@@ -292,6 +292,11 @@ def _measure_production_render_dense(
 
     for name, mod in module.named_modules():
         canonical_name = canonical_linear_name(name, profile)
+        # Per-expert-Linear models (DSv4-Flash) probe under the RAW live
+        # names; the packed-style remap above would then miss target_names
+        # and silently skip every routed expert.
+        if canonical_name not in target_names and name in target_names:
+            canonical_name = name
         if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
             continue
         if canonical_name not in act_cache:
