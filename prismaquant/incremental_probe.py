@@ -1234,7 +1234,12 @@ def _compute_global_precompute(
             )
         fwd_s = time.time() - fwd_t0
         hidden = out
-        device_acts.append(hidden.detach())
+        # GB10 / unified memory: capture to host IMMEDIATELY. Holding all
+        # L+1 activations device-resident and stacking them (the E1 batched
+        # transfer below) doubles a ~47 GB working set in UNSWAPPABLE UVM
+        # memory on a 121 GB box -> kernel OOM at the phase transition. A
+        # host copy here is a same-RAM memcpy; there is nothing to batch.
+        device_acts.append(hidden.detach().to("cpu"))
         ctx.unload(L)
         if L % 8 == 0 or L == num_layers - 1:
             print(f"[incremental/global] fwd L{L:02d}  src={src}  "
@@ -1245,18 +1250,12 @@ def _compute_global_precompute(
     # phase-3's isolated forwards can reconstruct it.
     shared_pass_state = _profile.capture_forward_pass_state(pass_state)
 
-    # v22 Fix E1: batched device→host transfer for the activations
-    # captured during phase-1. All have the same (B, T, H) shape so we
-    # stack into one (L+1, B, T, H) tensor and do a single .cpu() —
-    # 62 individual transfers collapsed into one. After the copy lands,
-    # we split back into a list of CPU tensors so the rest of the code
-    # (precompute cache pickle, phase-3 reads) sees the original layout.
+    # (v22 Fix E1 — the batched stack-then-.cpu() transfer — is intentionally
+    # NOT used here: activations are captured host-side per layer in the
+    # loop above, so they are already CPU tensors in the expected layout.)
     t_h2h = time.time()
-    stacked = torch.stack(device_acts, dim=0).cpu()
-    activations_cpu: list[torch.Tensor] = [
-        stacked[i].clone() for i in range(stacked.size(0))
-    ]
-    del device_acts, stacked
+    activations_cpu: list[torch.Tensor] = device_acts
+    device_acts = []
     print(f"[incremental/global] phase-1 forward: {time.time()-t_phase:.1f}s  "
           f"(host transfer {time.time()-t_h2h:.1f}s)  "
           f"{ctx.layer_cache.summary()}", flush=True)
