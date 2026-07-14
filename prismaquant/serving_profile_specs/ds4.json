@@ -1,0 +1,37 @@
+{
+  "schema": "prismaquant.serving_profile.v1",
+  "id": "ds4",
+  "runtime": "gguf_ocp_mx_union",
+  "description": "Serving profile for the public DSv4-Flash MXFP4 checkpoint under a GGUF + OCP MX union menu: the GGUF k-quant/IQ menu unioned with the OCP MX microscaling formats (MXFP4 routed experts are the checkpoint's own grid; MXFP6/MXFP8 are group-32 E8M0 re-encodes). BF16 is the unquantized passthrough.",
+  "format_rules": [
+    {
+      "id": "ds4_union_formats",
+      "allow_formats": ["IQ2_XXS", "IQ2_XS", "IQ2_S", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "MXFP4", "MXFP6_E2M3", "MXFP6_E3M2", "MXFP8_E4M3", "BF16"],
+      "reason": "profile_mismatch",
+      "detail": "ds4 union menu: ggml tensor types (K-quants Q2_K..Q6_K, Q8_0, IQ2 family) plus OCP MX group-32 formats (MXFP4/MXFP6_E2M3/MXFP6_E3M2/MXFP8_E4M3) and BF16 passthrough; everything else is structurally unavailable on this lane"
+    }
+  ],
+  "shape_rules": [
+    {
+      "id": "kquant_superblock_shape",
+      "formats": ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS", "IQ2_XS", "IQ2_S"],
+      "in_features_multiple_of": 256,
+      "reason": "kernel_shape",
+      "detail": "GGUF k-quants and 256-superblock IQ types pack 256-element superblocks along the input dim"
+    },
+    {
+      "id": "block32_shape",
+      "formats": ["Q8_0"],
+      "in_features_multiple_of": 32,
+      "reason": "kernel_shape",
+      "detail": "Q8_0 packs 32-element blocks along the input dim"
+    },
+    {
+      "id": "mx_group32_shape",
+      "formats": ["MXFP4", "MXFP6_E2M3", "MXFP6_E3M2", "MXFP8_E4M3"],
+      "in_features_multiple_of": 32,
+      "reason": "kernel_shape",
+      "detail": "OCP MX formats scale 32-element groups (E8M0 per-group scale) along the input dim"
+    }
+  ]
+}
