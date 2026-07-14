@@ -105,13 +105,16 @@ from .allocator_solver import (
 from .allocator_candidates import (
     PASSTHROUGH_SOURCE_REQUIREMENTS,
     _FUSED_SIBLING_MARKER,
+    _PACKED_GROUP_MARKER,
     _format_kernel_supports_shape,
     _is_passthrough_format,
     _passthrough_source_ok,
     _scan_source_dtype_manifest,
     aggregate_fused_siblings,
+    aggregate_packed_serving_groups,
     build_candidates,
     expand_fused_sibling_assignment,
+    expand_packed_group_assignment,
     summarize_applicability_masks,
 )
 from .serving_profiles import (
@@ -1672,12 +1675,33 @@ def main():
     )
     applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Pre-aggregate packed-MoE serving groups (e.g. DeepSeek-V4's 768
+    # per-expert Linears per layer) into single multi-choice DP units.
+    # The serving runtime loads each group under ONE format, so the DP
+    # must price the whole-group move — pricing per row while
+    # promote_serving_units charges the group is the ~1000x mismatch of
+    # the 2026-07 audit (anomaly 1a): expert rows top the per-bin ranking,
+    # the feasibility tightening over-corrects, and attention/shared rows
+    # starve while headroom goes unused. With groups as first-class DP
+    # units, post-DP MoE promotion is a validated no-op.
+    stats, costs, candidates = aggregate_packed_serving_groups(
+        stats, costs, specs_sorted, candidates, profile=model_profile)
+    packed_groups = sum(1 for n in candidates if _PACKED_GROUP_MARKER in n)
+    packed_member_rows = sum(
+        len(stats[n].get("_packed_group_members", ()))
+        for n in candidates if _PACKED_GROUP_MARKER in n
+    )
+    print(f"[alloc] packed-serving-group aggregation: {packed_groups} groups "
+          f"({packed_member_rows} member Linears priced as whole-group DP "
+          "units)")
+
     # Pre-aggregate fused siblings (qkv_proj, gate_up_proj, ...) into
     # single DP items. The DP can't pick mixed-sibling solutions because
     # there's only one item per group — so promote_fused becomes a no-op
     # on aggregated items and the overshoot-tightening loop collapses to
     # a single pass on well-behaved models. Must run AFTER the MoE
-    # aggregation (it skips `.__fused__.` entries explicitly).
+    # aggregation (it skips `.__fused__.` and packed-group entries
+    # explicitly).
     if not args.no_fused_aggregation:
         stats, costs, candidates = aggregate_fused_siblings(
             stats, costs, specs_sorted, candidates, profile=model_profile,
@@ -1796,13 +1820,13 @@ def main():
     ) -> dict[str, str]:
         """Expand DP super-items into the per-Linear seed-assignment shape.
 
-        The allocator can solve over fused-sibling super-items.
-        The KL probe's seed path wants ordinary module qnames; it already
-        handles legality, pinning, and fused coherence, but giving it expanded
-        names preserves the intended frontier point instead of making the
-        super-item markers look like unknown entries.
+        The allocator can solve over packed-serving-group and fused-sibling
+        super-items. The KL probe's seed path wants ordinary module qnames;
+        it already handles legality, pinning, and fused coherence, but giving
+        it expanded names preserves the intended frontier point instead of
+        making the super-item markers look like unknown entries.
         """
-        expanded = dict(assignment)
+        expanded = expand_packed_group_assignment(dict(assignment), stats)
         if not args.no_fused_aggregation:
             expanded = expand_fused_sibling_assignment(expanded, stats)
         if include_auxiliary:
@@ -2237,6 +2261,10 @@ def main():
 
     assignment_expanded = dict(assignment)
 
+    # Expand packed-serving-group super-items back to per-tensor entries.
+    assignment_expanded = expand_packed_group_assignment(
+        assignment_expanded, stats)
+
     # Expand fused-sibling super-Linears (qkv_proj / gate_up_proj).
     if not args.no_fused_aggregation:
         assignment_expanded = expand_fused_sibling_assignment(
@@ -2246,8 +2274,10 @@ def main():
     assignment_before_serving_promotion = dict(assignment_expanded)
 
     # vLLM's FusedMoE requires all projections of the same expert to share
-    # one scheme. This keeps per-Linear assignments serveable without
-    # collapsing experts into allocator super-items.
+    # one scheme. Packed groups are first-class DP units, so this promotion
+    # is a validated no-op (validate_final_serving_promotion_noop below);
+    # it stays as the serve-time coherence backstop for groups that fell
+    # back to individual rows (no common legal format).
     assignment_expanded = promote_serving_units(
         assignment_expanded,
         format_rank,
