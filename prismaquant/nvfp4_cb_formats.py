@@ -116,9 +116,10 @@ def _two_tier_tables(device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 # deterministic lattice codebooks
 # --------------------------------------------------------------------------- #
 
-def _snap_to_grid(x: torch.Tensor) -> torch.Tensor:
-    """Per-coordinate nearest E2M1 value."""
-    grid = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=x.device)
+def _snap_to_grid(x: torch.Tensor, nonneg: bool = False) -> torch.Tensor:
+    """Per-coordinate nearest E2M1 value (half-grid incl. 0 when nonneg)."""
+    vals = (0.0,) + E2M1_POS if nonneg else E2M1_VALUES
+    grid = torch.tensor(vals, dtype=torch.float32, device=x.device)
     idx = (x.unsqueeze(-1) - grid).abs().argmin(dim=-1)
     return grid[idx]
 
@@ -209,14 +210,20 @@ def _lattice_sub_table(bits: int, sub_dim: int = SUB_DIM) -> torch.Tensor:
 
 
 def learn_codebook(samples: torch.Tensor, k: int,
-                   iters: int = _LATTICE_ITERS) -> tuple[torch.Tensor, ...]:
+                   iters: int = _LATTICE_ITERS,
+                   mode: str = "product") -> tuple[torch.Tensor, ...]:
     """Learn per-role product sub-codebooks from real scale-normalized
     sub-vector samples (spec §4: 'shared per-role learned codebook, pooled
     across layers and, for MoE, across experts'; ships in the sidecar).
 
     samples: (N, VEC_DIM) group-normalized weight vectors (w / group_scale).
     Deterministic: seeded k-means++ init, fixed Lloyd iterations, snap to the
-    E2M1 grid each iteration, deterministic dedupe. Entry 0 pinned to zero."""
+    E2M1 grid each iteration, deterministic dedupe. Entry 0 pinned to zero.
+    mode='signed': one non-negative 8-dim magnitude table (2^(k-8) entries)."""
+    if mode == "signed":
+        return (_kmeans_grid(samples.abs().to(torch.float32).contiguous(),
+                             k - 8, seed=_LATTICE_SEED ^ (0x51 + k),
+                             iters=iters, nonneg=True),)
     b0, b1 = _bit_split(k, N_SUB_FP4)
     subs = []
     for si, bits in enumerate((b0, b1)):
@@ -228,7 +235,7 @@ def learn_codebook(samples: torch.Tensor, k: int,
 
 
 def _kmeans_grid(x: torch.Tensor, bits: int, seed: int,
-                 iters: int) -> torch.Tensor:
+                 iters: int, nonneg: bool = False) -> torch.Tensor:
     """Seeded grid-snapped k-means over (N, sub_dim) samples -> fp16 table."""
     B = 1 << bits
     sub_dim = x.shape[1]
@@ -245,7 +252,7 @@ def _kmeans_grid(x: torch.Tensor, bits: int, seed: int,
         cent[i] = x[pick]
         d2 = torch.minimum(d2, (x - cent[i]).pow(2).sum(dim=1))
     for _ in range(iters):
-        cent = _snap_to_grid(cent)
+        cent = _snap_to_grid(cent, nonneg)
         cent[0] = 0.0
         assign = torch.cdist(x, cent).argmin(dim=1)
         sums = torch.zeros_like(cent).index_add_(0, assign, x)
@@ -254,7 +261,7 @@ def _kmeans_grid(x: torch.Tensor, bits: int, seed: int,
         new[counts == 0] = cent[counts == 0]
         new[0] = 0.0
         cent = new
-    cent = _snap_to_grid(cent)
+    cent = _snap_to_grid(cent, nonneg)
     cent[0] = 0.0
     seen: set = set()
     dup_rows = []
@@ -270,7 +277,7 @@ def _kmeans_grid(x: torch.Tensor, bits: int, seed: int,
         oi = 0
         for row in dup_rows:
             while oi < order.numel():
-                cand = _snap_to_grid(x[order[oi]].unsqueeze(0))[0]
+                cand = _snap_to_grid(x[order[oi]].unsqueeze(0), nonneg)[0]
                 oi += 1
                 ck = tuple(cand.tolist())
                 if ck not in seen:
@@ -298,6 +305,19 @@ def group_normalized_subvectors(w: torch.Tensor,
     return v.contiguous()
 
 
+def _lattice_mag_table(bits: int) -> torch.Tensor:
+    """Deterministic magnitude codebook for signed mode: 2^bits non-negative
+    8-dim half-grid vectors, k-means on |group-normalized sample|."""
+    key = (bits, -VEC_DIM)          # distinct cache namespace from product
+    if key in _lattice_cache:
+        return _lattice_cache[key]
+    x = _lattice_sample(_LATTICE_SAMPLES, VEC_DIM).abs()
+    out = _kmeans_grid(x, bits, seed=_LATTICE_SEED ^ (0x51 + bits),
+                       iters=_LATTICE_ITERS, nonneg=True)
+    _lattice_cache[key] = out
+    return out
+
+
 def _resolve_codebook(k: int, grid: str, mode: str, codebook, device):
     """Return the (tuple of) sub-codebook tensor(s) on `device`. `codebook`
     passthrough if given (tests pass explicit codebooks)."""
@@ -305,9 +325,13 @@ def _resolve_codebook(k: int, grid: str, mode: str, codebook, device):
         if isinstance(codebook, (tuple, list)):
             return tuple(c.to(device) for c in codebook)
         return codebook.to(device)
+    if grid == "fp4" and mode == "signed":
+        if k <= 8:
+            raise ValueError("signed mode needs k > 8")
+        return (_lattice_mag_table(k - 8).to(device),)
     if grid != "fp4" or mode != "product":
         raise NotImplementedError(
-            f"default codebook only for fp4/product (got {grid}/{mode})")
+            f"default codebook only for fp4 product/signed (got {grid}/{mode})")
     b0, b1 = _bit_split(k, N_SUB_FP4)
     return (_lattice_sub_table(b0).to(device), _lattice_sub_table(b1).to(device))
 
@@ -404,14 +428,54 @@ def _assign_product(qvals: torch.Tensor, subs: tuple[torch.Tensor, ...],
     return out
 
 
-def _decode_codes(codes: torch.Tensor, subs, k: int) -> torch.Tensor:
+def _decode_codes(codes: torch.Tensor, subs, k: int,
+                  mode: str = "product") -> torch.Tensor:
     """(rows, n_vec) codewords -> (rows, in) codeword values (fp32)."""
+    if mode == "signed":
+        mag = subs[0].to(torch.float32)[(codes >> 8).long()]  # (rows,n_vec,8)
+        sign_bits = ((codes.unsqueeze(-1) >> torch.arange(
+            VEC_DIM, device=codes.device)) & 1)
+        cw = mag * torch.where(sign_bits.bool(), -1.0, 1.0)
+        return cw.reshape(codes.shape[0], -1)
     b0, b1 = _bit_split(k, N_SUB_FP4)
     i0 = (codes & ((1 << b0) - 1)).long()
     i1 = ((codes >> b0) & ((1 << b1) - 1)).long()
     cw = torch.cat([subs[0].to(torch.float32)[i0],
                     subs[1].to(torch.float32)[i1]], dim=-1)
     return cw.reshape(codes.shape[0], -1)
+
+
+def _assign_signed(qvals: torch.Tensor, mag_cb: torch.Tensor,
+                   col_weights: torch.Tensor | None,
+                   chunk: int = 1 << 17) -> torch.Tensor:
+    """Signed-mode assignment: codeword = 8 sign bits (bit j = coord j
+    negative) | magnitude index << 8, magnitude = nearest codebook entry to
+    |q| (weighted L2). Returns (rows, n_vec) int64 codes."""
+    rows, in_f = qvals.shape
+    n_vec = in_f // VEC_DIM
+    v = qvals.reshape(-1, VEC_DIM)
+    cbf = mag_cb.to(torch.float32)
+    m = v.abs()
+    if col_weights is not None:
+        wcol = col_weights.reshape(n_vec, VEC_DIM).to(torch.float32) \
+            .clamp_min(1e-12)
+        wv = wcol.unsqueeze(0).expand(rows, n_vec, VEC_DIM).reshape(-1, VEC_DIM)
+    else:
+        wv = None
+    idx = torch.empty(m.shape[0], dtype=torch.int64, device=m.device)
+    for s in range(0, m.shape[0], chunk):
+        me = m[s:s + chunk]
+        if wv is None:
+            d = torch.cdist(me, cbf).pow_(2)
+        else:
+            we = wv[s:s + chunk]
+            d = ((we * me * me).sum(-1, keepdim=True)
+                 - 2.0 * (we * me) @ cbf.T + we @ (cbf * cbf).T)
+        idx[s:s + chunk] = d.argmin(dim=1)
+    signs = (v < 0).to(torch.int64)
+    bitw = (1 << torch.arange(VEC_DIM, device=v.device, dtype=torch.int64))
+    sign_word = (signs * bitw).sum(dim=-1)
+    return (sign_word | (idx << 8)).reshape(rows, n_vec)
 
 
 def _refit_scales(w2: torch.Tensor, cvals: torch.Tensor, scale: torch.Tensor,
@@ -462,8 +526,8 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, grid: str = "fp4",
     encode_tier: 'fast' = amax scales + one assignment pass.
                  'em'   = fast, then alternate closed-form scale refit /
                           re-assignment (2 rounds). Better, ~3x slower."""
-    if grid != "fp4" or mode != "product":
-        raise NotImplementedError("phase 1: fp4/product only")
+    if grid != "fp4" or mode not in ("product", "signed"):
+        raise NotImplementedError("phase 1: fp4 product/signed only")
     if scale_coding is None:
         scale_coding = SCALE_CODING_V1
     orig_shape = tuple(w.shape)
@@ -484,21 +548,25 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, grid: str = "fp4",
         super_e, sub_codes, scale = _encode_scales_two_tier(amax_g, device)
         scale_bytes = None
 
+    b_widths = _bit_split(k, N_SUB_FP4)
+
     def assign(cur_scale):
         scale_per_w = cur_scale.unsqueeze(-1) \
             .expand(rows, n_sb, 16, GROUP_SIZE).reshape(rows, in_f)
         qvals = torch.where(scale_per_w > 0,
                             w2 / scale_per_w.clamp_min(1e-38),
                             torch.zeros_like(w2))
-        return _assign_product(qvals, subs, col_weights)
+        if mode == "signed":
+            return _assign_signed(qvals, subs[0], col_weights)
+        sub_idx = _assign_product(qvals, subs, col_weights)
+        return sub_idx[0].to(torch.int64) \
+            | (sub_idx[1].to(torch.int64) << b_widths[0])
 
-    sub_idx = assign(scale)
-    b_widths = _bit_split(k, N_SUB_FP4)
-    codes = sub_idx[0].to(torch.int64) | (sub_idx[1].to(torch.int64) << b_widths[0])
+    codes = assign(scale)
 
     if encode_tier == "em":
         for _ in range(2):
-            cvals = _decode_codes(codes, subs, k)
+            cvals = _decode_codes(codes, subs, k, mode)
             scale, nb, nc = _refit_scales(w2, cvals, scale, scale_coding,
                                           super_e, device,
                                           prev_sub_codes=sub_codes)
@@ -506,9 +574,7 @@ def nvfp4_cb_fields(w: torch.Tensor, k: int, grid: str = "fp4",
                 scale_bytes = nb
             else:
                 sub_codes = nc
-            sub_idx = assign(scale)
-            codes = sub_idx[0].to(torch.int64) \
-                | (sub_idx[1].to(torch.int64) << b_widths[0])
+            codes = assign(scale)
 
     return {
         "codes": codes,                    # (rows, in/8) int64 k-bit codewords
@@ -535,16 +601,12 @@ def nvfp4_cb_reconstruct(fields: dict, out_dtype=torch.bfloat16) -> torch.Tensor
     k = fields["k"]
     rows, n_vec = codes.shape
     in_f = n_vec * VEC_DIM
-    b0, b1 = _bit_split(k, N_SUB_FP4)
-    i0 = (codes & ((1 << b0) - 1)).long()
-    i1 = ((codes >> b0) & ((1 << b1) - 1)).long()
-    cw = torch.cat([subs[0].to(torch.float32)[i0],
-                    subs[1].to(torch.float32)[i1]], dim=-1)  # (rows,n_vec,8)
+    cw = _decode_codes(codes, subs, k, fields.get("mode", "product"))
     scale = fields["scale"]                                  # (rows,n_sb,16)
     scale_per_w = scale.unsqueeze(-1) \
         .expand(rows, scale.shape[1], 16, GROUP_SIZE) \
         .reshape(rows, in_f)
-    w = cw.reshape(rows, in_f) * scale_per_w
+    w = cw * scale_per_w
     w = w.to(torch.bfloat16).to(out_dtype)
     return w.reshape(fields["shape"])
 
@@ -627,14 +689,16 @@ def nvfp4_cb_unpack(qweight: torch.Tensor, k: int, grid: str = "fp4",
 # cost-stage entry points
 # --------------------------------------------------------------------------- #
 
-def parse_cb_format_name(name: str) -> tuple[int, str]:
-    """'NVFP4_CB_K16' -> (16, 'two_tier'); trailing 'V1' selects v1."""
-    if not name.startswith("NVFP4_CB_K"):
-        raise ValueError(name)
-    rest = name[len("NVFP4_CB_K"):]
-    if rest.endswith("V1"):
-        return int(rest[:-2]), SCALE_CODING_V1
-    return int(rest), SCALE_CODING_TWO_TIER
+def parse_cb_format_name(name: str) -> tuple[int, str, str]:
+    """'NVFP4_CB_K16' -> (16, 'two_tier', 'product');
+    'NVFP4_CB_S16' -> (16, 'two_tier', 'signed'); trailing 'V1' selects v1."""
+    for prefix, mode in (("NVFP4_CB_K", "product"), ("NVFP4_CB_S", "signed")):
+        if name.startswith(prefix):
+            rest = name[len(prefix):]
+            if rest.endswith("V1"):
+                return int(rest[:-2]), SCALE_CODING_V1, mode
+            return int(rest), SCALE_CODING_TWO_TIER, mode
+    raise ValueError(name)
 
 
 def nvfp4_cb_quantize_dequantize(w: torch.Tensor, fmt_name: str,
@@ -642,9 +706,10 @@ def nvfp4_cb_quantize_dequantize(w: torch.Tensor, fmt_name: str,
                                  encode_tier: str = "fast",
                                  codebook=None) -> torch.Tensor:
     """RTN-style weight QDQ for the cost stage: encode -> reconstruct."""
-    k, coding = parse_cb_format_name(fmt_name)
-    fields = nvfp4_cb_fields(w, k, scale_coding=coding, codebook=codebook,
-                             encode_tier=encode_tier, col_weights=col_weights)
+    k, coding, mode = parse_cb_format_name(fmt_name)
+    fields = nvfp4_cb_fields(w, k, mode=mode, scale_coding=coding,
+                             codebook=codebook, encode_tier=encode_tier,
+                             col_weights=col_weights)
     return nvfp4_cb_reconstruct(fields, out_dtype=w.dtype)
 
 
