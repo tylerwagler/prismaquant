@@ -369,7 +369,7 @@ def check_floor_non_negative(
     detail = ", ".join(
         f"{cls}={nb / GB:.2f}GB"
         for cls, nb in sorted(by_class.items(), key=lambda kv: -kv[1]))
-    raise AssertionError(
+    raise ValueError(
         f"[footprint] negative non-quantizable floor in {context}: "
         f"floor={floor_bytes / GB:.3f}GB (source_total="
         f"{source_total_bytes / GB:.3f}GB, reencoded_source="
