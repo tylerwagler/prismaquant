@@ -1707,7 +1707,8 @@ def main():
     # starve while headroom goes unused. With groups as first-class DP
     # units, post-DP MoE promotion is a validated no-op.
     stats, costs, candidates = aggregate_packed_serving_groups(
-        stats, costs, specs_sorted, candidates, profile=model_profile)
+        stats, costs, specs_sorted, candidates, profile=model_profile,
+        calibrated_gains=calibrated_gains)
     packed_groups = sum(1 for n in candidates if _PACKED_GROUP_MARKER in n)
     packed_member_rows = sum(
         len(stats[n].get("_packed_group_members", ()))
@@ -1865,6 +1866,13 @@ def main():
         for name, fmt in assignment.items():
             entry = _stats_entry_for_assignment_name(name)
             if not isinstance(entry, dict):
+                continue
+            # Super-items (packed groups, fused siblings) carry exact
+            # per-format byte sums; their stats entries have no single
+            # (out, in) shape, so the shape fallback is only for plain rows.
+            memory_map = entry.get("_memory_bytes_by_format")
+            if isinstance(memory_map, dict) and fmt in memory_map:
+                total += 8.0 * memory_map[fmt]
                 continue
             shape = _shape_from_stats(entry)
             total += 8.0 * fr.get_format(fmt).memory_bytes_for_shape(shape)
