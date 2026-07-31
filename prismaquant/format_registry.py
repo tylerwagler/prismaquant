@@ -677,6 +677,21 @@ register_format(FormatSpec(
     activation_quantize_dequantize=_make_rtn("fp4_e2m1", 32, mx_scale=True),
 ))
 register_format(FormatSpec(
+    # ds4 engine type-40 lane: weights on the checkpoint's own MXFP4 grid
+    # (byte-lossless re-encode), activations MXFP8 E4M3 with dynamic UE8M0
+    # block scales — the W4A8 GEMM in pulsar_mxfp4_cutlass.cu, which is also
+    # DSv4-Flash's own serving numerics (E4M3 dynamic acts). Distinct from
+    # generic OCP MXFP4 (W4A4): pricing MXFP4 experts with A4 acts charges
+    # an activation error the ds4 engine never incurs.
+    name="CUTLASS_MXFP4",
+    weight_bits=4, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
+    weight_element_dtype="fp4_e2m1", act_bits=8, act_dtype_name="fp8_e4m3",
+    act_group_size=32, family="mx", min_capability_sm=100,
+    autoround_config=lambda: _mx_autoround(4, 32, 8, "fp4_e2m1"),
+    quantize_dequantize=_make_rtn("fp4_e2m1", 32, mx_scale=True),
+    activation_quantize_dequantize=_mxfp8_e4m3_activation_vllm_rtn,
+))
+register_format(FormatSpec(
     name="MXFP6_E3M2",
     weight_bits=6, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
     weight_element_dtype="fp6_e3m2", act_bits=6, act_dtype_name="fp6_e3m2",
