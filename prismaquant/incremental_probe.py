@@ -2685,15 +2685,70 @@ def _validate_precompute_cache_payload(
     return data, ids
 
 
+class _HostStagedActivations(list):
+    """`activations_cpu` read out of the memory-mapped precompute cache.
+
+    The cache holds one hidden state per layer entry -- for DSv4-Flash at
+    N=32 x T=1024 that is 44 x 1.07 GB.  Resident in RSS they left the phase-3
+    reverse sweep no room on a 121 GB unified-memory box (sparky, 2026-09-11:
+    the backward through the first swept layer took available memory from 63 to
+    2 GiB and the process died at the ceiling; the 2026-07 run had only survived
+    on 19 GB of swap).  Memory-mapped they are reclaimable page cache, and each
+    read hands out an anonymous host copy: a file-backed view moves to CUDA at
+    ~5 MB/s on the GB10 (`layer_streaming._host_stage`), a clone at >40 GB/s.
+    Every consumer indexes by int and moves the result to the device at once,
+    so the copy is transient."""
+
+    def __getitem__(self, index):
+        item = super().__getitem__(index)
+        if isinstance(item, torch.Tensor) and item.device.type == "cpu":
+            return item.clone()
+        return item
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+
+def _host_stage_precompute_payload(data: dict) -> dict:
+    """Stage a memory-mapped cache payload for use: the per-layer activations
+    become `_HostStagedActivations` (lazy clones); every other tensor is
+    cloned now, so nothing downstream moves a file-backed view to CUDA."""
+
+    def clone_tree(obj):
+        if isinstance(obj, torch.Tensor):
+            return obj.clone() if obj.device.type == "cpu" else obj
+        if isinstance(obj, dict):
+            return {k: clone_tree(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [clone_tree(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(clone_tree(v) for v in obj)
+        return obj
+
+    staged = {}
+    for key, value in data.items():
+        if key == "activations_cpu":
+            staged[key] = _HostStagedActivations(value)
+        else:
+            staged[key] = clone_tree(value)
+    return staged
+
+
 def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
                            device: torch.device,
                            sample_calibration: torch.Tensor | None = None,
                            ) -> GlobalPrecompute | None:
-    """Load cached precompute if meta matches; return None otherwise."""
+    """Load cached precompute if meta matches; return None otherwise.
+
+    The file is memory-mapped: the per-layer activations stay in reclaimable
+    page cache (see `_HostStagedActivations`), everything else is cloned into
+    anonymous host memory once."""
     if not path.exists():
         return None
     try:
-        data = torch.load(str(path), map_location="cpu", weights_only=False)
+        data = torch.load(str(path), map_location="cpu", weights_only=False,
+                          mmap=True)
     except Exception as e:
         print(f"[incremental/global] cache load failed ({e}); recomputing",
               flush=True)
@@ -2712,6 +2767,7 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
         )
         return None
     sample_contract = expected_meta.get("sample_parallel")
+    data = _host_stage_precompute_payload(data)
     return GlobalPrecompute(
         activations_cpu=data["activations_cpu"],
         grad_at_tail=data["grad_at_tail"],
@@ -5449,6 +5505,28 @@ def main():
             precompute_cache_path, precomputed, precompute_meta)
         print(f"[incremental/global] wrote precompute cache to "
               f"{precompute_cache_path}", flush=True)
+        if args.sample_importance_stats_output is None:
+            # Phase-3 runs from the memory-mapped cache, not from the copy
+            # phase-1 accumulated in RSS (see `_HostStagedActivations`). The
+            # file was written a moment ago by this process: a failed reload
+            # is a bug, never a reason to continue on the resident copy.
+            precomputed = None
+            reloaded = _load_precompute_cache(
+                precompute_cache_path,
+                precompute_meta,
+                device,
+                sample_calibration=(
+                    calib if args.sample_parallel_contract is not None
+                    else None
+                ),
+            )
+            if reloaded is None:
+                raise RuntimeError(
+                    "precompute cache written but did not load back: "
+                    f"{precompute_cache_path}")
+            precomputed = reloaded
+            print("[incremental/global] phase-3 reads the precompute cache "
+                  "memory-mapped", flush=True)
         return precomputed
 
     if args.sample_importance_stats_output is not None:
