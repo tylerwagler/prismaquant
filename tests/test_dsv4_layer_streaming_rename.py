@@ -66,7 +66,8 @@ def test_ffn_rename():
     """`ffn` infix → `mlp`, including for routing gate and shared experts."""
     cases = [
         ("layers.0.ffn.gate.weight", "model.layers.0.mlp.gate.weight"),
-        ("layers.3.ffn.gate.bias",   "model.layers.3.mlp.gate.bias"),
+        # `ffn.gate.bias` needs the declared checkpoint's hash-layer count:
+        # see test_router_biases_without_a_live_home_drop.
         # Shared expert leafs renamed: w1→gate_proj, w2→down_proj, w3→up_proj.
         ("layers.0.ffn.shared_experts.w1.weight",
          "model.layers.0.mlp.shared_experts.gate_proj.weight"),
