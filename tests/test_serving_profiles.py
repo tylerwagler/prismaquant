@@ -749,3 +749,33 @@ def test_the_serve_dispatch_table_help_does_not_name_a_path_that_is_gone():
     help_block = source[start:end]
     assert "serve_dispatch_tables/" not in help_block
     assert "archive/gridbook_lane_2026-09-02/" in help_block
+
+
+def test_ds4_engine_profile_per_class_menus():
+    """ds4_engine = what the pulsar ds4 engine serves TODAY: routed experts limited to
+    IQ2_XXS/Q2_K/MXFP4 kernels; attention/shared/dense pinned to the FP8
+    tensor-core path (MXFP8_E4M3 only). Packed-group super-item names keep
+    the .mlp.experts. prefix, so the expert rule matches them too."""
+    from prismaquant.serving_profiles import check_serving_format
+
+    expert = "model.layers.5.mlp.experts.3.down_proj"
+    expert_super = (
+        "model.layers.5.mlp.experts.0.__packed_serving__."
+        "model__layers__5__mlp__experts::__packed_format__:"
+        "gate_proj,up_proj,down_proj::role:down"
+    )
+    attn = "model.layers.5.self_attn.wkv"
+    shared = "model.layers.5.mlp.shared_experts.gate_proj"
+    dense = "model.layers.0.mlp.gate_proj"
+
+    for fmt in ("IQ2_XXS", "Q2_K", "MXFP4"):
+        assert check_serving_format("ds4_engine", expert, fmt).legal
+        assert check_serving_format("ds4_engine", expert_super, fmt).legal
+    for fmt in ("IQ2_XS", "IQ2_S", "Q3_K", "Q4_K", "Q6_K", "Q8_0",
+                "MXFP8_E4M3", "BF16"):
+        assert not check_serving_format("ds4_engine", expert, fmt).legal
+
+    for qname in (attn, shared, dense):
+        assert check_serving_format("ds4_engine", qname, "MXFP8_E4M3").legal
+        for fmt in ("IQ2_XXS", "Q2_K", "Q6_K", "Q8_0", "MXFP4", "BF16"):
+            assert not check_serving_format("ds4_engine", qname, fmt).legal

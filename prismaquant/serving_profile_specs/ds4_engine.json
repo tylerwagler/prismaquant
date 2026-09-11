@@ -1,0 +1,53 @@
+{
+  "schema": "prismaquant.serving_profile.v1",
+  "id": "ds4_engine",
+  "runtime": "ds4_engine",
+  "description": "DSv4-Flash on the pulsar ds4 engine, serveable TODAY (kernel inventory as of 2026-09, pulsar dev): routed-expert tensors run on the IQ2_XXS (k-major MMQ) / Q2_K paths or the checkpoint-native MXFP4 grid; attention, shared-expert and dense tensors run ONLY on the FP8 tensor-core path (MXFP8_E4M3 group-32 re-encode); the token embedding and the output head are plain bf16 (a deliberate fidelity choice). No IQ2_XS / IQ2_S / Q3_K expert kernels exist, and non-expert projections have no IQ/k-quant path at all.",
+  "export_lane": {
+    "id": "pulsar_ds4",
+    "exporter": "pulsar gguf-tools/deepseek4-quantize (out of tree; per-tensor --format-map JSON)",
+    "codec_formats_from": ["prismaquant.ds4_engine_formats:DS4_ENGINE_FORMATS"],
+    "passthrough_formats": [],
+    "reason": "exporter_cannot_emit",
+    "detail": "pulsar's quantizer writes exactly the formats its engine has kernels for; the declaration module mirrors its format-map vocabulary"
+  },
+  "format_rules": [
+    {
+      "id": "routed_expert_kernels",
+      "when": {"regex": "\\.mlp\\.experts\\."},
+      "allow_formats": ["IQ2_XXS", "Q2_K", "MXFP4"],
+      "reason": "profile_mismatch",
+      "detail": "routed-expert tensors: engine kernels exist only for IQ2_XXS, Q2_K, and the checkpoint-native MXFP4 grid (no IQ2_XS/IQ2_S/Q3_K expert kernels)"
+    },
+    {
+      "id": "embed_and_head_bf16",
+      "when": {"regex": "embed_tokens|lm_head"},
+      "allow_formats": ["BF16"],
+      "reason": "profile_mismatch",
+      "detail": "token embedding and output head are shipped as plain bf16 (source-exact); the engine has no quantized path for them"
+    },
+    {
+      "id": "fp8_tensor_core_path",
+      "when": {"not_regex": "\\.mlp\\.experts\\.|embed_tokens|lm_head"},
+      "allow_formats": ["MXFP8_E4M3"],
+      "reason": "profile_mismatch",
+      "detail": "attention / shared-expert / dense projections are served only on the FP8 tensor-core path (MXFP8_E4M3 group-32); no IQ/k-quant kernels exist for them"
+    }
+  ],
+  "shape_rules": [
+    {
+      "id": "kquant_superblock_shape",
+      "formats": ["Q2_K", "IQ2_XXS"],
+      "in_features_multiple_of": 256,
+      "reason": "kernel_shape",
+      "detail": "GGUF k-quants and 256-superblock IQ types pack 256-element superblocks along the input dim"
+    },
+    {
+      "id": "mx_group32_shape",
+      "formats": ["MXFP4", "MXFP8_E4M3"],
+      "in_features_multiple_of": 32,
+      "reason": "kernel_shape",
+      "detail": "OCP MX formats scale 32-element groups (E8M0 per-group scale) along the input dim"
+    }
+  ]
+}
