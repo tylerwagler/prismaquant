@@ -66,7 +66,7 @@ def test_ffn_rename():
     """`ffn` infix → `mlp`, including for routing gate and shared experts."""
     cases = [
         ("layers.0.ffn.gate.weight", "model.layers.0.mlp.gate.weight"),
-        ("layers.0.ffn.gate.bias",   "model.layers.0.mlp.gate.bias"),
+        ("layers.3.ffn.gate.bias",   "model.layers.3.mlp.gate.bias"),
         # Shared expert leafs renamed: w1→gate_proj, w2→down_proj, w3→up_proj.
         ("layers.0.ffn.shared_experts.w1.weight",
          "model.layers.0.mlp.shared_experts.gate_proj.weight"),
@@ -79,6 +79,29 @@ def test_ffn_rename():
     ]
     for ck, live in cases:
         assert _rename(ck) == live, f"{ck} ↦ {_rename(ck)}, expected {live}"
+
+
+def test_router_biases_without_a_live_home_drop(tmp_path):
+    """Vision-Exp (2026-09) ships `ffn.gate.bias` on the hash-routed layers
+    too (0731 did not) and an image-token `ffn.gate.bias_vl` on every layer.
+    The hash router selects by `tid2eid` and carries no `bias` buffer; the
+    text forward has no image positions. Both drop; the learned routers keep
+    their `bias`. The hash-layer count comes from the declared checkpoint's
+    config.json, never assumed."""
+    import json
+    (tmp_path / "config.json").write_text(json.dumps({"num_hash_layers": 3}))
+    profile = DeepseekV4Profile()
+    profile._declare_model_path(tmp_path)
+    rename = profile.checkpoint_to_live_name
+    assert rename("layers.0.ffn.gate.bias") is None
+    assert rename("layers.2.ffn.gate.bias") is None
+    assert rename("layers.3.ffn.gate.bias") == "model.layers.3.mlp.gate.bias"
+    assert rename("layers.0.ffn.gate.bias_vl") is None
+    assert rename("layers.42.ffn.gate.bias_vl") is None
+    assert rename("layers.0.ffn.gate.tid2eid") == "model.layers.0.mlp.gate.tid2eid"
+    # Undeclared checkpoint: a hash-layer decision refuses instead of guessing.
+    with pytest.raises(RuntimeError, match="num_hash_layers"):
+        DeepseekV4Profile().checkpoint_to_live_name("layers.0.ffn.gate.bias")
 
 
 def test_compressor_and_indexer_keep_faithful_mapping():

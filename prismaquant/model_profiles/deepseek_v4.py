@@ -130,6 +130,27 @@ class DeepseekV4Profile(ModelProfile):
         # selectable-Linear inventory the byte accounting assumes.
         return r"self_attn\.(?:compressor|indexer)\."
 
+    def _num_hash_layers(self) -> int:
+        """`num_hash_layers` from the declared checkpoint's config.json (the
+        count of leading MoE layers routed by `tid2eid`). Read once; refuses
+        when no checkpoint has been declared rather than assuming a count."""
+        cached = getattr(self, "_num_hash_layers_cached", None)
+        if cached is not None:
+            return cached
+        root = self._declared_model_path
+        if root is None:
+            raise RuntimeError(
+                "DeepseekV4Profile: num_hash_layers needed before a checkpoint "
+                "was declared (detect_profile(model_path) declares it)")
+        import json as _json
+        with open(root / "config.json") as f:
+            cfg = _json.load(f)
+        n = cfg.get("num_hash_layers")
+        if not isinstance(n, int):
+            raise RuntimeError(f"{root}/config.json has no integer num_hash_layers")
+        self._num_hash_layers_cached = n
+        return n
+
     def checkpoint_to_live_name(self, k: str, *,
                                 multimodal: bool = False) -> str | None:
         """DSv4-Flash checkpoint → transformers live qname.
@@ -181,6 +202,20 @@ class DeepseekV4Profile(ModelProfile):
         m = re.match(r"^layers\.(\d+)\.(.+)$", k)
         if m:
             layer_idx, leaf = m.group(1), m.group(2)
+
+            # Router biases the text forward has no home for.
+            #   - `ffn.gate.bias_vl` (Vision-Exp): the image-token routing
+            #     bias, applied by the source only on image positions. The
+            #     probe's forward is text-only and the vendored routers carry
+            #     no such buffer; it ships verbatim in the artifact instead.
+            #   - `ffn.gate.bias` on a hash-routed layer: selection there is
+            #     the frozen `tid2eid` lookup, the bias never enters the
+            #     forward, and `DeepseekV4HashRouter` has no `bias` buffer.
+            #     The learned routers (`DeepseekV4TopKRouter`) keep theirs.
+            if leaf == "ffn.gate.bias_vl":
+                return None
+            if leaf == "ffn.gate.bias" and int(layer_idx) < self._num_hash_layers():
+                return None
 
             # Routed experts → per-expert ModuleList (set up by
             # `enable_per_expert_experts()` in vendored/dsv4_probe_experts).
