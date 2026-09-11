@@ -2631,7 +2631,10 @@ def _validate_precompute_cache_payload(
         or not activations
         or any(
             not isinstance(value, torch.Tensor)
-            or value.ndim != 3
+            # [B, S, H] single-stream, or [B, S, hc_mult, H] for a
+            # multi-stream residual (DSv4 mHC): the 3-only check refused
+            # every DSv4 cache and the probe silently recomputed phase 1.
+            or value.ndim not in (3, 4)
             or not torch.is_floating_point(value)
             or tuple(value.shape[:2]) != tuple(ids.shape)
             or not bool(torch.isfinite(value).all().item())
