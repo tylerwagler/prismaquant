@@ -58,6 +58,25 @@ def build_windows(texts_path: str, tokenizer, seqlen: int) -> tuple[torch.Tensor
     return torch.stack(windows, dim=0), seen
 
 
+def _load_tid2eid_from_checkpoint(model_path: str, router_qname: str) -> torch.Tensor:
+    """`layers.N.ffn.gate.tid2eid` ([vocab, top_k] int64) straight from the safetensors shard that holds it."""
+    import struct
+    layer = router_qname.split(".")[2]
+    name = f"layers.{layer}.ffn.gate.tid2eid"
+    with open(os.path.join(model_path, "model.safetensors.index.json")) as f:
+        shard = json.load(f)["weight_map"][name]
+    with open(os.path.join(model_path, shard), "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+        meta = header[name]
+        if meta["dtype"] != "I64":
+            raise RuntimeError(f"{name}: expected I64, got {meta['dtype']}")
+        start, end = meta["data_offsets"]
+        f.seek(8 + n + start)
+        raw = f.read(end - start)
+    return torch.frombuffer(bytearray(raw), dtype=torch.int64).reshape(meta["shape"]).clone()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
@@ -102,11 +121,15 @@ def main() -> None:
     routers = sorted(discover_moe_routers(model, profile=profile))
     top_k = read_top_k(model)
     tracker = RouterTracker(model, routers, top_k=top_k)
+    # Hash routers select by a frozen `tid2eid` table. The module's buffer is
+    # only materialized when its layer is installed (it is zeros on the meta
+    # skeleton -- the 2026-09-11 run counted every hash-layer token as expert
+    # 0), so the table is read from the checkpoint itself.
     hash_routers: dict[str, torch.Tensor] = {}
     for rq in routers:
         mod = model.get_submodule(rq)
         if type(mod).__name__ == "DeepseekV4HashRouter":
-            hash_routers[rq] = mod.tid2eid  # [vocab, top_k] long, on the router's device once installed
+            hash_routers[rq] = _load_tid2eid_from_checkpoint(a.model, rq)
     n_experts = {rq: int(tracker.counts_t[rq].numel()) for rq in routers if rq in tracker.counts_t}
     hash_counts = {rq: torch.zeros(n_experts[rq], dtype=torch.int64) for rq in hash_routers}
     print(f"[route] {len(routers)} routers ({len(hash_routers)} hash-routed), top_k={top_k}, "
