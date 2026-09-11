@@ -118,28 +118,36 @@ def _source_json(path, source_authentication=None):
 
 
 # ---------------------------------------------------------------------------
-# v21 #5: opt-in direct-to-CUDA safetensors load. Default path opens the
-# safetensors file with framework="pt" (CPU mmap) and explicitly moves
-# each tensor to device with `.to(device, non_blocking=True)`. That
-# allocates a host-side torch.Tensor object even though the underlying
-# bytes are mmapped, then issues a host→device cudaMemcpy.
+# Shard reads and the device move.
 #
-# When PRISMAQUANT_DIRECT_CUDA_LOAD=1 is set, we instead pass
-# `device=str(device)` to safe_open so safetensors materializes the
-# tensor directly on the CUDA device. On UMA hardware (DGX Spark) the
-# physical memory is shared, so the win is mostly the elision of the
-# extra Python-side host tensor object and one redundant memcpy step;
-# expected savings are 10–30 ms per layer load (modest but additive
-# across 16 chunks × 2 phases × ~62 layers).
+# `safe_open(framework="pt")` returns views over the mmapped shard. Moving such
+# a file-backed view to CUDA -- `.to(device)`, accelerate's install, or
+# `safe_open(device="cuda:N")` which does the same inside safetensors -- runs at
+# ~5 MB/s on the GB10 (torch 2.11+cu130, driver 615; measured 2026-09-11: the
+# 1.06 GB embedding took 227 s), while the same view cloned into anonymous host
+# memory copies at >40 GB/s and then moves at >35 GB/s. Every tensor read from a
+# shard is therefore host-staged through `_host_stage` before it moves.
 #
-# Falls back to the host-stage path on any TypeError / RuntimeError to
-# stay compatible with older safetensors releases that do not accept
-# the device kwarg.
+# PRISMAQUANT_DIRECT_CUDA_LOAD=1 opts into the v21 #5 direct-to-CUDA open
+# instead (safetensors materializes on the device). It was the default from v26
+# on the expectation that UMA hardware would elide the host tensor; it is the
+# slow path above on the GB10, so it is opt-in again.
 # ---------------------------------------------------------------------------
+def _host_stage(t: torch.Tensor) -> torch.Tensor:
+    """Materialize a shard-read tensor in anonymous host memory before it moves.
+
+    A CPU tensor straight out of `safe_open` is a file-backed mmap view (see the
+    note above); cloning it is the fast path to CUDA. CUDA tensors pass through.
+    """
+    if t.device.type != 'cpu':
+        return t
+    return t.clone()
+
+
 def _direct_cuda_enabled() -> bool:
     raw = os.environ.get("PRISMAQUANT_DIRECT_CUDA_LOAD")
     if raw is None:
-        return True  # default on as of v26
+        return False  # opt-in: measured 5 MB/s on the GB10 (see above)
     return raw not in ("0", "", "false", "False", "FALSE", "no", "NO")
 
 
@@ -1066,7 +1074,7 @@ def _materialize(model: nn.Module, prefixes: list[str],
             f_ctx = _source_safe_open(shard, framework="pt", source_authentication=source_authentication)
         with f_ctx as f:
             for model_name, ckpt_name in pairs:
-                t = f.get_tensor(ckpt_name)
+                t = _host_stage(f.get_tensor(ckpt_name))
                 _require_fp8_scale(model_name, t, fp8_scale_inv_map)
                 if (t.is_floating_point()
                         and not _is_fp8_scaled_tensor(
@@ -1537,7 +1545,7 @@ def fill_packed_experts_from_source(
         for shard, keys in by_shard.items():
             with _source_safe_open(str(src / shard), framework="pt") as f:
                 for k in keys:
-                    out[k] = f.get_tensor(k).to(target_dtype)
+                    out[k] = _host_stage(f.get_tensor(k)).to(target_dtype)
         live_shapes = {
             f"{src_prefix}.{pn}": tuple(p.shape)
             for pn, p in live_params.items()
@@ -1882,6 +1890,8 @@ def _read_layer_to_device(prefix: str,
                     cuda_copied |= t.device.type == 'cuda'
                     if release_pages and t.device.type == 'cpu':
                         host_staging.append(t)
+                    if not used_direct:
+                        t = _host_stage(t)
                     _require_fp8_scale(model_name, t, fp8_scale_inv_map)
                     if (t.is_floating_point()
                             and not _is_fp8_scaled_tensor(
