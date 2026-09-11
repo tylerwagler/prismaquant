@@ -1694,7 +1694,21 @@ def _build_streaming_context(model_path: str, *,
           f"{sum(len(r) for r in install_resolvers)} tensors across "
           f"{num_layers} layers in {time.time()-t_res:.1f}s", flush=True)
 
-    free_bytes = psutil.virtual_memory().available
+    # The layer cache lives on `device`, so the budget starts from what THAT
+    # memory has free. `cuda_memory_info` is the one authority: on an
+    # integrated (unified-memory) GPU it reports host MemAvailable, on a
+    # discrete card the device's own free bytes. Reading host memory here
+    # regardless (the pre-2026-09-11 behaviour) sized the cache from a 3 TB
+    # host on a 141 GB H200: 172 slots, lookahead 12, and the prefetcher
+    # filled the card before the first forward (CUDA OOM at 139.8 GB).
+    if device.type == "cuda":
+        from .memory_management import cuda_memory_info
+        info = cuda_memory_info(device)
+        if info is None:
+            raise RuntimeError("cache device is CUDA but CUDA is not available")
+        free_bytes = info[0]
+    else:
+        free_bytes = psutil.virtual_memory().available
     # Resolve headroom: env override > explicit arg > autoscale > legacy 75 GB default.
     resolved_headroom_gb = cache_headroom_gb
     autoscale_diag = None
