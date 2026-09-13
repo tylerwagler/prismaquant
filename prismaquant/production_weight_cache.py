@@ -65,19 +65,28 @@ Usage:
 """
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
+import io
+import json
 import math
 import os
 from pathlib import Path
 import re
+import subprocess
+import stat
+import time
+import zipfile
 
 import torch
 import torch.nn as nn
 
 from prismaquant.activation_sampling import update_priority_reservoir
 from prismaquant.build_rtn_cache import iter_quantizable_tensors
+from prismaquant.cost_stage_checkpoint import atomic_write_bytes
 from prismaquant.render_score import (
     gate_render_candidate,
     normalize_row_weights,
@@ -87,13 +96,110 @@ from prismaquant.render_score import (
 from prismaquant.source_prefetch import prefetch_files_to_page_cache
 
 
+CB_RENDER_IDENTITY_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_render_identity.v2"
+)
+CB_COL_WEIGHTS_HASH_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_col_weights.v1"
+)
+CB_SOURCE_WEIGHTS_HASH_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_source_weights.v1"
+)
+CB_RENDER_CONTRACT_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_render_contract.v1"
+)
+ACTIVATION_HOOK_SCOPE_SCHEMA = (
+    "prismaquant.production_weight_cache.activation_hook_scope.v1"
+)
+ACTIVATION_HOOK_SCOPE_KEY = "activation_hook_scope"
+CB_RENDER_MECHANISM_ABI = "prismaquant.production_render_mechanisms.v1"
+CB_RENDER_IDENTITY_METADATA_KEY = "cb_render_identity"
+CB_CACHE_PAIR_IDENTITY_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_pair_identity.v1"
+)
+CB_CACHE_PAIR_SIDECAR_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_pair_sidecar.v1"
+)
+CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA = (
+    "prismaquant.production_weight_cache.cb_transient_consumer_receipt.v1"
+)
+RENDER_IDENTITY_SCHEMA = (
+    "prismaquant.production_weight_cache.render_identity.v1"
+)
+RENDER_IDENTITY_SIDECAR_FILENAME = "render_identity.json"
+#: The resolved NVFP4 input-global-scale policy, as a render lever (#227).
+#: ``_resolve_production_render_levers`` is the ONE place this process's
+#: policy is turned into a stamped value, so the directory render identity,
+#: the CB render contract, the union per-shard identity, the score records and
+#: every consumer that reads ``ProductionWeightCache.levers`` all name the same
+#: one.  The policy stays a live setting in the contract owner; what is frozen
+#: here is what THIS fill priced with.
+RENDER_LEVER_INPUT_GLOBAL_SCALE_POLICY = "nvfp4_input_global_scale_policy"
+RENDER_IDENTITY_MTP_APPEND_SCHEMA = (
+    "prismaquant.production_weight_cache.mtp_append_identity.v1"
+)
+RENDER_IDENTITY_PACKED_APPEND_SCHEMA = (
+    "prismaquant.production_weight_cache.packed_append_identity.v1"
+)
+RENDER_IDENTITY_PACKED_STREAMING_APPEND_SCHEMA = (
+    "prismaquant.production_weight_cache.packed_streaming_append_identity.v1"
+)
+MTP_APPEND_SIDECAR_KEY = "mtp_append"
+PACKED_APPEND_SIDECAR_KEY = "packed_expert_append"
+PACKED_STREAMING_APPEND_SIDECAR_KEY = "packed_expert_streaming_append"
+PRE_GUARD_ADMISSION_SIDECAR_KEY = "pre_guard_admission"
+
+
+# Formats whose WEIGHT PLANE is the same artifact and must therefore get the
+# same production render.
+#
+# NVFP4 and NVFP4A16 are one serialization: identical packed 4-bit weights,
+# identical group scales, identical per-tensor global scale. They differ only in
+# whether the config group declares `input_activations`, which vLLM reads to
+# pick W4A4 (CUTLASS) or W4A16 (Marlin) at RUNTIME. The bytes on disk are the
+# same bytes.
+#
+# The render gate used to be `fmt == "NVFP4"` literally, so NVFP4A16 fell
+# through to the registry RTN path and shipped weights that had never seen
+# GPTQ, static_act_order or JSO -- measured max|diff| 0.0217 against NVFP4 on a
+# 512x1024 Linear. That made A16 strictly WORSE on the weight plane, so any
+# A16-vs-A4 comparison measured the rendering difference rather than the
+# activation contract: a rendering confound, principle 8's exact prohibition,
+# and it silently biased the allocator against ever choosing A16.
+#
+# GPTQ's objective is ||WX - W_hat X|| under the CALIBRATION activations, which
+# are the true unquantized ones in both contracts. Nothing in the weight solve
+# depends on whether activations are quantized at serve time, so the same
+# render is not merely acceptable for both -- it is the correct one, and
+# sharing it makes the activation axis genuinely byte-free AND render-free.
+# That is what lets one production cache entry serve both contracts.
+NVFP4_RENDER_EQUIVALENT = frozenset({"NVFP4", "NVFP4A16"})
+
+
 def _render_base_format(fmt: str) -> str:
+    """The render-base spelling of a requested format name.
+
+    Upper-casing is this module's one normalizer for a format identity: it
+    also spells the cache filenames, the manifest keys and the render-score
+    records, so the render base has to agree with them and it stays as it is.
+    Enumerated over the whole registry (80 rows + 3 aliases), it changes the
+    spelling of exactly one registered name -- ``INT4_W4A16_g128``, the only
+    mixed-case row -- and no other name, alias or Tessera rung.  That one name
+    is not made unresolvable HERE, though: it is unresolvable because case was
+    decided at each caller instead of in the registry, so the fix is in
+    ``format_registry.canonical_format_name``, which now resolves a name
+    case-insensitively as its last probe (#218).  Do not paper over it here.
+    """
     return str(fmt).strip().upper()
 
 
 def _cache_weight_filename(qname: str, fmt: str) -> str:
     safe = qname.replace("/", "__").replace(".", "_")
     return f"{safe}__{fmt}.pt"
+
+
+def _cache_pair_identity_filename(qname: str, fmt: str) -> str:
+    return _cache_weight_filename(qname, fmt) + ".identity.json"
 
 
 _UNCACHED_PACKED_EXPERT_RE = re.compile(
@@ -178,6 +284,9 @@ class ProductionWeightCache:
     _lru_paths: dict[tuple[str, str], str] | None = None
     _lru_bytes: int = 0
     _lru_max_bytes: int = 0
+    _cb_verified_keys: set[tuple[str, str]] | None = None
+    _file_load_max_bytes: int = 0
+    _file_load_receipts: dict | None = None
 
     def __post_init__(self) -> None:
         # Normalize to ``activation_max_abs`` if a caller used the legacy
@@ -186,6 +295,31 @@ class ProductionWeightCache:
             self.activation_max_abs = self.activation_scales
         elif self.activation_scales is None and self.activation_max_abs is not None:
             self.activation_scales = self.activation_max_abs
+
+    def validate_cb_render_identity(
+        self,
+        *,
+        expected_context=None,
+        expected_qnames: Sequence[str] | None = None,
+        col_weights: Mapping[str, torch.Tensor] | None = None,
+        require_for_formats: Sequence[str] = (),
+        require_source_complete: bool = True,
+        where: str = "ProductionWeightCache",
+    ):
+        """Validate and return this cache's persisted CB producer context.
+
+        The context is read from the cache metadata, never reconstructed from
+        the current process environment.  Non-CB caches return ``None``.
+        """
+        return validate_production_cache_cb_render_identity(
+            self,
+            expected_context=expected_context,
+            expected_qnames=expected_qnames,
+            col_weights=col_weights,
+            require_for_formats=require_for_formats,
+            require_source_complete=require_source_complete,
+            where=where,
+        )
 
     def enable_lru(self, max_bytes: int) -> None:
         """Bound the in-memory tensor footprint to ``max_bytes`` via LRU
@@ -196,6 +330,7 @@ class ProductionWeightCache:
         self._lru_order = []
         self._lru_paths = {}
         self._lru_bytes = 0
+        self._file_load_receipts = None
 
     def _evict_to_budget(self) -> None:
         if self._lru_order is None or self._lru_max_bytes <= 0:
@@ -208,6 +343,10 @@ class ProductionWeightCache:
                 # Restore the filename so subsequent lookups still resolve.
                 if self._lru_paths is not None and evict_key in self._lru_paths:
                     self.weights[evict_key] = self._lru_paths[evict_key]
+                if self._cb_verified_keys is not None:
+                    self._cb_verified_keys.discard(evict_key)
+                if self._file_load_receipts is not None:
+                    self._file_load_receipts.pop(evict_key, None)
 
     def compact_for_pickle(self) -> int:
         """Restore disk-backed resident tensors to path references.
@@ -234,7 +373,203 @@ class ProductionWeightCache:
                     compacted += 1
         self._lru_order = [] if self._lru_order is not None else None
         self._lru_bytes = 0
+        self._cb_verified_keys = None
+        self._file_load_receipts = None
         return compacted
+
+    def release_resident_tensors(self, keys: Sequence[tuple[str, str]] | None = None) -> int:
+        """Drop disk-backed resident tensors, keeping every key resolvable.
+
+        Same operation as :meth:`compact_for_pickle` — that one is named for
+        why it was first needed — but callers reach for this one when the goal
+        is *memory*, not serialization: after a one-way install has copied the
+        render set into a live model, nothing reads the cache's resident copies
+        again, and on a 27B assignment they are up to the full LRU cap of dead
+        bytes inside a shared 121.6 GB pool.
+
+        Entries that were never disk-backed are left resident, because dropping
+        those would lose data rather than free a re-readable copy. A later
+        ``get()`` on a released key simply reloads it from disk.
+
+        ``keys`` limits release to entries with a recorded load path. It never
+        adopts an unrelated same-named file as backing for an in-memory tensor.
+        Omitting ``keys`` preserves the legacy whole-cache compaction behavior.
+        """
+        if keys is None:
+            return self.compact_for_pickle()
+        released = 0
+        for key in dict.fromkeys(keys):
+            value = self.weights.get(key)
+            if not isinstance(value, torch.Tensor):
+                continue
+            path = (self._lru_paths or {}).get(key)
+            if path is None:
+                continue  # A non-disk-backed value remains its only owner.
+            self.weights[key] = path
+            if self._lru_order is not None and key in self._lru_order:
+                self._lru_order.remove(key)
+                self._lru_bytes -= value.numel() * value.element_size()
+            if self._cb_verified_keys is not None:
+                self._cb_verified_keys.discard(key)
+            if self._file_load_receipts is not None:
+                self._file_load_receipts.pop(key, None)
+            released += 1
+        return released
+
+    @staticmethod
+    def _window_storage(tensor):
+        if (type(tensor) not in (torch.Tensor, nn.Parameter)
+                or tensor.layout != torch.strided or tensor.device.type == 'meta'):
+            raise RuntimeError('PWC resident window has unaccountable tensor storage')
+        storage = tensor.untyped_storage()
+        return (tensor.device, storage.data_ptr()), storage.nbytes()
+
+    def _window_resident_storages(self):
+        storages = {}
+        for value in self.weights.values():
+            if isinstance(value, torch.Tensor):
+                identity, nbytes = self._window_storage(value)
+                storages[identity] = max(storages.get(identity, 0), nbytes)
+        return storages
+
+    @staticmethod
+    def _window_archive_storage_bytes(source):
+        """Only ordinary uncompressed Torch archives have accountable loads."""
+        from .perturbed_x_cache import torch_archive_storage_bytes
+        return torch_archive_storage_bytes(source)
+
+    def _window_keys(self, keys):
+        if not isinstance(keys, Sequence) or isinstance(keys, (str, bytes)):
+            raise TypeError('PWC window keys must be a finite sequence')
+        resolved, seen = [], set()
+        for pair in keys:
+            if (not isinstance(pair, (tuple, list)) or len(pair) != 2
+                    or any(not isinstance(part, str) or not part for part in pair)):
+                raise ValueError('PWC window needs (name, format) keys')
+            key = self.resolve_key(*pair)
+            if key is None:
+                raise RuntimeError(f'PWC window missing cache entry {pair}')
+            if key not in seen:
+                resolved.append(key)
+                seen.add(key)
+        return tuple(resolved)
+
+    @staticmethod
+    def _window_limits(max_resident_bytes, max_workers):
+        if type(max_resident_bytes) is not int or max_resident_bytes <= 0:
+            raise ValueError('PWC window requires a positive resident byte budget')
+        if (type(max_workers) is not int or max_workers <= 0
+                or max_workers > len(os.sched_getaffinity(0))):
+            raise ValueError('PWC window workers exceed assigned CPU affinity')
+
+    def _window_file(self, key):
+        value = self.weights[key]
+        if not isinstance(value, (str, Path)):
+            raise RuntimeError('PWC window has an unaccountable cache input')
+        path = Path(self._path_for_value(value)).absolute()
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError('PWC window requires a regular file, not a symlink')
+        storage_bytes = self._window_archive_storage_bytes(path)
+        if self._file_signature(path.lstat()) != self._file_signature(before):
+            raise RuntimeError('PWC window file changed during preflight')
+        estimate = self.estimate_nbytes([key])
+        if estimate != before.st_size or storage_bytes > estimate:
+            raise RuntimeError('PWC window file storage estimate changed')
+        return path, before, estimate, storage_bytes
+
+    def plan_resident_windows(self, keys, *, max_resident_bytes: int, max_workers: int):
+        """Plan finite research quanta in input order without loading tensors.
+
+        All existing PWC tensor backing storages count, including unrelated
+        entries and storage hidden behind views; aliases count once. Incoming
+        standard uncompressed Torch files use the existing conservative file
+        estimate. Each quantum has at most ``max_workers`` keys, bounding the
+        existing prefetch pool's futures as well as its loader concurrency.
+        Plans are key-only hints; ``resident_window`` revalidates each entry.
+        """
+        self._window_limits(max_resident_bytes, max_workers)
+        keys = self._window_keys(keys)
+        baseline = sum(self._window_resident_storages().values())
+        if baseline > max_resident_bytes:
+            raise RuntimeError('PWC existing resident storage exceeds window budget')
+        windows, window, nbytes = [], [], baseline
+        for key in keys:
+            value = self.weights[key]
+            incoming = 0 if isinstance(value, torch.Tensor) else self._window_file(key)[2]
+            if baseline + incoming > max_resident_bytes:
+                raise RuntimeError(f'PWC single entry exceeds resident window budget: {key}')
+            if window and (len(window) == max_workers or nbytes + incoming > max_resident_bytes):
+                windows.append(tuple(window))
+                window, nbytes = [], baseline
+            window.append(key)
+            nbytes += incoming
+        if window:
+            windows.append(tuple(window))
+        return tuple(windows)
+
+    @contextmanager
+    def resident_window(self, keys, *, max_resident_bytes: int, max_workers: int,
+                        max_load_buffer_bytes: int | None = None, release_file_pages: bool = False):
+        """Prefetch one research quantum, then expose strict resident lookups.
+
+        This owns no tensor dictionary. PWC remains the only cache; selected
+        disk-backed entries are released on success/failure. Callers must drop
+        their borrowed tensor references at the boundary. Nested windows refuse.
+        The resident cap covers all cache backing storages. Serialized loader
+        buffers have a separate aggregate cap (default: resident cap); both
+        caps, allocator overhead and consumer workspaces need phase admission.
+        Page-release advice is optional and is not a physical-memory guarantee.
+        """
+        if getattr(self, '_resident_window_files', None) is not None:
+            raise RuntimeError('PWC resident windows cannot be nested')
+        if type(release_file_pages) is not bool:
+            raise ValueError('PWC window page release must be boolean')
+        buffer_cap = max_resident_bytes if max_load_buffer_bytes is None else max_load_buffer_bytes
+        if type(buffer_cap) is not int or buffer_cap <= 0:
+            raise ValueError('PWC window needs a positive serialized buffer budget')
+        windows = self.plan_resident_windows(keys, max_resident_bytes=max_resident_bytes,
+                                             max_workers=max_workers)
+        if len(windows) != 1:
+            raise RuntimeError('PWC resident_window requires one nonempty planned quantum')
+        keys = windows[0]
+        files = {}
+        for key in keys:
+            value = self.weights[key]
+            if not isinstance(value, torch.Tensor):
+                path, observed, estimate, storage_bytes = self._window_file(key)
+                files[str(path)] = (observed, estimate, storage_bytes)
+        # Different keys reading one file still allocate separate load buffers.
+        buffer_bytes = sum(files[str(Path(self._path_for_value(self.weights[key])).absolute())][1]
+                           for key in keys if not isinstance(self.weights[key], torch.Tensor))
+        if buffer_bytes > buffer_cap:
+            raise RuntimeError('PWC serialized load buffers exceed window budget')
+        incoming_storage = sum(files[str(Path(self._path_for_value(self.weights[key])).absolute())][2]
+                               for key in keys if not isinstance(self.weights[key], torch.Tensor))
+        if (self._lru_order is not None and self._lru_max_bytes > 0
+                and self._lru_bytes + incoming_storage > self._lru_max_bytes):
+            raise RuntimeError('PWC resident window exceeds available LRU budget')
+        self._resident_window_files = files
+        self._resident_window_receipt_keys = frozenset(
+            key for key in keys if not isinstance(self.weights[key], torch.Tensor))
+        try:
+            loaded = self.prefetch(keys, max_workers=max_workers)
+            for key in keys:
+                self.get_resident(*key)
+            actual = sum(self._window_resident_storages().values())
+            if actual > max_resident_bytes:
+                raise RuntimeError('PWC actual backing storage exceeds resident window budget')
+            if release_file_pages:
+                from .perturbed_x_cache import release_activation_cache_file_pages
+                for path, (observed, _, _) in files.items():
+                    release_activation_cache_file_pages(path, expected_stat=observed)
+            yield {'keys': keys, 'loaded': loaded, 'resident_bytes': actual,
+                   'budget_bytes': max_resident_bytes, 'load_buffer_capacity_bytes': buffer_bytes,
+                   'load_buffer_budget_bytes': buffer_cap, 'file_pages_advised': len(files) if release_file_pages else 0}
+        finally:
+            self.release_resident_tensors(keys)
+            self._resident_window_files = None
+            self._resident_window_receipt_keys = frozenset()
 
     def _path_for_value(self, value: object) -> str:
         path = str(value)
@@ -310,6 +645,23 @@ class ProductionWeightCache:
         responsible for those 3-D entries.
         """
         from prismaquant import format_registry as fr
+
+        cb_formats = [
+            (str(qname), fr.canonical_format_name(str(fmt)))
+            for qname, fmt in assignment.items()
+            if _is_cb_format_name(fr.canonical_format_name(str(fmt)))
+        ]
+        if cb_formats:
+            cb_expected = []
+            for qname, fmt in cb_formats:
+                resolved = self.resolve_key(qname, fmt)
+                if resolved is not None:
+                    cb_expected.append(resolved[0])
+            self.validate_cb_render_identity(
+                expected_qnames=cb_expected,
+                require_for_formats=[fmt for _qname, fmt in cb_formats],
+                where="ProductionWeightCache assignment",
+            )
 
         keys: list[tuple[str, str]] = []
         missing: list[tuple[str, str]] = []
@@ -514,6 +866,149 @@ class ProductionWeightCache:
         self._lru_order.append(key)
         self._evict_to_budget()
 
+    def _validate_loaded_cb_pair_tensor(
+        self,
+        key: tuple[str, str],
+        tensor: torch.Tensor,
+    ) -> None:
+        """Verify an admitted CB shard on its necessary consumer load.
+
+        Resume admission validates the small identity sidecar without an eager
+        full-cache scan. The first real consumer load verifies the logical
+        tensor digest from the cache manifest, combining integrity checking
+        with I/O AURA/export already has to perform.
+        """
+        if not _is_cb_format_name(key[1]):
+            return
+        if self._cb_verified_keys is not None and key in self._cb_verified_keys:
+            return
+        metadata = self.metadata if isinstance(self.metadata, Mapping) else {}
+        artifact_set = metadata.get("cb_cache_pair_artifacts")
+        if artifact_set is None:
+            return
+        if not isinstance(artifact_set, Mapping):
+            raise RuntimeError(
+                "ProductionWeightCache CB pair artifact metadata is malformed"
+            )
+        records = artifact_set.get("records")
+        record_key = f"{key[0]}|{key[1]}"
+        record = records.get(record_key) if isinstance(records, Mapping) else None
+        expected = record.get("tensor") if isinstance(record, Mapping) else None
+        if not isinstance(expected, Mapping):
+            raise RuntimeError(
+                f"ProductionWeightCache CB pair artifact identity is missing "
+                f"for {key[0]}@{key[1]}"
+            )
+        observed = _cb_cache_tensor_identity(tensor)
+        difference = first_identity_difference(
+            expected,
+            observed,
+            path="tensor",
+        )
+        if difference is not None:
+            field, stored, current = difference
+            raise RuntimeError(
+                f"ProductionWeightCache CB shard integrity refused for "
+                f"{key[0]}@{key[1]}: identity field '{field}' differs: "
+                f"stored={identity_value_for_error(stored)} "
+                f"current={identity_value_for_error(current)}"
+            )
+        if self._cb_verified_keys is None:
+            self._cb_verified_keys = set()
+        self._cb_verified_keys.add(key)
+
+    def enable_file_load_receipts(self, *, max_file_bytes: int) -> None:
+        """Capture content provenance on the necessary, bounded PWC file read.
+
+        Receipts describe bytes actually deserialized, not a previous file scan.
+        They exist only while the matching tensor remains resident and unchanged.
+        This is opt-in for preparation; ordinary cache loads retain their path.
+        """
+        if type(max_file_bytes) is not int or max_file_bytes <= 0:
+            raise ValueError("PWC file receipt needs a positive read buffer bound")
+        if self._lru_order is None or self._lru_max_bytes <= 0:
+            raise RuntimeError("PWC file receipts require bounded LRU residency")
+        if any(isinstance(value, torch.Tensor) for value in self.weights.values()):
+            raise RuntimeError("PWC file receipt capture requires unloaded entries")
+        self._file_load_max_bytes = max_file_bytes
+        self._file_load_receipts = {}
+
+    def disable_file_load_receipts(self) -> None:
+        self._file_load_max_bytes = 0
+        self._file_load_receipts = None
+
+    @staticmethod
+    def _file_signature(value):
+        from .perturbed_x_cache import cache_file_stat_signature
+        return cache_file_stat_signature(value)
+
+    @staticmethod
+    def _file_tensor_guard(tensor):
+        return (tensor._version, tensor.untyped_storage().data_ptr(),
+                tensor.storage_offset(), tuple(tensor.shape), tuple(tensor.stride()),
+                str(tensor.dtype), str(tensor.device))
+
+    def _load_file_tensor(self, value):
+        path = Path(self._path_for_value(value)).absolute()
+        limit = getattr(self, "_file_load_max_bytes", 0)
+        window_files = getattr(self, '_resident_window_files', None)
+        window_entry = None
+        if window_files is not None:
+            window_entry = window_files.get(str(path))
+            if window_entry is None:
+                raise RuntimeError('PWC load is outside the active resident window')
+            limit = min(limit, window_entry[1]) if limit else window_entry[1]
+        if not limit:
+            return torch.load(path, map_location="cpu", weights_only=True), None
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("PWC file receipt requires a regular file, not a symlink")
+        if before.st_size > limit:
+            raise RuntimeError("PWC file exceeds the explicit read buffer bound")
+        signature = self._file_signature(before)
+        if window_entry is not None and signature != self._file_signature(window_entry[0]):
+            raise RuntimeError('PWC window file changed before its content read')
+        with path.open("rb") as handle:
+            if self._file_signature(os.fstat(handle.fileno())) != signature:
+                raise RuntimeError("PWC file changed before its content read")
+            raw = handle.read(before.st_size + 1)
+            if (len(raw) != before.st_size or self._file_signature(os.fstat(handle.fileno())) != signature
+                    or self._file_signature(path.lstat()) != signature):
+                raise RuntimeError("PWC file changed during its content read")
+        # The temporary serialized buffer is per loader worker and is released
+        # before its result enters the existing LRU. No whole-cache byte store.
+        receipt = {"path": str(path), "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        if window_entry is not None:
+            if self._window_archive_storage_bytes(io.BytesIO(raw)) != window_entry[2]:
+                raise RuntimeError('PWC window archive storage changed during its read')
+        tensor = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
+        if not isinstance(tensor, torch.Tensor):
+            raise RuntimeError("PWC file receipt requires a tensor shard")
+        if window_entry is not None and self._window_storage(tensor)[1] > window_entry[2]:
+            raise RuntimeError('PWC loaded backing storage exceeds its archive bound')
+        return tensor, (receipt, signature, self._file_tensor_guard(tensor))
+
+    def _record_file_load(self, key, tensor, observed) -> None:
+        if observed is not None and self.weights.get(key) is tensor:
+            if self._file_load_receipts is None:
+                self._file_load_receipts = {}
+            # This is the same resident object, released with its LRU entry.
+            self._file_load_receipts[key] = (tensor, observed)
+
+    def file_load_receipt(self, key, tensor) -> dict:
+        """Return a detached receipt for this exact resident tensor lifetime."""
+        entry = (self._file_load_receipts or {}).get(key)
+        if entry is None or entry[0] is not tensor or self.weights.get(key) is not tensor:
+            if self._file_load_receipts is not None:
+                self._file_load_receipts.pop(key, None)
+            raise RuntimeError("PWC file receipt has no matching resident tensor")
+        receipt, signature, guard = entry[1]
+        if (self._file_tensor_guard(tensor) != guard or
+                self._file_signature(Path(receipt["path"]).lstat()) != signature):
+            self._file_load_receipts.pop(key, None)
+            raise RuntimeError("PWC file receipt tensor or source file changed")
+        return dict(receipt)
+
     def prefetch(self, keys: Sequence[tuple[str, str]] | None = None,
                  max_workers: int = 4) -> int:
         """Eagerly load (a subset of) cache entries via a thread pool.
@@ -531,6 +1026,9 @@ class ProductionWeightCache:
         """
         from concurrent.futures import ThreadPoolExecutor
 
+        if getattr(self, "_file_load_max_bytes", 0):
+            if type(max_workers) is not int or not 0 < max_workers <= len(os.sched_getaffinity(0)):
+                raise ValueError("PWC file receipt workers exceed assigned CPU affinity")
         if keys is None:
             keys = [k for k, v in self.weights.items()
                     if not isinstance(v, torch.Tensor)]
@@ -544,38 +1042,40 @@ class ProductionWeightCache:
             value = self.weights.get(key)
             if value is None or isinstance(value, torch.Tensor):
                 return None
-            return (
-                key,
-                value,
-                torch.load(
-                    self._path_for_value(value),
-                    map_location="cpu",
-                    weights_only=True,
-                ),
-            )
+            tensor, receipt = self._load_file_tensor(value)
+            return key, value, tensor, receipt
 
         loaded_count = 0
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             for item in pool.map(_load_one, keys):
                 if item is None:
                     continue
-                key, original_value, tensor = item
+                key, original_value, tensor, receipt = item
                 if isinstance(self.weights.get(key), torch.Tensor):
                     continue
+                self._validate_loaded_cb_pair_tensor(key, tensor)
                 self.weights[key] = tensor
                 self._record_lru_load(key, original_value, tensor)
+                self._record_file_load(key, tensor, receipt)
                 loaded_count += 1
         return loaded_count
 
-    def _resolve_to_tensor(self, key: tuple[str, str]) -> torch.Tensor | None:
+    def _resolve_to_tensor(self, key: tuple[str, str], *, resident_only=False) -> torch.Tensor | None:
         """Return the tensor at ``key`` (lazy-load from disk if needed).
         With LRU enabled, the freshly-loaded tensor is bookkept and the
         oldest entries get evicted back to filenames when the byte budget
         is exceeded.  Returns None if the key isn't present."""
         v = self.weights.get(key)
+        if resident_only and not isinstance(v, torch.Tensor):
+            raise RuntimeError(f'PWC cache entry is not resident: {key}')
         if v is None:
             return None
         if isinstance(v, torch.Tensor):
+            self._validate_loaded_cb_pair_tensor(key, v)
+            if resident_only and (getattr(self, '_file_load_max_bytes', 0)
+                                  or key in (self._file_load_receipts or {})
+                                  or key in getattr(self, '_resident_window_receipt_keys', ())):
+                self.file_load_receipt(key, v)
             # Refresh LRU position.
             if self._lru_order is not None:
                 if key in self._lru_order:
@@ -583,17 +1083,30 @@ class ProductionWeightCache:
                 self._lru_order.append(key)
             return v
         # Treat anything non-tensor as a filename / path.
-        path = self._path_for_value(v)
-        loaded = torch.load(path, map_location="cpu", weights_only=True)
+        loaded, receipt = self._load_file_tensor(v)
+        self._validate_loaded_cb_pair_tensor(key, loaded)
         self.weights[key] = loaded
         self._record_lru_load(key, v, loaded)
+        self._record_file_load(key, loaded, receipt)
         return loaded
 
-    def get(self, name: str, fmt: str) -> torch.Tensor | None:
+    def get(self, name: str, fmt: str, *, resident_only=False) -> torch.Tensor | None:
         key = self.resolve_key(name, fmt)
         if key is not None:
-            return self._resolve_to_tensor(key)
+            if _is_cb_format_name(key[1]):
+                self.validate_cb_render_identity(
+                    expected_qnames=[key[0]],
+                    require_for_formats=[key[1]],
+                    where=f"ProductionWeightCache get({key[0]}@{key[1]})",
+                )
+            return self._resolve_to_tensor(key, resident_only=resident_only)
+        if resident_only:
+            raise RuntimeError(f'PWC missing cache entry: {name}@{fmt}')
         return None
+
+    def get_resident(self, name: str, fmt: str) -> torch.Tensor:
+        """Return a resident tensor with CB/receipt guards; never load a file."""
+        return self.get(name, fmt, resident_only=True)
 
     def relocate(self, new_cache_dir: str | Path) -> None:
         """Point the cache at a new on-disk directory of .pt shards.
@@ -782,6 +1295,27 @@ class _LinearActivationCollector:
                 if prev is None
                 else torch.maximum(prev, x_abs_max.detach())
             )
+            # Draw this call's row priorities for EVERY hooked Linear,
+            # stored or not. One generator feeds every Linear's reservoir, so
+            # the slice of the stream a Linear receives is a function of how
+            # many rows every earlier hook consumed. Drawing only for stored
+            # Linears makes a run that stores a subset -- a `--resume` build
+            # that skips already-rendered units, or any per-unit split of a
+            # render -- keep DIFFERENT rows than the full run, and the
+            # rendered bytes follow the rows. Draws are CPU floats; the cost
+            # is noise next to the D2H copy below.
+            last_dim = int(x.shape[-1]) if x.dim() >= 1 else 0
+            n_rows = (x.numel() // last_dim) if last_dim > 0 else 0
+            new_priorities = (
+                torch.rand(
+                    int(n_rows),
+                    generator=self._activation_generator,
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+                if n_rows > 0 and self.max_rows > 0
+                else None
+            )
             # Only store the full activation tensor if this Linear is in
             # the store set.  Memory bound: store_qnames × max_rows × in.
             if key not in self.store_qnames:
@@ -804,7 +1338,7 @@ class _LinearActivationCollector:
                 self._activation_priorities.get(key),
                 flat,
                 max_rows=self.max_rows,
-                generator=self._activation_generator,
+                new_priorities=new_priorities,
             )
             self.activations[key] = [] if sampled is None else [sampled]
             if priorities is None:
@@ -1035,22 +1569,58 @@ def _store_rendered_weight_entry(
     fmt: str,
     tensor: torch.Tensor,
     weight_dtype: torch.dtype,
+    durable: bool = False,
 ) -> None:
     from prismaquant import format_registry as fr
 
     fmt = fr.canonical_format_name(str(fmt).strip().upper())
-    target_dtype = weight_dtype if weight_dtype != torch.float32 else torch.bfloat16
-    stored = tensor.to(target_dtype).cpu()
+    stored = _canonical_rendered_weight_tensor(
+        tensor,
+        weight_dtype=weight_dtype,
+    )
     if cache_dir_path is not None:
         fname = _cache_weight_filename(qname, fmt)
         final_path = cache_dir_path / fname
         tmp_path = cache_dir_path / (fname + ".tmp")
         torch.save(stored, tmp_path)
+        if durable:
+            fd = os.open(tmp_path, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         os.replace(tmp_path, final_path)
+        if durable:
+            directory_fd = os.open(cache_dir_path, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         weights[(qname, fmt)] = fname
         del stored
     else:
         weights[(qname, fmt)] = stored
+
+
+def _canonical_rendered_weight_tensor(
+    tensor: torch.Tensor,
+    *,
+    weight_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return the exact tensor representation a cache shard would contain.
+
+    Renderers may compute in FP32 even when the source model is BF16.  Any
+    transient consumer must score this canonical representation, rather than
+    the wider temporary, so its scalar describes the bytes later installed by
+    validation/export.
+    """
+    target_dtype = (
+        weight_dtype if weight_dtype != torch.float32 else torch.bfloat16
+    )
+    return tensor.detach().to(
+        dtype=target_dtype,
+        device="cpu",
+    ).contiguous()
 
 @dataclass
 class _RenderedCandidate:
@@ -1167,6 +1737,7 @@ def _render_score_record(
     rendered_weight: torch.Tensor,
     activations: torch.Tensor | None,
     activation_max_abs: float | None,
+    input_global_scale_policy: str | None = None,
 ) -> dict[str, object]:
     raw_score, raw_metric = _render_score_for_gate(
         reference_weight.detach().to(torch.float32),
@@ -1177,26 +1748,56 @@ def _render_score_record(
     metric = raw_metric
     activation_quantized = False
     activation_clipped = False
-    activation_clip_max = (
-        activation_max_abs
-        if _format_uses_static_activation_clip(fmt) else
-        None
-    )
+    from prismaquant import format_registry as fr
+
+    spec = fr.get_format(fr.canonical_format_name(fmt))
+    contract = _static_activation_contract_of(spec)
+    # Which activation quantizer the row is scored under is the SPEC's answer
+    # (``static_activation_contract``), not its name's (#205):
+    #
+    #   * served-measurement contract (a Tessera W4A4 rung): the served oracle
+    #     at the unit's calibrated G, no pre-clip (the clamp lives in G), and
+    #     the record keeps the maximum and the G it was priced at.  A unit
+    #     with no maximum refuses by name -- there is no dynamic serving path
+    #     whose score would mean anything.
+    #   * screen-default contract (stock NVFP4): the historical clip to the
+    #     calibrated maximum + the row's dynamic RTN.
+    #   * no contract (FP8/MX dynamic W8A8): the row's dynamic quantizer,
+    #     unclipped -- applying NVFP4's maximum there prices the wrong kernel.
+    #
+    # Either contract retains the calibration maximum in the record: it is the
+    # unit's scale identity, and a reader must be able to see which contract
+    # the row was priced under.
+    served_measurement = contract is not None and contract.measured_as_served
+    recorded_max_abs = activation_max_abs if contract is not None else None
+    activation_clip_max = None if served_measurement else recorded_max_abs
+    # Which policy this row is priced under: the one the caller resolved for
+    # the whole fill (its render levers), else the live one.  Resolved ONCE
+    # here so the G that scores and the policy the record stamps are the same
+    # answer (#227).
+    policy = _resolve_render_input_global_scale_policy(input_global_scale_policy)
+    input_global_scale: float | None = None
     if (
         activations is not None
         and activations.numel() > 0
         and int(activations.shape[-1]) == int(reference_weight.shape[1])
     ):
+        if served_measurement:
+            input_global_scale = contract.require_input_global_scale(
+                activation_max_abs, qname=qname,
+                consumer=f"production cache render score @ {fmt}",
+                policy=policy)
+            g = float(input_global_scale)
+            activation_quantize = lambda t: contract.quantize_dequantize(t, g)  # noqa: E731
+        else:
+            activation_quantize = spec.activation_quantize_dequantize
         try:
-            from prismaquant import format_registry as fr
-
-            spec = fr.get_format(fr.canonical_format_name(fmt))
             score, metric, activation_quantized, activation_clipped = (
                 _local_forward_render_score(
                     reference_weight=reference_weight,
                     rendered_weight=rendered_weight,
                     activations=activations,
-                    activation_quantize=spec.activation_quantize_dequantize,
+                    activation_quantize=activation_quantize,
                     activation_max_abs=activation_clip_max,
                 )
             )
@@ -1239,26 +1840,92 @@ def _render_score_record(
         "activation_quantized": bool(activation_quantized),
         "activation_clipped": bool(activation_clipped),
         "activation_max_abs": (
-            float(activation_clip_max)
-            if activation_clip_max is not None and activation_clip_max > 0
+            float(recorded_max_abs)
+            if recorded_max_abs is not None and recorded_max_abs > 0
             else None
+        ),
+        # The static G the row was priced at, when its contract is the served
+        # one; None for rows scored under a dynamic quantizer.
+        "input_global_scale": (
+            float(input_global_scale) if input_global_scale is not None else None
+        ),
+        # ... and the policy that G came out of, so a later resume or KL hook
+        # can say WHY a retained cost no longer matches (#227).  Stamped only
+        # where it priced something: a dynamically scored row does not depend
+        # on it, and claiming otherwise would invalidate FP8/MX rows for a
+        # setting that never touched them.
+        "input_global_scale_policy": (
+            str(policy) if input_global_scale is not None else None
         ),
         "out_features": int(rows),
         "in_features": int(cols),
     }
 
 
-def _format_uses_static_activation_clip(fmt: str) -> bool:
-    """Return whether local scoring should apply a calibrated activation max.
+def _resolve_format_spec(fmt):
+    """The ``FormatSpec`` a requested format name resolves to, or ``None``.
 
-    NVFP4 serving uses a calibrated tensor-level activation scale plus local
-    tensor-group quantization. MXFP8/FP8 dynamic serving computes activation
-    scales at runtime, so applying the NVFP4 activation max to those formats
-    prices the wrong kernel contract.
+    ONE home for "does this requested name resolve to a spec, and if so which"
+    (principle 8).  Every predicate in this module that classifies a name off
+    the format menu goes through here, so they cannot answer that question
+    differently again.  Two properties, both load-bearing:
+
+    * It does not upper-case.  ``fr.canonical_format_name`` settles case
+      itself; an extra ``.upper()`` here is redundant at best, and at worst it
+      destroys a mixed-case registered name before any resolver sees it
+      (#218).  These predicates are handed ``_render_base_format`` output,
+      which has already normalized -- so they resolve the name they are given.
+
+    * It answers ``None`` rather than raising.  These are predicates over a
+      requested format MENU, and a menu can carry a name this registry does
+      not own; "not a format we know" is an answer, not an error.  A caller
+      that wants to refuse an unknown format raises its own named refusal
+      where the menu is validated -- not a bare ``KeyError`` escaping from a
+      question about activation scales, mid-fill, before a tensor is
+      rendered.
     """
     from prismaquant import format_registry as fr
 
-    return fr.canonical_format_name(str(fmt).strip().upper()) == "NVFP4"
+    try:
+        return fr.get_format(fr.canonical_format_name(str(fmt).strip()))
+    except Exception:
+        return None
+
+
+def _static_activation_contract_of(spec):
+    """``spec.static_activation_contract``, tolerant of the bare stand-ins
+    tests hand ``fr.get_format`` back (a namespace with only the callable)."""
+    return getattr(spec, "static_activation_contract", None)
+
+
+def _format_uses_static_activation_clip(fmt: str) -> bool:
+    """Return whether local scoring should apply a calibrated activation max.
+
+    True for a format whose serving contract is a calibrated STATIC per-unit
+    activation scale (``FormatSpec.static_activation_contract``, read from the
+    spec -- a Tessera W4A4 rung answers yes with no "NVFP4" in its name).
+    MXFP8/FP8 dynamic serving computes activation scales at runtime, so
+    applying a calibrated maximum to those formats prices the wrong kernel
+    contract.  Whether the maximum is applied as a pre-clip or as the G of the
+    served oracle is the contract's ``measured_as_served``; this predicate only
+    says the maximum belongs to the row.
+
+    Total over the menu: a name this registry does not resolve is not served
+    under a static activation contract, so it answers False (#218).
+    """
+    return _static_activation_contract_of(_resolve_format_spec(fmt)) is not None
+
+
+def _formats_need_static_activation_max(formats) -> bool:
+    """Whether a cache fill over ``formats`` must measure per-unit max|x|.
+
+    The fill collects the calibrated activation maximum only when some
+    requested format is served under a static per-unit activation scale; it
+    used to ask ``"NVFP4" in formats``, which a Tessera-only fill answered
+    "no" -- so its records could never retain a maximum and its assignment-KL
+    hooks never had a scale identity to price with (#205).
+    """
+    return any(_format_uses_static_activation_clip(fmt) for fmt in formats)
 
 
 def _local_forward_render_score(
@@ -1313,19 +1980,28 @@ def _local_forward_render_score(
 def _load_render_score_sidecar(path: Path | None) -> dict[str, dict[str, object]]:
     if path is None or not path.is_file():
         return {}
-    import json as _json
 
     try:
-        raw = _json.loads(path.read_text())
-    except Exception:
-        return {}
+        raw = json.loads(path.read_text())
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to load render-score sidecar {path}: {exc}; "
+            "refusing resume"
+        ) from exc
     records = raw.get("records") if isinstance(raw, Mapping) else None
     if not isinstance(records, Mapping):
-        return {}
+        raise RuntimeError(
+            f"render-score sidecar {path} does not contain a records object; "
+            "refusing resume"
+        )
     out: dict[str, dict[str, object]] = {}
     for key, value in records.items():
-        if isinstance(value, Mapping):
-            out[str(key)] = dict(value)
+        if not isinstance(value, Mapping):
+            raise RuntimeError(
+                f"render-score sidecar {path} has a non-object record for "
+                f"{key!r}; refusing resume"
+            )
+        out[str(key)] = dict(value)
     return out
 
 
@@ -1344,6 +2020,177 @@ def _write_render_score_sidecar(
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(_json.dumps(payload, indent=2, sort_keys=True))
     os.replace(tmp, path)
+
+
+def _render_score_record_priced_scale(
+    record: Mapping[str, object],
+    *,
+    key: str,
+    where: str,
+) -> tuple[str, float, float, str | None] | None:
+    """``(qname, priced_G, max_abs, priced_policy)`` for a served-contract row.
+
+    ``None`` for a row that carries no static G -- one scored under a dynamic
+    quantizer (FP8/MX), or scored without activations.  Nothing about those
+    rows depends on the input-global-scale policy, so nothing about them is
+    invalidated by a change to it.
+
+    A row that carries a G but no maximum to have derived it from is neither:
+    it is an inconsistent record, and it fails closed here rather than being
+    admitted as "nothing to check".
+    """
+    priced = record.get("input_global_scale")
+    if priced is None:
+        return None
+    qname = str(record.get("qname") or key)
+    max_abs = record.get("activation_max_abs")
+    try:
+        priced_value = float(priced)  # type: ignore[arg-type]
+        max_abs_value = float(max_abs)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"{where}: render score {key!r} records "
+            f"input_global_scale={priced!r} with activation_max_abs="
+            f"{max_abs!r}; refusing to reuse a cost whose static scale cannot "
+            "be checked against the current policy"
+        ) from None
+    if (
+        not math.isfinite(priced_value) or priced_value <= 0.0
+        or not math.isfinite(max_abs_value) or max_abs_value <= 0.0
+    ):
+        raise RuntimeError(
+            f"{where}: render score {key!r} records a non-positive static "
+            f"activation scale (input_global_scale={priced!r}, "
+            f"activation_max_abs={max_abs!r}); refusing to reuse it"
+        )
+    policy = record.get("input_global_scale_policy")
+    return (
+        qname,
+        priced_value,
+        max_abs_value,
+        None if policy is None else str(policy),
+    )
+
+
+def _check_resumed_render_score_policies(
+    records: Mapping[str, Mapping[str, object]],
+    *,
+    policy: str,
+    where: str,
+) -> int:
+    """Refuse retained activation-aware costs priced under another policy.
+
+    The resume loop admits a shard as rendered by file presence and keeps its
+    existing score by ``qname|FMT`` key, so without this a cache filled under
+    ``PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0`` (G = 6/amax) silently
+    contributes its old costs to a run that quantizes activations at
+    ``448*6/amax`` -- the same weights, the same maximum, a different served
+    A-side, and therefore a different cost (#227).
+
+    The check is the recorded G against the G this policy derives from the
+    SAME recorded maximum, so it holds for records written before the policy
+    stamp existed as well as after; the stamp only lets the refusal name the
+    two policies.  Returns how many rows carried a static G.
+    """
+    from prismaquant.nvfp4_activation_contract import (
+        input_global_scale_from_max_abs,
+        require_matching_input_global_scale,
+    )
+
+    checked = 0
+    for key in sorted(records):
+        record = records[key]
+        if not isinstance(record, Mapping):
+            continue
+        priced = _render_score_record_priced_scale(
+            record, key=key, where=where)
+        if priced is None:
+            continue
+        qname, priced_value, max_abs_value, priced_policy = priced
+        checked += 1
+        require_matching_input_global_scale(
+            priced_value,
+            input_global_scale_from_max_abs(max_abs_value, policy=policy),
+            qname=qname,
+            consumer=where,
+            priced_policy=priced_policy,
+            applied_policy=policy,
+        )
+    return checked
+
+
+def production_cache_priced_input_global_scales(
+    cache, *, where: str = "ProductionWeightCache",
+) -> dict[str, float]:
+    """The static G each unit's retained render score was priced at.
+
+    The measurement side of #227: an assignment-KL hook derives its own G from
+    the cache's calibrated maximum and the CURRENT policy, and must compare it
+    against the G the cost it is measuring against was priced at.  Read from
+    the cache's own ``render_scores`` provenance, never from the environment.
+
+    Rows without a static G (dynamic quantizers) contribute nothing.  Two rows
+    for one unit disagreeing is the very defect this guards -- G is a function
+    of the unit's maximum and one policy -- so it refuses by name rather than
+    picking one.
+    """
+    metadata = cache.metadata if isinstance(
+        getattr(cache, "metadata", None), Mapping) else {}
+    section = metadata.get("render_scores")
+    records = section.get("records") if isinstance(section, Mapping) else None
+    if not isinstance(records, Mapping):
+        return {}
+    priced_scales: dict[str, float] = {}
+    for key in sorted(records):
+        record = records[key]
+        if not isinstance(record, Mapping):
+            continue
+        priced = _render_score_record_priced_scale(
+            record, key=str(key), where=where)
+        if priced is None:
+            continue
+        qname, priced_value, _max_abs, _policy = priced
+        previous = priced_scales.get(qname)
+        if previous is not None and previous != priced_value:
+            raise RuntimeError(
+                f"{where}: {qname!r} has render scores priced at two static "
+                f"activation scales ({previous!r} and {priced_value!r}); the "
+                "cache mixes input-global-scale policies and cannot be "
+                "measured against"
+            )
+        priced_scales[qname] = priced_value
+    return priced_scales
+
+
+def _load_activation_max_abs_sidecar(path: Path) -> dict[str, float]:
+    try:
+        raw = json.loads(path.read_text())
+    except Exception as exc:
+        raise RuntimeError(
+            f"failed to load activation max-abs sidecar {path}: {exc}; "
+            "refusing resume"
+        ) from exc
+    if not isinstance(raw, Mapping):
+        raise RuntimeError(
+            f"activation max-abs sidecar {path} is not a JSON object; "
+            "refusing resume"
+        )
+
+    values: dict[str, float] = {}
+    for qname, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(
+                f"activation max-abs sidecar {path} has a non-numeric value "
+                f"for {qname!r}; refusing resume"
+            )
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric <= 0.0:
+            raise RuntimeError(
+                f"activation max-abs sidecar {path} has an invalid value "
+                f"for {qname!r}: {value!r}; refusing resume"
+            )
+        values[str(qname)] = numeric
+    return values
 
 
 def _format_supports_render_mechanism(fmt: str, mechanism: str) -> bool:
@@ -1373,7 +2220,2219 @@ def _format_supports_render_mechanism(fmt: str, mechanism: str) -> bool:
         return mech in {"gptq", "static_act_order"} or (
             mech == "scale_sweep" and fmt_u == "MXFP8_E4M3"
         )
+    if _weighted_render_family(fmt_u) is not None:
+        # VQ codebooks quantize 8-column vectors jointly and k-quant
+        # superblocks pick scales per block; the scalar-column mechanisms
+        # (gptq/jso/scale_sweep/act_order) do not apply to either. The
+        # imatrix-weighted search IS the deliberate render (col_weights) —
+        # re-vet R3 / CB Milestone C made it reachable from this path.
+        return mech == "weighted_vq"
     return False
+
+
+# Format families whose EXPORTER renders imatrix-weighted, so a production
+# render of the same (qname, fmt) is only exporter-faithful when it applies the
+# same per-input-column vector. Keyed off the family exactly as
+# `measure_quant_cost._cost_render_uses_imatrix` keys the inline cost render —
+# one invariant, two call sites, no third opinion.
+WEIGHTED_RENDER_FAMILIES = ("nvfp4_cb", "fp8_cb", "gguf")
+
+
+def _expert_col_weights(
+    stack_cw: torch.Tensor | None, index: int, n_experts: int,
+) -> torch.Tensor | None:
+    """Slice a packed-expert imatrix entry for expert ``index``.
+
+    **Delegates** to ``measure_quant_cost._item_col_weights`` rather than
+    re-deriving the rule: a ``(E, in)`` stack is indexed per expert, anything
+    else is a single pooled vector shared by every expert. One definition, two
+    readers — if the cost stage and the cache ever sliced the same pickle
+    differently they would weight the same tensor differently, which is the
+    rendering confound wearing a new hat.
+    """
+    if stack_cw is None:
+        return None
+    from prismaquant.measure_quant_cost import _item_col_weights
+
+    return _item_col_weights(stack_cw, index, n_experts)
+
+
+def _weighted_render_family(fmt: str) -> str | None:
+    """The weighted-render family of ``fmt``, or ``None`` for every format
+    whose render ignores ``col_weights`` (NVFP4/FP8/MX/BF16/INT)."""
+    family = getattr(_resolve_format_spec(fmt), "family", None)
+    return family if family in WEIGHTED_RENDER_FAMILIES else None
+
+
+def _is_cb_format_name(fmt: str) -> bool:
+    """Return whether ``fmt`` is one of the two serialized CB families."""
+    return getattr(_resolve_format_spec(fmt), "family", None) in {
+        "nvfp4_cb", "fp8_cb"}
+
+
+def _cb_qnames_in_render_scope(
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+) -> list[str]:
+    return list(_canonical_cb_render_scope(formats_by_qname))
+
+
+def _canonical_cb_render_scope(
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+) -> dict[str, list[str]]:
+    """Canonical qname -> serialized-CB-format render scope."""
+    from prismaquant import format_registry as fr
+
+    scope: dict[str, list[str]] = {}
+    for raw_qname, raw_formats in formats_by_qname.items():
+        formats = (
+            (raw_formats,)
+            if isinstance(raw_formats, str)
+            else tuple(raw_formats)
+        )
+        canonical = sorted({
+            fr.canonical_format_name(str(fmt).strip().upper())
+            for fmt in formats
+            if _is_cb_format_name(fmt)
+        })
+        if canonical:
+            scope[str(raw_qname)] = canonical
+    return dict(sorted(scope.items()))
+
+
+def _canonical_cb_col_weights_identity(
+    col_weights: Mapping[str, torch.Tensor] | None,
+    qnames: Sequence[str],
+) -> tuple[str, dict[str, list[int]], dict[str, str]]:
+    """Hash the exact imatrix values that make a CB render reproducible.
+
+    The byte stream is version-tagged and consists of sorted, length-framed
+    ``qname``, tensor ``shape``, and contiguous little-endian CPU float32
+    values.  Length framing prevents concatenation ambiguity, and the explicit
+    dtype/endian conversion makes insertion order, source dtype, device, and
+    striding irrelevant to the identity.
+    """
+    if not isinstance(col_weights, Mapping):
+        raise ValueError(
+            "production CB render requires an explicit col_weights mapping "
+            "for its persisted render identity"
+        )
+
+    names = sorted(dict.fromkeys(str(name) for name in qnames))
+    missing = [name for name in names if name not in col_weights]
+    if missing:
+        raise ValueError(
+            "production CB render identity is missing col_weights for "
+            f"{len(missing)} qname(s); sample={missing[:8]}"
+        )
+
+    digest = hashlib.sha256()
+    digest.update((CB_COL_WEIGHTS_HASH_SCHEMA + "\0").encode("utf-8"))
+    shapes: dict[str, list[int]] = {}
+    content_digests: dict[str, str] = {}
+
+    def _frame(payload: bytes) -> None:
+        digest.update(len(payload).to_bytes(8, byteorder="little", signed=False))
+        digest.update(payload)
+
+    for qname in names:
+        tensor = torch.as_tensor(col_weights[qname]).detach().to(
+            device="cpu",
+            dtype=torch.float32,
+        ).contiguous()
+        if tensor.layout != torch.strided:
+            raise ValueError(
+                f"production CB col_weights for {qname!r} must be strided"
+            )
+        shape = [int(dim) for dim in tensor.shape]
+        shapes[qname] = shape
+        _frame(qname.encode("utf-8"))
+        _frame(json.dumps(shape, separators=(",", ":")).encode("ascii"))
+        # ``<f4`` fixes little-endian float32 even on a big-endian producer.
+        raw = tensor.numpy().astype("<f4", copy=False).tobytes(order="C")
+        content_digests[qname] = hashlib.sha256(raw).hexdigest()
+        _frame(raw)
+    return digest.hexdigest(), shapes, content_digests
+
+
+def canonical_cb_col_weights_sha256(
+    col_weights: Mapping[str, torch.Tensor] | None,
+    qnames: Sequence[str],
+) -> str:
+    """Public digest helper for producer provenance and focused audits."""
+    digest, _, _ = _canonical_cb_col_weights_identity(col_weights, qnames)
+    return digest
+
+
+def _canonical_json_value(value, *, where: str):
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{where} is not canonical JSON data") from exc
+    return json.loads(encoded)
+
+
+def _cb_render_contract(
+    levers: Mapping[str, object] | None,
+    mechanism_plan,
+    cb_formats: Sequence[str],
+) -> dict[str, object]:
+    if not isinstance(levers, Mapping):
+        raise ValueError(
+            "production CB render identity requires explicit resolved render "
+            "levers"
+        )
+    if not bool(levers.get("weighted_vq", True)):
+        raise ValueError(
+            "production CB render identity requires weighted_vq=True"
+        )
+    ordered = getattr(mechanism_plan, "ordered", mechanism_plan)
+    if ordered is None:
+        raise ValueError(
+            "production CB render identity requires an explicit resolved "
+            "render mechanism plan"
+        )
+    records: list[dict[str, object]] = []
+    calibration_dependent: list[str] = []
+    for raw in ordered:
+        if isinstance(raw, Mapping):
+            record = {
+                str(key): raw[key]
+                for key in (
+                    "name", "operation", "scope", "phase", "gate_metric"
+                )
+                if key in raw
+            }
+            name = str(record.get("name", ""))
+        else:
+            name = str(getattr(raw, "name", raw))
+            record = {
+                "name": name,
+                **({
+                    key: getattr(raw, key)
+                    for key in (
+                        "operation", "scope", "phase", "gate_metric"
+                    )
+                    if hasattr(raw, key)
+                }),
+            }
+        records.append(_canonical_json_value(
+            record,
+            where="CB render mechanism record",
+        ))
+        if any(
+            _format_supports_render_mechanism(fmt, name)
+            and name != "weighted_vq"
+            for fmt in cb_formats
+        ):
+            calibration_dependent.append(name)
+    if calibration_dependent:
+        raise ValueError(
+            "production CB render unexpectedly enables calibration-dependent "
+            f"mechanisms {sorted(set(calibration_dependent))}; bind their "
+            "inputs before admitting them to the CB contract"
+        )
+    return {
+        "schema": CB_RENDER_CONTRACT_SCHEMA,
+        "mechanism_abi": CB_RENDER_MECHANISM_ABI,
+        "resolved_levers": _canonical_json_value(
+            dict(levers),
+            where="CB resolved render levers",
+        ),
+        "mechanism_plan": records,
+        "cb_active_mechanisms": ["weighted_vq"],
+        "calibration_dependent_mechanisms": [],
+    }
+
+
+def _source_weight_value_identity(
+    weight: torch.Tensor,
+) -> tuple[list[int], str]:
+    tensor = torch.as_tensor(weight).detach()
+    shape = [int(dim) for dim in tensor.shape]
+    digest = hashlib.sha256()
+    max_chunk_elements = 4 * 1024 * 1024  # <=16 MiB after fp32 conversion
+
+    def _chunks_c_order(value: torch.Tensor):
+        if value.numel() <= max_chunk_elements or value.ndim == 0:
+            yield value
+            return
+        trailing = math.prod(int(dim) for dim in value.shape[1:])
+        if trailing <= max_chunk_elements:
+            step = max(1, max_chunk_elements // max(trailing, 1))
+            for start in range(0, int(value.shape[0]), step):
+                yield value[start:start + step]
+            return
+        # A single leading slice is still too large. Recurse dimension by
+        # dimension; concatenating these chunks is exactly C-order traversal.
+        for index in range(int(value.shape[0])):
+            yield from _chunks_c_order(value[index])
+
+    for chunk in _chunks_c_order(tensor):
+        cpu = chunk.to(device="cpu", dtype=torch.float32).contiguous()
+        digest.update(
+            cpu.numpy().astype("<f4", copy=False).tobytes(order="C")
+        )
+        del cpu
+    return shape, digest.hexdigest()
+
+
+def _combined_source_weights_sha256(
+    shapes: Mapping[str, Sequence[int]],
+    content_digests: Mapping[str, str],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update((CB_SOURCE_WEIGHTS_HASH_SCHEMA + "\0").encode("utf-8"))
+
+    def _frame(payload: bytes) -> None:
+        digest.update(len(payload).to_bytes(8, "little", signed=False))
+        digest.update(payload)
+
+    for qname in sorted(content_digests):
+        _frame(qname.encode("utf-8"))
+        _frame(json.dumps(
+            [int(dim) for dim in shapes[qname]],
+            separators=(",", ":"),
+        ).encode("ascii"))
+        _frame(bytes.fromhex(str(content_digests[qname])))
+    return digest.hexdigest()
+
+
+def validate_cb_render_source_weight(
+    identity: Mapping[str, object],
+    qname: str,
+    weight: torch.Tensor,
+    *,
+    where: str,
+) -> None:
+    """Incrementally verify one decoded exporter source tensor."""
+    if (
+        not isinstance(identity, Mapping)
+        or identity.get("schema") != CB_RENDER_IDENTITY_SCHEMA
+        or identity.get("source_weights_complete") is not True
+    ):
+        raise ValueError(
+            f"{where}: missing source-complete CB render identity"
+        )
+    name = str(qname)
+    shapes = identity.get("source_weights_shapes")
+    content = identity.get("source_weights_content_sha256")
+    if (
+        not isinstance(shapes, Mapping)
+        or not isinstance(content, Mapping)
+        or name not in shapes
+        or name not in content
+    ):
+        raise ValueError(
+            f"{where}: decoded CB source qname {name!r} is absent from the "
+            "selected render identity"
+        )
+    shape, digest = _source_weight_value_identity(weight)
+    if (
+        shape != [int(dim) for dim in shapes[name]]
+        or digest != str(content[name]).lower()
+    ):
+        raise ValueError(
+            f"{where}: decoded CB source-weight value differs for {name!r}"
+        )
+
+
+def build_production_cache_cb_render_identity(
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+    *,
+    cb_serialization_context,
+    col_weights: Mapping[str, torch.Tensor] | None,
+    render_levers: Mapping[str, object] | None,
+    render_mechanism_plan,
+) -> dict[str, object] | None:
+    """Build the fresh, versioned identity for a CB cache render scope.
+
+    ``None`` is returned only when the scope has no CB formats.  A CB scope
+    requires a caller-supplied ``CBSerializationContext``; this function never
+    consults process environment defaults.
+    """
+    scope = _canonical_cb_render_scope(formats_by_qname)
+    qnames = list(scope)
+    if not scope:
+        return None
+    if cb_serialization_context is None:
+        raise ValueError(
+            "production CB render requires an explicit "
+            "CBSerializationContext; refusing to infer layout/codebook "
+            "identity from the current environment"
+        )
+    from prismaquant.nvfp4_cb_footprint import (
+        CBSerializationContext,
+        cb_serialization_context_stamp,
+    )
+
+    if not isinstance(cb_serialization_context, CBSerializationContext):
+        raise TypeError(
+            "cb_serialization_context must be a CBSerializationContext, got "
+            f"{type(cb_serialization_context).__name__}"
+        )
+    col_digest, shapes, content_digests = _canonical_cb_col_weights_identity(
+        col_weights,
+        qnames,
+    )
+    cb_formats = sorted({fmt for formats in scope.values() for fmt in formats})
+    return {
+        "schema": CB_RENDER_IDENTITY_SCHEMA,
+        "cb_serialized_payload": cb_serialization_context_stamp(
+            cb_serialization_context,
+            formats=cb_formats,
+        ),
+        "render_contract": _cb_render_contract(
+            render_levers,
+            render_mechanism_plan,
+            cb_formats,
+        ),
+        "cb_formats_by_qname": scope,
+        "col_weights_schema": CB_COL_WEIGHTS_HASH_SCHEMA,
+        "col_weights_sha256": col_digest,
+        "col_weights_entries": len(qnames),
+        "col_weights_qnames": qnames,
+        "col_weights_shapes": shapes,
+        "col_weights_content_sha256": content_digests,
+        "source_weights_schema": CB_SOURCE_WEIGHTS_HASH_SCHEMA,
+        "source_weights_complete": False,
+        "source_weights_sha256": None,
+        "source_weights_shapes": {},
+        "source_weights_content_sha256": {},
+    }
+
+
+_IDENTITY_MISSING = object()
+
+
+def first_identity_difference(
+    stored: object,
+    expected: object,
+    *,
+    path: str = "",
+) -> tuple[str, object, object] | None:
+    """Return the first canonical-identity difference, including its field.
+
+    Resume gates use this rather than a single aggregate digest so an operator
+    is told *which* value-bearing input changed.  Mapping keys are traversed in
+    sorted order and sequences in index order, making the reported field stable.
+    """
+    if isinstance(stored, Mapping) and isinstance(expected, Mapping):
+        keys = sorted(set(str(key) for key in stored) | set(
+            str(key) for key in expected
+        ))
+        stored_by_name = {str(key): value for key, value in stored.items()}
+        expected_by_name = {str(key): value for key, value in expected.items()}
+        for key in keys:
+            child = f"{path}.{key}" if path else key
+            left = stored_by_name.get(key, _IDENTITY_MISSING)
+            right = expected_by_name.get(key, _IDENTITY_MISSING)
+            if left is _IDENTITY_MISSING or right is _IDENTITY_MISSING:
+                return child, left, right
+            different = first_identity_difference(left, right, path=child)
+            if different is not None:
+                return different
+        return None
+    if (
+        isinstance(stored, Sequence)
+        and not isinstance(stored, (str, bytes, bytearray))
+        and isinstance(expected, Sequence)
+        and not isinstance(expected, (str, bytes, bytearray))
+    ):
+        if len(stored) != len(expected):
+            child = f"{path}.length" if path else "length"
+            return child, len(stored), len(expected)
+        for index, (left, right) in enumerate(zip(stored, expected)):
+            child = f"{path}[{index}]" if path else f"[{index}]"
+            different = first_identity_difference(left, right, path=child)
+            if different is not None:
+                return different
+        return None
+    if type(stored) is not type(expected) or stored != expected:
+        return path or "value", stored, expected
+    return None
+
+
+def identity_value_for_error(value: object) -> str:
+    if value is _IDENTITY_MISSING:
+        return "<missing>"
+    text = repr(value)
+    return text if len(text) <= 240 else text[:237] + "..."
+
+
+def _canonical_json_sha256(value: object, *, where: str) -> str:
+    canonical = _canonical_json_value(value, where=where)
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _production_cache_git_commit() -> str:
+    """Resolve the exact source commit once for pair-shard identity.
+
+    A missing commit is not a useful producer identity, so unlike reporting
+    provenance this is deliberately fail-closed.  The optional override is for
+    immutable/container source mounts whose checkout metadata is unavailable;
+    it must still be a full hexadecimal object id.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    override = str(os.environ.get(
+        "PRISMAQUANT_IDENTITY_GIT_COMMIT", ""
+    )).strip().lower()
+    if override:
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", override) is None:
+            raise RuntimeError(
+                "PRISMAQUANT_IDENTITY_GIT_COMMIT must be a full 40- or "
+                "64-character hexadecimal commit id"
+            )
+        return override
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "production CB pair identity cannot resolve git commit"
+        ) from exc
+    commit = result.stdout.strip().lower()
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None:
+        raise RuntimeError(
+            "production CB pair identity resolved an invalid git commit "
+            f"{commit!r}"
+        )
+    return commit
+
+
+def _production_cache_source_sha256(
+    package_root: Path | None = None,
+) -> str:
+    """Hash every durable PrismaQuant package input used by the producer.
+
+    A hand-maintained import list is not fail-closed: a newly introduced
+    transitive renderer dependency could otherwise change bytes without
+    changing a resumable pair's identity.  Hash the complete installed
+    package tree instead, excluding only interpreter bytecode caches.  This
+    also binds packaged lattice/codebook data and model-profile JSON.
+    """
+    root = (
+        Path(package_root)
+        if package_root is not None
+        else Path(__file__).resolve().parent
+    )
+    if not root.is_dir():
+        raise RuntimeError(
+            f"production CB source identity cannot read package root {root}"
+        )
+    identity_paths = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.relative_to(root).parts
+        and path.suffix not in {".pyc", ".pyo"}
+    )
+    if not identity_paths:
+        raise RuntimeError(
+            f"production CB source identity found no files under {root}"
+        )
+    digest = hashlib.sha256()
+    for path in identity_paths:
+        relative = path.relative_to(root).as_posix()
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"production CB source identity cannot read {relative}"
+            ) from exc
+        encoded_name = relative.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(4, "big"))
+        digest.update(encoded_name)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def _cb_pair_codebook_identity(
+    identity: Mapping[str, object],
+    qname: str,
+    fmt: str,
+    context,
+    *,
+    runtime_context=None,
+) -> tuple[str, str | None, object]:
+    from prismaquant.nvfp4_cb_footprint import codebook_source_for_format
+
+    source = codebook_source_for_format(fmt, context)
+    stamp = identity["cb_serialized_payload"]
+    if source == "lattice":
+        by_format = stamp.get("lattice_codebook_sha256_by_format")
+        digests = (
+            by_format.get(fmt)
+            if isinstance(by_format, Mapping)
+            else None
+        )
+        if not isinstance(digests, Sequence) or isinstance(digests, str):
+            raise ValueError(
+                f"CB pair identity has no lattice codebook digests for {fmt}"
+            )
+        return source, None, [str(value) for value in digests]
+
+    # The serialized context deliberately does not retain a producer-local
+    # bundle path.  The fresh runtime context is stamp-validated by the caller
+    # and is used only to open the exact bundle whose content digest is then
+    # persisted in the pair identity.
+    bundle_path = getattr(runtime_context, "codebook_bundle_path", None)
+    if not bundle_path:
+        raise ValueError(
+            f"learned CB pair identity has no bundle path for {qname}@{fmt}"
+        )
+    from prismaquant.cb_learned_bundle import load_bundle_cached
+
+    bundle = load_bundle_cached(bundle_path)
+    bundle_digest = str(bundle.bundle_content_sha256).lower()
+    if re.fullmatch(r"[0-9a-f]{64}", bundle_digest) is None:
+        raise ValueError("learned CB bundle content SHA-256 is invalid")
+
+    refs = None
+    refs_by_qname_format = stamp.get("codebook_refs_by_qname_format")
+    if isinstance(refs_by_qname_format, Mapping):
+        by_format = refs_by_qname_format.get(qname)
+        if isinstance(by_format, Mapping):
+            refs = by_format.get(fmt)
+    if refs is None:
+        refs_by_qname = stamp.get("codebook_refs")
+        if isinstance(refs_by_qname, Mapping):
+            refs = refs_by_qname.get(qname)
+    ref_names = (
+        [str(refs)]
+        if isinstance(refs, str)
+        else [str(value) for value in refs]
+        if isinstance(refs, Sequence)
+        else []
+    )
+    if not ref_names:
+        raise ValueError(
+            f"learned CB pair identity has no codebook refs for {qname}@{fmt}"
+        )
+    all_digests = stamp.get("codebook_content_sha256")
+    if not isinstance(all_digests, Mapping):
+        raise ValueError("learned CB pair identity has no codebook digest map")
+    missing = sorted(ref for ref in ref_names if ref not in all_digests)
+    if missing:
+        raise ValueError(
+            "learned CB pair identity references codebooks without content "
+            f"digests; sample={missing[:8]}"
+        )
+    selected = {
+        ref: str(all_digests[ref]).lower()
+        for ref in sorted(set(ref_names))
+    }
+    return source, bundle_digest, selected
+
+
+def build_cb_cache_pair_identity(
+    identity: Mapping[str, object],
+    *,
+    qname: str,
+    fmt: str,
+    calibration_hash: str,
+    git_commit: str,
+    source_weight_dtype: torch.dtype | str,
+    cb_serialization_context=None,
+    render_input_contract: Mapping[str, object] | None = None,
+    validated_context=None,
+    producer_source_sha256: str | None = None,
+) -> dict[str, object]:
+    """Project the global CB render identity onto one resumable cache pair."""
+    if validated_context is None:
+        context = validate_cb_render_identity_metadata(
+            identity,
+            expected_context=cb_serialization_context,
+            expected_formats_by_qname={qname: [fmt]},
+            require_source_complete=False,
+            where=f"CB cache pair identity {qname}@{fmt}",
+        )
+    else:
+        context = validated_context
+        scope = identity.get("cb_formats_by_qname")
+        formats = scope.get(qname) if isinstance(scope, Mapping) else None
+        if (
+            not isinstance(formats, Sequence)
+            or isinstance(formats, str)
+            or fmt not in formats
+        ):
+            raise ValueError(
+                f"CB cache pair identity scope is missing {qname}@{fmt}"
+            )
+    from prismaquant.cb_layout import parse_format_name
+    from prismaquant.nvfp4_cb_footprint import (
+        effective_codebook_source_scope,
+        effective_scale_sweep_scope,
+    )
+
+    parsed = parse_format_name(fmt)
+    if parsed is None:
+        raise ValueError(f"CB cache pair format is invalid: {fmt!r}")
+    _family, rung = parsed
+    source, bundle_digest, codebook_identity = _cb_pair_codebook_identity(
+        identity,
+        qname,
+        fmt,
+        context,
+        runtime_context=cb_serialization_context,
+    )
+    stamp = identity["cb_serialized_payload"]
+    source_shapes = identity["source_weights_shapes"]
+    source_digests = identity["source_weights_content_sha256"]
+    col_shapes = identity["col_weights_shapes"]
+    col_digests = identity["col_weights_content_sha256"]
+    for field_name, values in (
+        ("source_weights_sha256", source_digests),
+        ("source_weights_shape", source_shapes),
+        ("col_weights_sha256", col_digests),
+        ("col_weights_shape", col_shapes),
+    ):
+        if not isinstance(values, Mapping) or qname not in values:
+            raise ValueError(
+                f"CB cache pair identity is missing {field_name} for {qname}"
+            )
+    ldlq_scope = str(getattr(
+        context, "ldlq_scope", "all" if context.ldlq else "none"
+    ))
+    cache_dtype = (
+        torch.bfloat16
+        if str(source_weight_dtype) == str(torch.float32)
+        else source_weight_dtype
+    )
+    pair = {
+        "schema": CB_CACHE_PAIR_IDENTITY_SCHEMA,
+        "qname": str(qname),
+        "format": str(fmt),
+        "rung": int(rung),
+        "codebook_source": str(source),
+        "codebook_source_scope": effective_codebook_source_scope(context),
+        "codebook_bundle_sha256": bundle_digest,
+        "codebook_content_sha256": codebook_identity,
+        "col_weights_sha256": str(col_digests[qname]).lower(),
+        "col_weights_shape": [int(dim) for dim in col_shapes[qname]],
+        "source_weights_sha256": str(source_digests[qname]).lower(),
+        "source_weights_shape": [int(dim) for dim in source_shapes[qname]],
+        "source_weight_dtype": str(source_weight_dtype),
+        "cache_weight_dtype": str(cache_dtype),
+        "scale_coding": str(context.scale_coding),
+        "scale_sweep_scope": effective_scale_sweep_scope(context),
+        "ldlq_scope": ldlq_scope,
+        "minchain": bool(getattr(context, "minchain", False)),
+        "minchain_version": getattr(context, "minchain_version", None),
+        "minchain_cells": (
+            copy.deepcopy(
+                identity.get("cb_minchain_cells", {})
+                .get(qname, {})
+                .get(fmt)
+            )
+            if isinstance(identity.get("cb_minchain_cells"), Mapping)
+            and isinstance(identity["cb_minchain_cells"].get(qname), Mapping)
+            else None
+        ),
+        "layout_version": int(context.layout_version),
+        "encode_tier": str(context.encode_tier),
+        "renderer_abi": str(context.renderer_abi),
+        "activation_contract": getattr(context, "activation_contract", None),
+        "activation_execution": getattr(context, "activation_execution", None),
+        "ldlq_packed_kernel_sha256": (
+            _canonical_json_sha256(
+                stamp["ldlq_packed_kernel"],
+                where="CB LDLQ packed-kernel identity",
+            )
+            if "ldlq_packed_kernel" in stamp
+            else None
+        ),
+        "render_contract_sha256": _canonical_json_sha256(
+            identity["render_contract"],
+            where="CB render-contract identity",
+        ),
+        "calibration_hash": str(calibration_hash),
+        "render_input_contract": dict(render_input_contract or {}),
+        "git_commit": str(git_commit).lower(),
+        "producer_source_sha256": str(
+            producer_source_sha256 or _production_cache_source_sha256()
+        ).lower(),
+    }
+    if re.fullmatch(r"[0-9a-f]{64}", pair["producer_source_sha256"]) is None:
+        raise ValueError("CB cache pair producer source SHA-256 is invalid")
+    return _canonical_json_value(pair, where="CB cache pair identity")
+
+
+def _read_cb_cache_pair_sidecar(
+    path: Path,
+    *,
+    qname: str,
+    fmt: str,
+) -> dict[str, object]:
+    try:
+        raw = json.loads(path.read_text())
+    except Exception as exc:
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            f"identity field 'sidecar_json' differs: stored=<invalid> "
+            "expected=<valid canonical JSON>; refusing reuse or re-render"
+        ) from exc
+    if not isinstance(raw, Mapping):
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            "identity field 'sidecar' differs: stored=<non-object> "
+            "expected=<object>; refusing reuse or re-render"
+        )
+    return dict(raw)
+
+
+def _validate_cb_cache_pair_resume(
+    *,
+    cache_dir_path: Path,
+    qname: str,
+    fmt: str,
+    expected_identity: Mapping[str, object],
+    legacy_kind: str = "production ",
+    require_render_score: bool = False,
+    require_packed_state: bool = False,
+    verify_shard_payload: bool = False,
+    allow_missing_shard: bool = False,
+    require_consumer_receipt: bool = False,
+    expected_consumer_identity: Mapping[str, object] | None = None,
+) -> dict[str, object] | None:
+    """Admit one existing CB shard only under its exact per-pair stamp.
+
+    A matching stamp without a shard is an interrupted atomic write and may be
+    rendered.  A shard without a stamp, or any mismatched stamp, is never
+    reused and never overwritten.
+    """
+    shard_path = cache_dir_path / _cache_weight_filename(qname, fmt)
+    sidecar_path = cache_dir_path / _cache_pair_identity_filename(qname, fmt)
+    shard_exists = shard_path.is_file()
+    sidecar_exists = sidecar_path.is_file()
+    if shard_exists and not sidecar_exists:
+        # Keep the legacy test/operator phrase while avoiding the old blanket
+        # source marker used by campaign inventory: only an *unstamped* shard
+        # is disabled now.
+        raise RuntimeError(
+            f"legacy unstamped {legacy_kind}"
+            "CB cache resume is disabled for "
+            f"{qname}@{fmt}: missing identity sidecar {sidecar_path}; "
+            "refusing reuse or re-render"
+        )
+    if not sidecar_exists:
+        return None
+    sidecar = _read_cb_cache_pair_sidecar(
+        sidecar_path,
+        qname=qname,
+        fmt=fmt,
+    )
+    if sidecar.get("schema") != CB_CACHE_PAIR_SIDECAR_SCHEMA:
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            "identity field 'sidecar.schema' differs: "
+            f"stored={identity_value_for_error(sidecar.get('schema'))} "
+            f"expected={CB_CACHE_PAIR_SIDECAR_SCHEMA!r}; refusing reuse or "
+            "re-render"
+        )
+    stored_identity = sidecar.get("identity")
+    difference = first_identity_difference(
+        stored_identity,
+        expected_identity,
+    )
+    if difference is not None:
+        field, stored, expected = difference
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            f"identity field '{field}' differs: "
+            f"stored={identity_value_for_error(stored)} "
+            f"expected={identity_value_for_error(expected)}; "
+            "refusing reuse or re-render"
+        )
+    tensor_metadata = sidecar.get("tensor")
+    if not isinstance(tensor_metadata, Mapping):
+        raise RuntimeError(
+            f"production CB cache resume refused for {qname}@{fmt}: "
+            "identity field 'tensor' differs: stored=<missing> "
+            "expected=<value-bearing shard identity>; refusing reuse or "
+            "re-render"
+        )
+    if shard_exists and verify_shard_payload:
+        try:
+            shard = torch.load(
+                shard_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'tensor.payload' differs: stored=<invalid> "
+                "expected=<loadable tensor>; refusing reuse or re-render"
+            ) from exc
+        if not isinstance(shard, torch.Tensor):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'tensor.payload' differs: stored=<non-tensor> "
+                "expected=<tensor>; refusing reuse or re-render"
+            )
+        observed_tensor = _cb_cache_tensor_identity(shard)
+        tensor_difference = first_identity_difference(
+            tensor_metadata,
+            observed_tensor,
+            path="tensor",
+        )
+        del shard
+        if tensor_difference is not None:
+            field, stored, expected = tensor_difference
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                f"identity field '{field}' differs: "
+                f"stored={identity_value_for_error(stored)} "
+                f"expected={identity_value_for_error(expected)}; refusing "
+                "reuse or re-render"
+            )
+    render_score = sidecar.get("render_score")
+    if require_render_score:
+        expected_score_identity = {
+            "qname": str(qname),
+            "format": str(fmt).upper(),
+        }
+        if not isinstance(render_score, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'render_score' differs: stored=<missing> "
+                "expected=<identity-bound score>; refusing reuse or re-render"
+            )
+        observed_score_identity = {
+            "qname": render_score.get("qname"),
+            "format": render_score.get("format"),
+        }
+        score_difference = first_identity_difference(
+            observed_score_identity,
+            expected_score_identity,
+            path="render_score",
+        )
+        if score_difference is not None:
+            field, stored, expected = score_difference
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                f"identity field '{field}' differs: "
+                f"stored={identity_value_for_error(stored)} "
+                f"expected={identity_value_for_error(expected)}; refusing "
+                "reuse or re-render"
+            )
+        try:
+            observed_score_sha256 = _canonical_json_sha256(
+                render_score,
+                where=f"CB cache render score {qname}@{fmt}",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'render_score' differs: stored=<invalid> "
+                "expected=<finite canonical record>; refusing reuse or "
+                "re-render"
+            ) from exc
+        stored_score_sha256 = sidecar.get("render_score_sha256")
+        if stored_score_sha256 != observed_score_sha256:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'render_score_sha256' differs: "
+                f"stored={identity_value_for_error(stored_score_sha256)} "
+                f"expected={observed_score_sha256!r}; refusing reuse or "
+                "re-render"
+            )
+    consumer_receipt = sidecar.get("consumer_receipt")
+    if require_consumer_receipt or expected_consumer_identity is not None:
+        if not isinstance(consumer_receipt, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'consumer_receipt' differs: stored=<missing> "
+                "expected=<value-bearing transient-consumer receipt>; "
+                "refusing reuse or re-render"
+            )
+        expected_receipt_binding = {
+            "schema": CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA,
+            "qname": str(qname),
+            "format": str(fmt).upper(),
+            "tensor": dict(tensor_metadata),
+            "render_score_sha256": sidecar.get("render_score_sha256"),
+        }
+        observed_receipt_binding = {
+            field: consumer_receipt.get(field)
+            for field in expected_receipt_binding
+        }
+        receipt_difference = first_identity_difference(
+            observed_receipt_binding,
+            expected_receipt_binding,
+            path="consumer_receipt",
+        )
+        if receipt_difference is not None:
+            field, stored, expected = receipt_difference
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                f"identity field '{field}' differs: "
+                f"stored={identity_value_for_error(stored)} "
+                f"expected={identity_value_for_error(expected)}; refusing "
+                "reuse or re-render"
+            )
+        if expected_consumer_identity is not None:
+            receipt_difference = first_identity_difference(
+                consumer_receipt.get("consumer_identity"),
+                expected_consumer_identity,
+                path="consumer_receipt.consumer_identity",
+            )
+            if receipt_difference is not None:
+                field, stored, expected = receipt_difference
+                raise RuntimeError(
+                    f"production CB cache resume refused for {qname}@{fmt}: "
+                    f"identity field '{field}' differs: "
+                    f"stored={identity_value_for_error(stored)} "
+                    f"expected={identity_value_for_error(expected)}; refusing "
+                    "reuse or re-render"
+                )
+        result = consumer_receipt.get("result")
+        if not isinstance(result, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'consumer_receipt.result' differs: "
+                "stored=<missing> expected=<canonical result>; refusing "
+                "reuse or re-render"
+            )
+        observed_result_sha256 = _canonical_json_sha256(
+            result,
+            where=f"CB transient consumer result {qname}@{fmt}",
+        )
+        if consumer_receipt.get("result_sha256") != observed_result_sha256:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'consumer_receipt.result_sha256' differs; "
+                "refusing reuse or re-render"
+            )
+        observed_receipt_sha256 = _canonical_json_sha256(
+            consumer_receipt,
+            where=f"CB transient consumer receipt {qname}@{fmt}",
+        )
+        if sidecar.get("consumer_receipt_sha256") != observed_receipt_sha256:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'consumer_receipt_sha256' differs; refusing "
+                "reuse or re-render"
+            )
+    packed_state = sidecar.get("packed_state")
+    if require_packed_state:
+        if not isinstance(packed_state, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'packed_state' differs: stored=<missing> "
+                "expected=<activation/coverage state>; refusing reuse or "
+                "re-render"
+            )
+        try:
+            observed_packed_sha256 = _canonical_json_sha256(
+                packed_state,
+                where=f"packed CB cache state {qname}@{fmt}",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'packed_state' differs: stored=<invalid> "
+                "expected=<finite canonical state>; refusing reuse or "
+                "re-render"
+            ) from exc
+        stored_packed_sha256 = sidecar.get("packed_state_sha256")
+        if stored_packed_sha256 != observed_packed_sha256:
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'packed_state_sha256' differs: "
+                f"stored={identity_value_for_error(stored_packed_sha256)} "
+                f"expected={observed_packed_sha256!r}; refusing reuse or "
+                "re-render"
+            )
+        activation_max_abs = packed_state.get("activation_max_abs")
+        coverage = packed_state.get("coverage")
+        if (
+            not isinstance(activation_max_abs, (int, float))
+            or float(activation_max_abs) <= 0.0
+            or not isinstance(coverage, Mapping)
+            or coverage.get("fmt") != fmt
+            or coverage.get("rendered") is not True
+        ):
+            raise RuntimeError(
+                f"production CB cache resume refused for {qname}@{fmt}: "
+                "identity field 'packed_state' differs: stored=<malformed> "
+                "expected=<positive activation scale and exact coverage>; "
+                "refusing reuse or re-render"
+            )
+    return sidecar if (shard_exists or allow_missing_shard) else None
+
+
+def _cb_cache_tensor_identity(tensor: torch.Tensor) -> dict[str, object]:
+    stored = tensor.detach().to(device="cpu").contiguous()
+    raw = stored.view(torch.uint8).numpy().tobytes()
+    return {
+        "shape": [int(dim) for dim in stored.shape],
+        "dtype": str(stored.dtype),
+        "logical_bytes": len(raw),
+        "content_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _build_cb_transient_consumer_receipt(
+    *,
+    qname: str,
+    fmt: str,
+    tensor: torch.Tensor,
+    render_score: Mapping[str, object],
+    consumer_identity: Mapping[str, object],
+    result: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind one synchronous scalar consumer to the exact canonical render."""
+    canonical_result = _canonical_json_value(
+        dict(result),
+        where=f"CB transient consumer result {qname}@{fmt}",
+    )
+    return _canonical_json_value(
+        {
+            "schema": CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA,
+            "qname": str(qname),
+            "format": str(fmt).upper(),
+            "consumer_identity": dict(consumer_identity),
+            "tensor": _cb_cache_tensor_identity(tensor),
+            "render_score_sha256": _canonical_json_sha256(
+                render_score,
+                where=f"CB cache render score {qname}@{fmt}",
+            ),
+            "result": canonical_result,
+            "result_sha256": _canonical_json_sha256(
+                canonical_result,
+                where=f"CB transient consumer result {qname}@{fmt}",
+            ),
+        },
+        where=f"CB transient consumer receipt {qname}@{fmt}",
+    )
+
+
+def _write_cb_cache_pair_sidecar(
+    *,
+    cache_dir_path: Path,
+    qname: str,
+    fmt: str,
+    identity: Mapping[str, object],
+    tensor: torch.Tensor,
+    encode_seconds: float,
+    render_score: Mapping[str, object] | None = None,
+    packed_state: Mapping[str, object] | None = None,
+    consumer_receipt: Mapping[str, object] | None = None,
+    retained_weight: bool = True,
+) -> None:
+    """Durably stamp a pair before the atomic weight-shard publication."""
+    target_dtype = (
+        tensor.dtype if tensor.dtype != torch.float32 else torch.bfloat16
+    )
+    stored = tensor.detach().to(dtype=target_dtype, device="cpu").contiguous()
+    canonical_render_score = (
+        _canonical_json_value(
+            dict(render_score),
+            where=f"CB cache render score {qname}@{fmt}",
+        )
+        if render_score is not None
+        else None
+    )
+    canonical_packed_state = (
+        _canonical_json_value(
+            dict(packed_state),
+            where=f"packed CB cache state {qname}@{fmt}",
+        )
+        if packed_state is not None
+        else None
+    )
+    canonical_consumer_receipt = (
+        _canonical_json_value(
+            dict(consumer_receipt),
+            where=f"CB transient consumer receipt {qname}@{fmt}",
+        )
+        if consumer_receipt is not None
+        else None
+    )
+    payload = {
+        "schema": CB_CACHE_PAIR_SIDECAR_SCHEMA,
+        "identity": dict(identity),
+        "measurement": {
+            "encode_seconds": float(encode_seconds),
+        },
+        "tensor": _cb_cache_tensor_identity(stored),
+        "render_score": canonical_render_score,
+        "render_score_sha256": (
+            _canonical_json_sha256(
+                canonical_render_score,
+                where=f"CB cache render score {qname}@{fmt}",
+            )
+            if canonical_render_score is not None
+            else None
+        ),
+        "packed_state": canonical_packed_state,
+        "packed_state_sha256": (
+            _canonical_json_sha256(
+                canonical_packed_state,
+                where=f"packed CB cache state {qname}@{fmt}",
+            )
+            if canonical_packed_state is not None
+            else None
+        ),
+        "consumer_receipt": canonical_consumer_receipt,
+        "consumer_receipt_sha256": (
+            _canonical_json_sha256(
+                canonical_consumer_receipt,
+                where=f"CB transient consumer receipt {qname}@{fmt}",
+            )
+            if canonical_consumer_receipt is not None
+            else None
+        ),
+        "retained_weight": bool(retained_weight),
+    }
+    path = cache_dir_path / _cache_pair_identity_filename(qname, fmt)
+    tmp = path.with_name(path.name + ".tmp")
+    encoded = json.dumps(
+        payload,
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    directory_fd = os.open(cache_dir_path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def validate_cb_render_identity_metadata(
+    identity: Mapping[str, object] | None,
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    expected_formats_by_qname: Mapping[
+        str, str | Sequence[str]
+    ] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    source_weights: Mapping[str, torch.Tensor] | None = None,
+    require_source_complete: bool = True,
+    require_minchain_cells: bool = False,
+    where: str = "CB render identity",
+):
+    """Validate a value-bearing CB render identity independent of a cache.
+
+    This is the shared consumer gate for cache, cost, assignment, and export
+    artifacts.  It validates the serialized layout/codebook bytes, exact
+    qname/format scope, and canonical float32 imatrix content without ever
+    consulting the current process environment.
+    """
+    if not isinstance(identity, Mapping):
+        raise ValueError(f"{where}: missing versioned CB render identity")
+    if identity.get("schema") != CB_RENDER_IDENTITY_SCHEMA:
+        raise ValueError(
+            f"{where}: unsupported CB render identity schema "
+            f"{identity.get('schema')!r}"
+        )
+    if identity.get("col_weights_schema") != CB_COL_WEIGHTS_HASH_SCHEMA:
+        raise ValueError(
+            f"{where}: unsupported CB col_weights identity schema "
+            f"{identity.get('col_weights_schema')!r}"
+        )
+    raw_qnames = identity.get("col_weights_qnames")
+    if not isinstance(raw_qnames, Sequence) or isinstance(raw_qnames, str):
+        raise ValueError(f"{where}: CB render identity has no qname list")
+    identity_qnames = [str(name) for name in raw_qnames]
+    if identity_qnames != sorted(set(identity_qnames)):
+        raise ValueError(
+            f"{where}: CB render identity qnames are not canonical/sorted"
+        )
+    if int(identity.get("col_weights_entries", -1)) != len(identity_qnames):
+        raise ValueError(f"{where}: CB render identity entry count differs")
+
+    raw_scope = identity.get("cb_formats_by_qname")
+    if not isinstance(raw_scope, Mapping):
+        raise ValueError(f"{where}: CB render identity has no format scope")
+    try:
+        scope = _canonical_cb_render_scope(raw_scope)
+    except Exception as exc:
+        raise ValueError(
+            f"{where}: CB render identity format scope is invalid"
+        ) from exc
+    normalized_raw_scope = {
+        str(name): [str(fmt) for fmt in formats]
+        for name, formats in raw_scope.items()
+        if isinstance(formats, Sequence) and not isinstance(formats, str)
+    }
+    if (
+        set(scope) != set(identity_qnames)
+        or normalized_raw_scope != scope
+    ):
+        raise ValueError(
+            f"{where}: CB render identity format scope is not exact, "
+            "canonical, and qname-complete"
+        )
+
+    render_contract = identity.get("render_contract")
+    if not isinstance(render_contract, Mapping):
+        raise ValueError(f"{where}: CB render contract is missing")
+    if render_contract.get("schema") != CB_RENDER_CONTRACT_SCHEMA:
+        raise ValueError(f"{where}: unsupported CB render contract schema")
+    if render_contract.get("mechanism_abi") != CB_RENDER_MECHANISM_ABI:
+        raise ValueError(f"{where}: unsupported CB render mechanism ABI")
+    if not isinstance(render_contract.get("resolved_levers"), Mapping):
+        raise ValueError(f"{where}: CB render contract has no resolved levers")
+    if not isinstance(render_contract.get("mechanism_plan"), Sequence):
+        raise ValueError(f"{where}: CB render contract has no mechanism plan")
+    if render_contract.get("cb_active_mechanisms") != ["weighted_vq"]:
+        raise ValueError(f"{where}: unsupported CB active render mechanisms")
+    if render_contract.get("calibration_dependent_mechanisms") != []:
+        raise ValueError(
+            f"{where}: CB render identity contains unbound "
+            "calibration-dependent mechanisms"
+        )
+
+    raw_shapes = identity.get("col_weights_shapes")
+    if not isinstance(raw_shapes, Mapping) or set(raw_shapes) != set(identity_qnames):
+        raise ValueError(
+            f"{where}: CB render identity shapes do not cover its qnames"
+        )
+    shapes: dict[str, list[int]] = {}
+    for qname in identity_qnames:
+        raw_shape = raw_shapes[qname]
+        if not isinstance(raw_shape, Sequence) or isinstance(raw_shape, str):
+            raise ValueError(
+                f"{where}: CB render identity shape for {qname!r} is invalid"
+            )
+        shape = [int(dim) for dim in raw_shape]
+        if any(dim < 0 for dim in shape):
+            raise ValueError(
+                f"{where}: CB render identity shape for {qname!r} is invalid"
+            )
+        shapes[qname] = shape
+    raw_content_digests = identity.get("col_weights_content_sha256")
+    if (
+        not isinstance(raw_content_digests, Mapping)
+        or set(raw_content_digests) != set(identity_qnames)
+    ):
+        raise ValueError(
+            f"{where}: CB render identity content hashes do not cover its "
+            "qnames"
+        )
+    content_digests = {
+        qname: str(raw_content_digests[qname]).lower()
+        for qname in identity_qnames
+    }
+    if any(
+        re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in content_digests.values()
+    ):
+        raise ValueError(f"{where}: CB col_weights content SHA-256 is invalid")
+    observed_digest = str(identity.get("col_weights_sha256", "")).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", observed_digest):
+        raise ValueError(f"{where}: CB col_weights SHA-256 is invalid")
+
+    if identity.get("source_weights_schema") != CB_SOURCE_WEIGHTS_HASH_SCHEMA:
+        raise ValueError(
+            f"{where}: unsupported CB source-weight identity schema"
+        )
+    source_shapes_raw = identity.get("source_weights_shapes")
+    source_content_raw = identity.get("source_weights_content_sha256")
+    if not isinstance(source_shapes_raw, Mapping) or not isinstance(
+        source_content_raw, Mapping
+    ):
+        raise ValueError(f"{where}: CB source-weight identity is malformed")
+    source_names = set(str(name) for name in source_content_raw)
+    if source_names != set(str(name) for name in source_shapes_raw):
+        raise ValueError(
+            f"{where}: CB source-weight shapes/content scopes differ"
+        )
+    if not source_names.issubset(identity_qnames):
+        raise ValueError(
+            f"{where}: CB source-weight identity contains out-of-scope qnames"
+        )
+    source_shapes: dict[str, list[int]] = {}
+    source_content: dict[str, str] = {}
+    for qname in sorted(source_names):
+        raw_shape = source_shapes_raw[qname]
+        if not isinstance(raw_shape, Sequence) or isinstance(raw_shape, str):
+            raise ValueError(
+                f"{where}: source-weight shape for {qname!r} is invalid"
+            )
+        source_shapes[qname] = [int(dim) for dim in raw_shape]
+        value = str(source_content_raw[qname]).lower()
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(
+                f"{where}: source-weight SHA-256 for {qname!r} is invalid"
+            )
+        source_content[qname] = value
+    source_complete = identity.get("source_weights_complete")
+    if not isinstance(source_complete, bool):
+        raise ValueError(
+            f"{where}: CB source-weight completeness marker is invalid"
+        )
+    if source_complete:
+        if source_names != set(identity_qnames):
+            raise ValueError(
+                f"{where}: complete CB source-weight identity does not cover "
+                "its qname scope"
+            )
+        expected_source_digest = _combined_source_weights_sha256(
+            source_shapes,
+            source_content,
+        )
+        if identity.get("source_weights_sha256") != expected_source_digest:
+            raise ValueError(
+                f"{where}: combined CB source-weight SHA-256 differs"
+            )
+    elif require_source_complete:
+        raise ValueError(
+            f"{where}: CB source-weight identity is incomplete; cache render "
+            "did not observe every exact decoded source tensor"
+        )
+    elif identity.get("source_weights_sha256") is not None:
+        raise ValueError(
+            f"{where}: incomplete CB source identity has a final digest"
+        )
+
+    if expected_qnames is not None:
+        missing_expected = sorted(
+            set(str(name) for name in expected_qnames) - set(identity_qnames)
+        )
+        if missing_expected:
+            raise ValueError(
+                f"{where}: requested CB qnames are absent from render "
+                f"identity; sample={missing_expected[:8]}"
+            )
+    if expected_formats_by_qname is not None:
+        expected_scope = _canonical_cb_render_scope(expected_formats_by_qname)
+        missing_or_mismatched = sorted(
+            qname for qname, formats in expected_scope.items()
+            if qname not in scope
+            or not set(formats).issubset(scope[qname])
+        )
+        if missing_or_mismatched:
+            raise ValueError(
+                f"{where}: requested CB qname/format scope differs from the "
+                f"stored render; sample={missing_or_mismatched[:8]}"
+            )
+
+    from prismaquant.nvfp4_cb_footprint import (
+        cb_serialization_context_from_stamp,
+        codebook_source_for_format,
+        lattice_codebook_content_sha256,
+        validate_cb_serialization_context_stamp,
+    )
+
+    stamp = identity.get("cb_serialized_payload")
+    context = cb_serialization_context_from_stamp(
+        stamp,
+        where=f"{where} serialized payload",
+    )
+    if expected_context is not None:
+        validate_cb_serialization_context_stamp(
+            stamp,
+            expected_context,
+            where=where,
+        )
+    formats = sorted({fmt for values in scope.values() for fmt in values})
+    lattice_formats = [
+        fmt for fmt in formats
+        if codebook_source_for_format(fmt, context) == "lattice"
+    ]
+    learned_formats = [
+        fmt for fmt in formats
+        if codebook_source_for_format(fmt, context) == "learned"
+    ]
+    if lattice_formats:
+        observed_lattice = stamp.get("lattice_codebook_sha256_by_format")
+        expected_lattice = {
+            fmt: list(lattice_codebook_content_sha256(fmt))
+            for fmt in lattice_formats
+        }
+        if not isinstance(observed_lattice, Mapping) or any(
+            observed_lattice.get(fmt) != digests
+            for fmt, digests in expected_lattice.items()
+        ):
+            raise ValueError(
+                f"{where}: CB render identity does not bind the exact "
+                "canonical lattice codebook bytes for its format scope"
+            )
+    if learned_formats:
+        learned_digests = stamp.get("codebook_content_sha256")
+        if not isinstance(learned_digests, Mapping) or not learned_digests:
+            raise ValueError(
+                f"{where}: learned CB render identity has no value-bearing "
+                "codebook content digests"
+            )
+
+    raw_minchain_cells = identity.get("cb_minchain_cells")
+    if not context.minchain:
+        if raw_minchain_cells is not None:
+            raise ValueError(
+                f"{where}: non-chain render claims per-cell min-chain identity"
+            )
+    elif raw_minchain_cells is None:
+        if require_minchain_cells:
+            raise ValueError(
+                f"{where}: min-chain render is missing per-cell arm/digest "
+                "identity"
+            )
+    else:
+        if not isinstance(raw_minchain_cells, Mapping):
+            raise ValueError(f"{where}: min-chain cell identity is malformed")
+        from prismaquant.cb_minchain import validate_chain_identity
+
+        normalized_cells: dict[str, dict[str, list[dict[str, object]]]] = {}
+        for raw_qname, raw_formats in raw_minchain_cells.items():
+            qname = str(raw_qname)
+            if qname not in scope or not isinstance(raw_formats, Mapping):
+                raise ValueError(
+                    f"{where}: min-chain cell identity has an out-of-scope qname"
+                )
+            normalized_cells[qname] = {}
+            for raw_fmt, raw_cells in raw_formats.items():
+                fmt = str(raw_fmt)
+                if (
+                    fmt not in scope[qname]
+                    or not isinstance(raw_cells, Sequence)
+                    or isinstance(raw_cells, str)
+                    or not raw_cells
+                ):
+                    raise ValueError(
+                        f"{where}: min-chain cell identity has an invalid "
+                        f"scope at {qname}/{fmt}"
+                    )
+                normalized_cells[qname][fmt] = [
+                    validate_chain_identity(
+                        cell,
+                        where=f"{where} {qname}/{fmt}[{index}]",
+                    )
+                    for index, cell in enumerate(raw_cells)
+                ]
+        if normalized_cells != raw_minchain_cells:
+            raise ValueError(
+                f"{where}: min-chain cell identity is not canonical"
+            )
+        if require_minchain_cells:
+            missing = sorted(
+                f"{qname}/{fmt}"
+                for qname, formats in scope.items()
+                for fmt in formats
+                if fmt not in normalized_cells.get(qname, {})
+            )
+            if missing:
+                raise ValueError(
+                    f"{where}: min-chain cell identity does not cover the "
+                    f"selected scope; sample={missing[:8]}"
+                )
+
+    if col_weights is not None:
+        expected_digest, expected_shapes, expected_content = (
+            _canonical_cb_col_weights_identity(
+                col_weights,
+                identity_qnames,
+            )
+        )
+        if (
+            expected_digest != observed_digest
+            or expected_shapes != shapes
+            or expected_content != content_digests
+        ):
+            raise ValueError(
+                f"{where}: CB col_weights identity differs from the stored "
+                "render"
+            )
+    if source_weights is not None:
+        missing_source_values = sorted(
+            set(identity_qnames) - set(str(name) for name in source_weights)
+        )
+        if missing_source_values:
+            raise ValueError(
+                f"{where}: source-weight validation mapping is missing "
+                f"qnames; sample={missing_source_values[:8]}"
+            )
+        mismatched_source_values: list[str] = []
+        for qname in identity_qnames:
+            shape, digest = _source_weight_value_identity(
+                source_weights[qname]
+            )
+            if (
+                shape != source_shapes.get(qname)
+                or digest != source_content.get(qname)
+            ):
+                mismatched_source_values.append(qname)
+        if mismatched_source_values:
+            raise ValueError(
+                f"{where}: decoded CB source-weight values differ; "
+                f"sample={mismatched_source_values[:8]}"
+            )
+    return context
+
+
+def bind_cb_render_identity_source_weights(
+    identity: Mapping[str, object],
+    source_weights: Mapping[str, torch.Tensor],
+    *,
+    require_complete: bool = True,
+    where: str = "CB render identity source binding",
+) -> dict[str, object]:
+    """Bind exact decoded source tensors into a render identity copy."""
+    validate_cb_render_identity_metadata(
+        identity,
+        require_source_complete=False,
+        where=where,
+    )
+    updated = copy.deepcopy(dict(identity))
+    scope = set(str(name) for name in updated["col_weights_qnames"])
+    shapes = dict(updated["source_weights_shapes"])
+    content = dict(updated["source_weights_content_sha256"])
+    for raw_qname, weight in source_weights.items():
+        qname = str(raw_qname)
+        if qname not in scope:
+            continue
+        shape, digest = _source_weight_value_identity(weight)
+        if qname in content and (
+            list(shapes[qname]) != shape
+            or str(content[qname]).lower() != digest
+        ):
+            raise ValueError(
+                f"{where}: decoded source weight changed for {qname!r}"
+            )
+        shapes[qname] = shape
+        content[qname] = digest
+    observed = set(content)
+    complete = observed == scope
+    if require_complete and not complete:
+        missing = sorted(scope - observed)
+        raise ValueError(
+            f"{where}: missing decoded source weights; sample={missing[:8]}"
+        )
+    updated["source_weights_shapes"] = dict(sorted(shapes.items()))
+    updated["source_weights_content_sha256"] = dict(sorted(content.items()))
+    updated["source_weights_complete"] = bool(complete)
+    updated["source_weights_sha256"] = (
+        _combined_source_weights_sha256(shapes, content)
+        if complete else None
+    )
+    validate_cb_render_identity_metadata(
+        updated,
+        require_source_complete=require_complete,
+        where=where,
+    )
+    return updated
+
+
+class CBRenderSourceIdentityCollector:
+    """Incrementally bind decoded source values without retaining tensors.
+
+    Large streaming exports cannot keep every decoded source weight resident
+    merely to construct the value-bearing render identity.  This collector is
+    the one-pass equivalent of :func:`bind_cb_render_identity_source_weights`:
+    it keeps only canonical shapes and SHA-256 values, requires every source
+    qname exactly once (distinguishing duplicate-name drift), and emits the
+    same complete v2 identity after exact scope coverage.
+
+    The seed identity must be otherwise production-valid and deliberately
+    source-incomplete.  A completed identity is an input to an exporter and is
+    therefore verified directly instead of being re-attested here.
+    """
+
+    def __init__(
+        self,
+        identity: Mapping[str, object],
+        *,
+        where: str = "streaming CB render source identity",
+    ) -> None:
+        validate_cb_render_identity_metadata(
+            identity,
+            require_source_complete=False,
+            where=where,
+        )
+        if identity.get("source_weights_complete") is not False:
+            raise ValueError(
+                f"{where}: collector seed must be source-incomplete"
+            )
+        if identity.get("source_weights_shapes") or identity.get(
+            "source_weights_content_sha256"
+        ):
+            raise ValueError(
+                f"{where}: collector seed must not carry partial source values"
+            )
+        self._identity = copy.deepcopy(dict(identity))
+        self._scope = frozenset(
+            str(name) for name in identity["col_weights_qnames"]
+        )
+        self._shapes: dict[str, list[int]] = {}
+        self._content: dict[str, str] = {}
+        self._where = where
+        self._finalized = False
+
+    @property
+    def observed_qnames(self) -> frozenset[str]:
+        return frozenset(self._content)
+
+    def observe(self, qname: str, weight: torch.Tensor) -> None:
+        """Bind one exact decoded tensor, rejecting scope or value drift."""
+
+        if self._finalized:
+            raise ValueError(
+                f"{self._where}: collector is already finalized"
+            )
+        name = str(qname)
+        if name not in self._scope:
+            raise ValueError(
+                f"{self._where}: decoded source qname {name!r} is out of scope"
+            )
+        shape, digest = _source_weight_value_identity(weight)
+        if name in self._content:
+            if self._shapes[name] != shape or self._content[name] != digest:
+                raise ValueError(
+                    f"{self._where}: decoded source weight changed for "
+                    f"{name!r}"
+                )
+            raise ValueError(
+                f"{self._where}: decoded source weight {name!r} was "
+                "observed more than once"
+            )
+        self._shapes[name] = shape
+        self._content[name] = digest
+
+    def finalize(self) -> dict[str, object]:
+        """Return a source-complete identity after exact scope coverage."""
+
+        if self._finalized:
+            raise ValueError(
+                f"{self._where}: collector is already finalized"
+            )
+        missing = sorted(self._scope - set(self._content))
+        extra = sorted(set(self._content) - self._scope)
+        if missing or extra:
+            raise ValueError(
+                f"{self._where}: decoded source coverage differs: "
+                f"missing={missing[:8]}, extra={extra[:8]}"
+            )
+        updated = copy.deepcopy(self._identity)
+        updated["source_weights_shapes"] = dict(sorted(self._shapes.items()))
+        updated["source_weights_content_sha256"] = dict(
+            sorted(self._content.items())
+        )
+        updated["source_weights_complete"] = True
+        updated["source_weights_sha256"] = _combined_source_weights_sha256(
+            self._shapes,
+            self._content,
+        )
+        validate_cb_render_identity_metadata(
+            updated,
+            require_source_complete=True,
+            where=self._where,
+        )
+        self._finalized = True
+        return updated
+
+
+def bind_production_cache_cb_source_weights(
+    cache: ProductionWeightCache,
+    source_weights: Mapping[str, torch.Tensor],
+    *,
+    require_complete: bool = False,
+    where: str = "ProductionWeightCache source binding",
+) -> None:
+    """Record decoded source values as streamed CB tensors become resident."""
+    metadata = dict(getattr(cache, "metadata", {}) or {})
+    identity = metadata.get(CB_RENDER_IDENTITY_METADATA_KEY)
+    if identity is None:
+        if source_weights:
+            raise ValueError(f"{where}: cache has no CB render identity")
+        return
+    metadata[CB_RENDER_IDENTITY_METADATA_KEY] = (
+        bind_cb_render_identity_source_weights(
+            identity,
+            source_weights,
+            require_complete=require_complete,
+            where=where,
+        )
+    )
+    cache.metadata = metadata
+
+
+def project_cb_render_identity(
+    identity: Mapping[str, object],
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+    *,
+    col_weights: Mapping[str, torch.Tensor],
+    where: str,
+) -> dict[str, object]:
+    """Project a full-menu identity onto one exact selected CB assignment."""
+    context = validate_cb_render_identity_metadata(identity, where=where)
+    selected_scope = _canonical_cb_render_scope(formats_by_qname)
+    if not selected_scope:
+        raise ValueError(f"{where}: selected scope contains no CB formats")
+    original_scope = identity["cb_formats_by_qname"]
+    missing = sorted(
+        qname for qname, formats in selected_scope.items()
+        if qname not in original_scope
+        or not set(formats).issubset(original_scope[qname])
+    )
+    if missing:
+        raise ValueError(
+            f"{where}: selected CB scope is absent from producer identity; "
+            f"sample={missing[:8]}"
+        )
+    contract = identity["render_contract"]
+    projected = build_production_cache_cb_render_identity(
+        selected_scope,
+        cb_serialization_context=context,
+        col_weights=col_weights,
+        render_levers=contract["resolved_levers"],
+        render_mechanism_plan=contract["mechanism_plan"],
+    )
+    if projected["render_contract"] != contract:
+        raise ValueError(
+            f"{where}: selected projection changed the resolved render "
+            "contract"
+        )
+    projected_shapes = {
+        qname: list(identity["source_weights_shapes"][qname])
+        for qname in selected_scope
+    }
+    projected_content = {
+        qname: str(identity["source_weights_content_sha256"][qname])
+        for qname in selected_scope
+    }
+    projected["source_weights_shapes"] = projected_shapes
+    projected["source_weights_content_sha256"] = projected_content
+    projected["source_weights_complete"] = True
+    projected["source_weights_sha256"] = _combined_source_weights_sha256(
+        projected_shapes,
+        projected_content,
+    )
+    if context.minchain and "cb_minchain_cells" in identity:
+        original_cells = identity["cb_minchain_cells"]
+        projected["cb_minchain_cells"] = {
+            qname: {
+                fmt: copy.deepcopy(original_cells[qname][fmt])
+                for fmt in formats
+            }
+            for qname, formats in selected_scope.items()
+        }
+    validate_cb_render_identity_metadata(
+        projected,
+        col_weights=col_weights,
+        where=f"{where} projected identity",
+    )
+    return projected
+
+
+def merge_cb_render_identities(
+    identities: Sequence[Mapping[str, object]],
+    *,
+    col_weights: Mapping[str, torch.Tensor],
+    where: str,
+) -> dict[str, object] | None:
+    """Merge disjoint source-complete shard identities into one cost scope."""
+    if not identities:
+        return None
+    contexts = [
+        validate_cb_render_identity_metadata(
+            identity,
+            col_weights=col_weights,
+            where=f"{where} shard {index}",
+        )
+        for index, identity in enumerate(identities)
+    ]
+    first = identities[0]
+    contract = first["render_contract"]
+    scope: dict[str, list[str]] = {}
+    source_shapes: dict[str, list[int]] = {}
+    source_content: dict[str, str] = {}
+    minchain_cells: dict[str, dict[str, list[dict[str, object]]]] = {}
+    for index, identity in enumerate(identities):
+        if identity["render_contract"] != contract:
+            raise ValueError(
+                f"{where}: CB shard {index} render contract differs"
+            )
+        from prismaquant.nvfp4_cb_footprint import (
+            validate_cb_serialization_context_stamp,
+        )
+
+        validate_cb_serialization_context_stamp(
+            identity["cb_serialized_payload"],
+            contexts[0],
+            where=f"{where} shard {index}",
+        )
+        overlap = set(scope) & set(identity["cb_formats_by_qname"])
+        if overlap:
+            raise ValueError(
+                f"{where}: CB shard render identities overlap; "
+                f"sample={sorted(overlap)[:8]}"
+            )
+        scope.update(copy.deepcopy(identity["cb_formats_by_qname"]))
+        source_shapes.update(copy.deepcopy(identity["source_weights_shapes"]))
+        source_content.update(copy.deepcopy(
+            identity["source_weights_content_sha256"]
+        ))
+        if contexts[0].minchain:
+            shard_cells = identity.get("cb_minchain_cells")
+            if not isinstance(shard_cells, Mapping):
+                raise ValueError(
+                    f"{where}: min-chain shard {index} has no per-cell identity"
+                )
+            minchain_cells.update(copy.deepcopy(shard_cells))
+    merged = build_production_cache_cb_render_identity(
+        scope,
+        cb_serialization_context=contexts[0],
+        col_weights=col_weights,
+        render_levers=contract["resolved_levers"],
+        render_mechanism_plan=contract["mechanism_plan"],
+    )
+    merged["source_weights_shapes"] = dict(sorted(source_shapes.items()))
+    merged["source_weights_content_sha256"] = dict(
+        sorted(source_content.items())
+    )
+    merged["source_weights_complete"] = True
+    merged["source_weights_sha256"] = _combined_source_weights_sha256(
+        source_shapes,
+        source_content,
+    )
+    if contexts[0].minchain:
+        merged["cb_minchain_cells"] = dict(sorted(minchain_cells.items()))
+    validate_cb_render_identity_metadata(
+        merged,
+        col_weights=col_weights,
+        where=f"{where} merged identity",
+    )
+    return merged
+
+
+def validate_production_cache_cb_render_identity(
+    cache: ProductionWeightCache,
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    require_for_formats: Sequence[str] = (),
+    require_source_complete: bool = True,
+    where: str = "ProductionWeightCache",
+):
+    """Fail closed on absent, stale, or malformed CB render provenance.
+
+    Consumers rehydrate the stored producer context from this identity.  They
+    may compare it with an assignment context, but they never stamp whatever
+    CB environment happens to be active when the cache is consumed.
+    """
+    stored_cb_scope: dict[str, list[str]] = {}
+    for qname, fmt in (getattr(cache, "weights", {}) or {}):
+        if not _is_cb_format_name(fmt):
+            continue
+        stored_cb_scope.setdefault(str(qname), []).append(str(fmt))
+    required_by_format = any(
+        _is_cb_format_name(fmt) for fmt in require_for_formats
+    )
+    metadata = getattr(cache, "metadata", None)
+    identity = (
+        metadata.get(CB_RENDER_IDENTITY_METADATA_KEY)
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    if not stored_cb_scope and not required_by_format and identity is None:
+        return None
+    if not isinstance(identity, Mapping):
+        raise ValueError(
+            f"{where}: CB cache is missing versioned "
+            f"metadata[{CB_RENDER_IDENTITY_METADATA_KEY!r}]; legacy or "
+            "partially resumed CB caches must be rebuilt"
+        )
+    return validate_cb_render_identity_metadata(
+        identity,
+        expected_context=expected_context,
+        expected_qnames=expected_qnames,
+        expected_formats_by_qname=stored_cb_scope,
+        col_weights=col_weights,
+        require_source_complete=require_source_complete,
+        where=where,
+    )
+
+
+def production_cache_cb_render_identity(
+    cache: ProductionWeightCache,
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    require_for_formats: Sequence[str] = (),
+    require_source_complete: bool = True,
+    where: str = "ProductionWeightCache",
+) -> dict[str, object] | None:
+    """Return a validated defensive copy of the cache's stored identity."""
+    context = validate_production_cache_cb_render_identity(
+        cache,
+        expected_context=expected_context,
+        expected_qnames=expected_qnames,
+        col_weights=col_weights,
+        require_for_formats=require_for_formats,
+        require_source_complete=require_source_complete,
+        where=where,
+    )
+    if context is None:
+        return None
+    return copy.deepcopy(
+        dict(cache.metadata[CB_RENDER_IDENTITY_METADATA_KEY])
+    )
+
+
+def production_cache_cb_render_provenance(
+    cache: ProductionWeightCache,
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    require_for_formats: Sequence[str] = (),
+    require_source_complete: bool = True,
+    where: str = "ProductionWeightCache",
+) -> dict[str, object]:
+    """Return the exact stored CB provenance fragment for downstream use."""
+    identity = production_cache_cb_render_identity(
+        cache,
+        expected_context=expected_context,
+        expected_qnames=expected_qnames,
+        col_weights=col_weights,
+        require_for_formats=require_for_formats,
+        require_source_complete=require_source_complete,
+        where=where,
+    )
+    if identity is None:
+        return {}
+    return {
+        "cb_serialized_payload": copy.deepcopy(
+            identity["cb_serialized_payload"]
+        ),
+        CB_RENDER_IDENTITY_METADATA_KEY: identity,
+    }
+
+
+def validate_cb_render_provenance(
+    payload: Mapping[str, object],
+    *,
+    expected_context=None,
+    expected_qnames: Sequence[str] | None = None,
+    expected_formats_by_qname: Mapping[
+        str, str | Sequence[str]
+    ] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    where: str,
+) -> tuple[object, dict[str, object]]:
+    """Validate and return a cost/assignment payload's exact CB identity."""
+    provenance = payload.get("provenance")
+    container = provenance if isinstance(provenance, Mapping) else payload
+    identity = container.get(CB_RENDER_IDENTITY_METADATA_KEY)
+    context = validate_cb_render_identity_metadata(
+        identity if isinstance(identity, Mapping) else None,
+        expected_context=expected_context,
+        expected_qnames=expected_qnames,
+        expected_formats_by_qname=expected_formats_by_qname,
+        col_weights=col_weights,
+        where=where,
+    )
+    top_stamp = container.get("cb_serialized_payload")
+    from prismaquant.nvfp4_cb_footprint import (
+        validate_cb_serialization_context_stamp,
+    )
+
+    validate_cb_serialization_context_stamp(
+        top_stamp if isinstance(top_stamp, Mapping) else None,
+        context,
+        where=f"{where} top-level context",
+    )
+    if top_stamp is None or dict(top_stamp) != dict(
+        identity["cb_serialized_payload"]
+    ):
+        raise ValueError(
+            f"{where}: top-level CB context does not exactly match its "
+            "value-bearing render identity"
+        )
+    return context, copy.deepcopy(dict(identity))
+
+
+def validate_matching_cb_render_identities(
+    reference: Mapping[str, object],
+    candidate: Mapping[str, object],
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+    *,
+    where: str,
+) -> None:
+    """Require equal value-bearing inputs for the requested CB rows."""
+    required_scope = _canonical_cb_render_scope(formats_by_qname)
+    reference_context = validate_cb_render_identity_metadata(
+        reference,
+        expected_formats_by_qname=required_scope,
+        where=f"{where} reference",
+    )
+    validate_cb_render_identity_metadata(
+        candidate,
+        expected_context=reference_context,
+        expected_formats_by_qname=required_scope,
+        where=f"{where} candidate",
+    )
+    if reference["render_contract"] != candidate["render_contract"]:
+        raise ValueError(f"{where}: resolved CB render contracts differ")
+    mismatched: list[str] = []
+    mismatched_source: list[str] = []
+    for qname in required_scope:
+        if (
+            list(reference["col_weights_shapes"][qname])
+            != list(candidate["col_weights_shapes"][qname])
+            or str(reference["col_weights_content_sha256"][qname]).lower()
+            != str(candidate["col_weights_content_sha256"][qname]).lower()
+        ):
+            mismatched.append(qname)
+        if (
+            list(reference["source_weights_shapes"][qname])
+            != list(candidate["source_weights_shapes"][qname])
+            or str(reference["source_weights_content_sha256"][qname]).lower()
+            != str(candidate["source_weights_content_sha256"][qname]).lower()
+        ):
+            mismatched_source.append(qname)
+    if mismatched:
+        raise ValueError(
+            f"{where}: CB imatrix values differ for consumed rows; "
+            f"sample={mismatched[:8]}"
+        )
+    if mismatched_source:
+        raise ValueError(
+            f"{where}: decoded CB source-weight values differ for consumed "
+            f"rows; sample={mismatched_source[:8]}"
+        )
+
+
+def _extend_production_cache_cb_render_identity(
+    cache: ProductionWeightCache,
+    formats_by_qname: Mapping[str, str | Sequence[str]],
+    *,
+    cb_serialization_context,
+    col_weights: Mapping[str, torch.Tensor] | None,
+    render_levers: Mapping[str, object] | None = None,
+    render_mechanism_plan=None,
+) -> None:
+    """Validate the existing identity and extend it for a new CB scope."""
+    new_scope = _canonical_cb_render_scope(formats_by_qname)
+    new_qnames = list(new_scope)
+    if not new_scope:
+        return
+    metadata = dict(getattr(cache, "metadata", {}) or {})
+    old_identity = metadata.get(CB_RENDER_IDENTITY_METADATA_KEY)
+    old_scope: dict[str, list[str]] = {}
+    if old_identity is not None or any(
+        _is_cb_format_name(fmt) for _qname, fmt in cache.weights
+    ):
+        validate_production_cache_cb_render_identity(
+            cache,
+            expected_context=cb_serialization_context,
+            require_for_formats=["NVFP4_CB_K16"],
+            require_source_complete=False,
+            where="ProductionWeightCache extension",
+        )
+        old_scope = {
+            str(name): [str(fmt) for fmt in formats]
+            for name, formats in old_identity["cb_formats_by_qname"].items()
+        }
+        old_qnames = list(old_scope)
+        overlap = sorted(set(old_qnames) & set(new_qnames))
+        if overlap:
+            _, overlap_shapes, overlap_content = (
+                _canonical_cb_col_weights_identity(col_weights, overlap)
+            )
+            stored_shapes = old_identity["col_weights_shapes"]
+            stored_content = old_identity["col_weights_content_sha256"]
+            mismatched = [
+                name for name in overlap
+                if (
+                    list(stored_shapes[name]) != overlap_shapes[name]
+                    or str(stored_content[name]).lower()
+                    != overlap_content[name]
+                )
+            ]
+            if mismatched:
+                raise ValueError(
+                    "ProductionWeightCache extension: CB col_weights differ "
+                    f"for existing render qnames; sample={mismatched[:8]}"
+                )
+        if all(
+            name in old_scope
+            and set(formats).issubset(old_scope[name])
+            for name, formats in new_scope.items()
+        ):
+            return
+    combined: dict[str, list[str]] = copy.deepcopy(old_scope)
+    for name, formats in new_scope.items():
+        combined[name] = sorted(set(combined.get(name, ())) | set(formats))
+    if old_identity is None and (
+        render_levers is None or render_mechanism_plan is None
+    ):
+        raise ValueError(
+            "new ProductionWeightCache CB scope requires explicit resolved "
+            "render levers and mechanism plan"
+        )
+    identity = build_production_cache_cb_render_identity(
+        combined,
+        cb_serialization_context=cb_serialization_context,
+        col_weights=col_weights,
+        render_levers=(
+            render_levers
+            if render_levers is not None
+            else old_identity["render_contract"]["resolved_levers"]
+        ),
+        render_mechanism_plan=(
+            render_mechanism_plan
+            if render_mechanism_plan is not None
+            else old_identity["render_contract"]["mechanism_plan"]
+        ),
+    )
+    if old_identity is not None:
+        if identity["render_contract"] != old_identity["render_contract"]:
+            raise ValueError(
+                "ProductionWeightCache extension: resolved CB render "
+                "contract differs from the existing cache"
+            )
+        identity["source_weights_shapes"] = copy.deepcopy(
+            old_identity["source_weights_shapes"]
+        )
+        identity["source_weights_content_sha256"] = copy.deepcopy(
+            old_identity["source_weights_content_sha256"]
+        )
+        observed = set(identity["source_weights_content_sha256"])
+        expected = set(identity["col_weights_qnames"])
+        identity["source_weights_complete"] = observed == expected
+        identity["source_weights_sha256"] = (
+            _combined_source_weights_sha256(
+                identity["source_weights_shapes"],
+                identity["source_weights_content_sha256"],
+            )
+            if observed == expected else None
+        )
+    metadata[CB_RENDER_IDENTITY_METADATA_KEY] = identity
+    cache.metadata = metadata
 
 
 def _render_nvfp4_progressive_candidate(
@@ -1789,7 +4848,10 @@ def render_production_weight(
     act_clip_threshold: float | None = None,
     act_clip_rescale: str | None = None,
     fisher_row_weights: torch.Tensor | None = None,
+    col_weights: torch.Tensor | None = None,
+    cb_serialization_context=None,
     gate_trace: list[dict[str, object]] | None = None,
+    ldlq_missing_activation_ok: bool = False,
 ) -> torch.Tensor:
     """Compute the production-faithful dequantized weight for ``(qname, fmt)``.
 
@@ -1809,10 +4871,73 @@ def render_production_weight(
     render passes. ``fisher_row_weights`` optionally weights local objectives
     by per-token gradient² from h-detail.
 
+    ``col_weights`` is the per-input-column imatrix vector (``(in_features,)``)
+    for this ``qname`` — CB **Milestone C** / re-vet **R3**. It is applied for
+    the weighted-render families ONLY (``WEIGHTED_RENDER_FAMILIES``: the CB
+    codebook families and GGUF), whose exporters ship imatrix-weighted bytes;
+    for every other format the argument is inert and the render is
+    **bit-identical** whether it is passed or not (pinned by
+    ``tests/test_col_weights_render_identity.py``). The vector is supplied by
+    the caller rather than derived here from ``activations`` on purpose: the
+    exporter's vector is the harvested ``artifacts/cb_col_weights.pkl``, which
+    includes the synthesized packed-expert entries
+    (``moe_imatrix.synthesize_packed_expert_col_weights``) that no raw
+    activation matrix on this path can reproduce. With it, the CB lane's cost,
+    KL and shipped bytes can come from ONE render through
+    ``ProductionWeightCache``.
+
+    ``ldlq_missing_activation_ok`` is a deliberately narrow cold-expert
+    escape hatch.  It may be set only by a caller that has already checked an
+    exact never-routed provenance declaration.  In that case the exporter
+    itself fail-closes LDLQ to the raw, imatrix-weighted render, so returning
+    that same render is production-faithful.  The default remains fail-closed
+    for an ordinary missing activation row.
+
     """
     from prismaquant import format_registry as fr
 
     fmt = fr.canonical_format_name(str(fmt).strip().upper())
+    # Tessera owns its own byte path. It is intercepted here, ahead of the
+    # format cascade, because the cascade's terminal branch is the registry's
+    # ``quantize_dequantize`` -- for Tessera a weights-only *reconstruction*,
+    # not the decoded wire, and not the H-aware encode that ships. One render
+    # for the surrogate, the KL and the bytes (principle 8) means this one.
+    if fr.is_tessera_format_name(fmt):
+        # Imported inside the branch: ``tessera_render`` pulls in the
+        # ``tessera`` package, and an NVFP4-only pipeline must not.
+        from prismaquant.tessera_render import render_tessera_production
+
+        return render_tessera_production(
+            weight,
+            fmt,
+            qname=qname,
+            activations=activations,
+            levers=levers,
+        )
+    is_cb = fr.get_format(fmt).family in {"nvfp4_cb", "fp8_cb"}
+    if is_cb and cb_serialization_context is None:
+        raise ValueError(
+            f"{qname}={fmt}: production CB render requires an explicit "
+            "CBSerializationContext; refusing to use current environment "
+            "defaults"
+        )
+    if is_cb and col_weights is None:
+        raise RuntimeError(
+            f"{qname}={fmt}: production CB render has no col_weights; "
+            "refusing an unweighted cache entry that export cannot reproduce"
+        )
+    if is_cb and not bool(levers.get("weighted_vq", True)):
+        raise RuntimeError(
+            f"{qname}={fmt}: weighted_vq cannot be disabled for a production "
+            "CB render because export is always imatrix-weighted"
+        )
+    if col_weights is not None and not (
+        _format_supports_render_mechanism(fmt, "weighted_vq")
+        and bool(levers.get("weighted_vq", True))
+    ):
+        # Inert for every non-weighted family: fall through to the exact
+        # pre-R3 code path, no branch, no dtype churn.
+        col_weights = None
     clip_rescale = "none"
     if str(act_clip_rescale or "none").strip().lower() not in {
         "",
@@ -1824,7 +4949,7 @@ def render_production_weight(
     }:
         raise ValueError("activation clip rescaling is not supported")
     progressive_gates = _env_flag("PRISMAQUANT_RENDER_PROGRESSIVE_GATES", True)
-    if fmt == "NVFP4" and progressive_gates:
+    if fmt in NVFP4_RENDER_EQUIVALENT and progressive_gates:
         return _render_nvfp4_progressively(
             weight,
             qname=qname,
@@ -1837,18 +4962,44 @@ def render_production_weight(
             gate_trace=gate_trace,
         )
 
-    if fmt != "NVFP4":
+    if fmt not in NVFP4_RENDER_EQUIVALENT:
         spec = fr.get_format(fmt)
-        baseline = spec.quantize_dequantize(weight.detach().clone()).to(
-            device=weight.device, dtype=weight.dtype,
-        )
-        reference = weight.detach().to(torch.float32)
         acts = activations.get(qname)
         acts_for_render = (
             acts.detach().to(device=weight.device, dtype=torch.float32)
             if acts is not None and int(acts.shape[-1]) == int(weight.shape[1])
             else None
         )
+        # R3 / Milestone C: the weighted families' one render definition,
+        # shared with the inline cost render and the emulation path. Calling
+        # it for the unweighted case as well is important for CB: it binds the
+        # v1/v2 reachable scale set to the same serialization context the
+        # cost payload and exporter stamp, while remaining the registry QDQ
+        # for every non-CB format.
+        if is_cb:
+            from prismaquant.nvfp4_cb_footprint import (
+                cb_quantize_dequantize_for_context,
+            )
+
+            baseline = cb_quantize_dequantize_for_context(
+                spec,
+                weight.detach(),
+                context=cb_serialization_context,
+                qname=qname,
+                col_weights=col_weights.reshape(-1).to(weight.device),
+                activation_rows=acts_for_render,
+                ldlq_missing_activation_ok=ldlq_missing_activation_ok,
+            ).to(device=weight.device, dtype=weight.dtype)
+        else:
+            from prismaquant.emu_forward_kl import weighted_quantize_dequantize
+
+            baseline = weighted_quantize_dequantize(
+                spec,
+                weight.detach(),
+                None if col_weights is None
+                else col_weights.reshape(-1).to(weight.device),
+            ).to(device=weight.device, dtype=weight.dtype)
+        reference = weight.detach().to(torch.float32)
         # Clip-consistent gate matrix — same contract as the NVFP4
         # progressive path (audit 2026-07-02 §3.9): score under the matrix
         # the GPTQ/scale-sweep passes optimize on.
@@ -1866,7 +5017,8 @@ def render_production_weight(
             acts_for_gate,
         )
         current = _RenderedCandidate(
-            label=f"{fmt.lower()}+rtn",
+            label=f"{fmt.lower()}+" + (
+                "weighted_vq" if col_weights is not None else "rtn"),
             weight=baseline.contiguous(),
             score=float(baseline_score),
             metric=baseline_metric,
@@ -2175,7 +5327,51 @@ def _resolve_production_render_levers(
     ):
         levers["nvfp4_scale_rule"] = NVFP4_SCALE_RULE_JOINT_MSE
     levers.setdefault("nvfp4_scale_rule", resolve_nvfp4_scale_rule())
+    # The A-side scale policy is a render input like the W-side scale rule
+    # beside it: it already reaches ``render_production_weight`` as this
+    # fill's ``input_global_scale``, and it decides what every
+    # activation-aware render SCORE means.  Resolve it here, once, and let it
+    # travel with the levers -- into the directory render identity, the CB
+    # render contract, the union per-shard identity and each score record --
+    # so a cache priced under one policy cannot be silently resumed, rescored
+    # or KL-validated under another (#227).  An explicit caller value wins and
+    # is canonicalized; a bad one refuses here rather than mid-fill.
+    levers[RENDER_LEVER_INPUT_GLOBAL_SCALE_POLICY] = (
+        _resolve_render_input_global_scale_policy(
+            levers.get(RENDER_LEVER_INPUT_GLOBAL_SCALE_POLICY)
+        )
+    )
     return levers
+
+
+def _resolve_render_input_global_scale_policy(
+    value: object | None = None,
+) -> str:
+    """Canonical input-global-scale policy id, from the contract owner."""
+    from prismaquant.nvfp4_activation_contract import (
+        resolve_input_global_scale_policy,
+    )
+
+    return resolve_input_global_scale_policy(
+        None if value is None else str(value)
+    )
+
+
+def _render_levers_input_global_scale_policy(
+    levers: Mapping[str, object] | None,
+) -> str:
+    """The policy a resolved lever mapping was priced under.
+
+    Falls back to the live resolution for a lever mapping built before #227
+    (or by a caller that never went through
+    :func:`_resolve_production_render_levers`), which is what those callers
+    already got.
+    """
+    value = (
+        levers.get(RENDER_LEVER_INPUT_GLOBAL_SCALE_POLICY)
+        if isinstance(levers, Mapping) else None
+    )
+    return _resolve_render_input_global_scale_policy(value)
 
 
 def _resolve_render_mechanism_plan(levers: Mapping[str, object]):
@@ -2201,6 +5397,1591 @@ def _resolve_render_mechanism_plan(levers: Mapping[str, object]):
     return mechanism_plan
 
 
+def _qname_set_sha256(qnames: Iterable[str]) -> str:
+    """Digest an unordered qname set.
+
+    Sorted, so the digest is a property of the SET and not of the order the
+    caller happened to enumerate it in. Two ``fill_production_weight_cache``
+    calls with equal digests hooked the same Linears, which (with an equal
+    ``calib_hash``) is what makes their rendered rows equal.
+    """
+    payload = "\n".join(sorted(str(q) for q in qnames))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def validate_activation_hook_scope(
+    value: object, *, where: str = "activation_hook_scope"
+) -> dict[str, object]:
+    """Validate an ``activation_hook_scope`` stamp (#147).
+
+    Every rule below is derived from the writer in
+    ``fill_production_weight_cache``: the exact five fields, the hooked set's
+    sha256, and ``render_narrowed`` as the comparison of the two counts.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where} must be a JSON object")
+    raw = dict(value)
+    if raw.get("schema") != ACTIVATION_HOOK_SCOPE_SCHEMA:
+        raise ValueError(f"{where} has unsupported schema")
+    digest = str(raw.get("hooked_qnames_sha256", "")).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError(f"{where}.hooked_qnames_sha256 must be a SHA-256 digest")
+    hooked = raw.get("hooked_qnames")
+    rendered = raw.get("rendered_qnames")
+    narrowed = raw.get("render_narrowed")
+    if (
+        not isinstance(hooked, int)
+        or isinstance(hooked, bool)
+        or hooked < 0
+        or not isinstance(rendered, int)
+        or isinstance(rendered, bool)
+        or rendered < 0
+        or rendered > hooked
+    ):
+        raise ValueError(
+            f"{where} has malformed hooked/rendered qname counts"
+        )
+    if not isinstance(narrowed, bool) or narrowed != (rendered != hooked):
+        raise ValueError(
+            f"{where}.render_narrowed must equal (rendered_qnames != "
+            "hooked_qnames)"
+        )
+    if set(raw) != {
+        "schema",
+        "hooked_qnames_sha256",
+        "hooked_qnames",
+        "rendered_qnames",
+        "render_narrowed",
+    }:
+        raise ValueError(f"{where} has unsupported fields")
+    return {
+        "schema": ACTIVATION_HOOK_SCOPE_SCHEMA,
+        "hooked_qnames_sha256": digest,
+        "hooked_qnames": int(hooked),
+        "rendered_qnames": int(rendered),
+        "render_narrowed": bool(narrowed),
+    }
+
+
+def activation_hook_scope_of(source: object) -> dict[str, object] | None:
+    """Return the validated hook scope carried by a cache or its metadata.
+
+    ``None`` when the stamp is absent (caches rendered before #130). Present
+    but malformed is an error, never a silent skip.
+    """
+    metadata = source
+    if hasattr(source, "metadata"):
+        metadata = getattr(source, "metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    raw = metadata.get(ACTIVATION_HOOK_SCOPE_KEY)
+    if raw is None:
+        return None
+    return validate_activation_hook_scope(raw)
+
+
+def assert_same_activation_hook_scope(
+    reference: Mapping[str, object] | None,
+    candidate: Mapping[str, object] | None,
+    *,
+    where: str,
+) -> dict[str, object] | None:
+    """Refuse two activation renderings that cannot be the same one (#147).
+
+    The correct rule for striped campaigns: shards of one campaign hook the
+    whole enumeration and render a slice each, so EQUAL hook digests (plus an
+    equal hooked count) is the pass condition. Binding per-shard digests into
+    the render identity would refuse every striped union; comparing nothing
+    lets two renderings ship under one name. Returns the validated reference
+    scope (``None`` when both sides predate the stamp).
+    """
+    if reference is None and candidate is None:
+        return None
+    if reference is None or candidate is None:
+        raise ValueError(
+            f"{where}: activation hook scope is present on one side and "
+            "missing on the other; cannot prove the same rendering"
+        )
+    validated_reference = validate_activation_hook_scope(
+        reference, where=f"{where} reference"
+    )
+    validated_candidate = validate_activation_hook_scope(
+        candidate, where=f"{where} candidate"
+    )
+    if (
+        validated_candidate["hooked_qnames_sha256"]
+        != validated_reference["hooked_qnames_sha256"]
+        or validated_candidate["hooked_qnames"]
+        != validated_reference["hooked_qnames"]
+    ):
+        raise ValueError(
+            f"{where}: activation hook digests differ: reference="
+            f"{validated_reference['hooked_qnames_sha256']} "
+            f"candidate={validated_candidate['hooked_qnames_sha256']}; "
+            "the two caches were rendered against different enumerations"
+        )
+    return validated_reference
+
+
+def _pre_guard_trusted_shards(cache_dir_path: str | Path) -> list[str]:
+    """Sorted names of rendered ``.pt`` shards already on disk.
+
+    This is the same file-presence predicate the resume loop admits units
+    by, so the admission record names exactly the shards the guard lets
+    through on trust.
+    """
+    try:
+        entries = list(Path(cache_dir_path).iterdir())
+    except OSError:
+        return []
+    return sorted(
+        entry.name
+        for entry in entries
+        if entry.is_file() and entry.suffix == ".pt"
+    )
+
+
+def build_pre_guard_admission(trusted_shards: Sequence[str]) -> dict[str, object]:
+    """Build the trust-admission record for a pre-guard directory (#146).
+
+    A directory that holds rendered shards but no sidecar is admitted on
+    trust — refusing would strand every existing cache — but the admission
+    is recorded in the sidecar itself: that shards were admitted, how many,
+    and their sorted shard names. A fresh directory (no shards) carries no
+    record at all.
+    """
+    names = [str(name) for name in trusted_shards]
+    if not names or any(not name for name in names):
+        raise ValueError("pre-guard admission requires a nonempty shard list")
+    if list(names) != sorted(names):
+        raise ValueError("pre-guard admission shard names must be sorted")
+    return {
+        "admitted_on_trust": True,
+        "trusted_shard_count": len(names),
+        "trusted_shards": list(names),
+    }
+
+
+def validate_pre_guard_admission(
+    value: object, *, where: str = "pre-guard admission"
+) -> dict[str, object]:
+    """Validate a ``pre_guard_admission`` sidecar section.
+
+    Every rule below is derived from the writer in
+    :func:`build_pre_guard_admission`: the exact field set, the true
+    admission flag, and the shard count matching the named shards. Present
+    but malformed is an error, never a silent skip.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where} must be a JSON object")
+    raw = dict(value)
+    if set(raw) != {
+        "admitted_on_trust",
+        "trusted_shard_count",
+        "trusted_shards",
+    }:
+        raise ValueError(f"{where} has unsupported fields")
+    if raw.get("admitted_on_trust") is not True:
+        raise ValueError(f"{where}.admitted_on_trust must be true")
+    count = raw.get("trusted_shard_count")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        raise ValueError(
+            f"{where}.trusted_shard_count must be a positive int"
+        )
+    shards = raw.get("trusted_shards")
+    if (
+        not isinstance(shards, list)
+        or not shards
+        or any(not isinstance(name, str) or not name for name in shards)
+        or list(shards) != sorted(shards)
+    ):
+        raise ValueError(
+            f"{where}.trusted_shards must be a sorted nonempty string list"
+        )
+    if count != len(shards):
+        raise ValueError(
+            f"{where}.trusted_shard_count must match len(trusted_shards)"
+        )
+    return {
+        "admitted_on_trust": True,
+        "trusted_shard_count": int(count),
+        "trusted_shards": list(shards),
+    }
+
+
+def build_production_cache_render_identity(
+    *,
+    render_scope: str,
+    requested_formats: Sequence[str],
+    levers: Mapping[str, object],
+    mechanism_plan,
+    calib_hash: str,
+    eligible_qnames: Iterable[str],
+    render_formats_by_qname: Mapping[str, Sequence[str]],
+    max_act_rows: int,
+) -> dict[str, object]:
+    """Build the render identity a cache directory's shards were rendered under.
+
+    This is the directory-level equivalent of the union campaign's
+    ``_render_identity`` (which binds the same render semantics per shard
+    bundle): every value-bearing input that changes the rendered bytes is a
+    field here — the render scope, the requested format menu, the resolved
+    levers plus their mechanism order, the calibration hash, the hooked
+    enumeration digest (#130: what the shared priority stream — and therefore
+    every Linear's rows — is a function of), the exact rendered
+    ``qname|fmt`` pairs (what an assignment scope or an
+    ``--include-qnames-file`` narrowing renders), and ``max_act_rows`` (the
+    reservoir size, hence the rows kept). Two fills that admit the same
+    sidecar rendered the same bytes; anything else refuses with the differing
+    field named.
+    """
+    if not isinstance(levers, Mapping):
+        raise ValueError("production cache render identity requires levers")
+    ordered = getattr(mechanism_plan, "ordered", mechanism_plan)
+    if ordered is None:
+        raise ValueError(
+            "production cache render identity requires a render mechanism plan"
+        )
+    mechanism_records = []
+    for raw in ordered:
+        if isinstance(raw, Mapping):
+            record = {
+                str(key): raw[key]
+                for key in (
+                    "name", "operation", "scope", "gate_metric"
+                )
+                if key in raw
+            }
+        else:
+            record = {
+                "name": str(getattr(raw, "name", raw)),
+                **({
+                    key: getattr(raw, key)
+                    for key in ("operation", "scope", "gate_metric")
+                    if hasattr(raw, key)
+                }),
+            }
+        mechanism_records.append(record)
+    hooked = sorted({str(q) for q in eligible_qnames})
+    rendered_pairs = sorted({
+        f"{str(qname)}|{str(fmt).strip().upper()}"
+        for qname, fmts in render_formats_by_qname.items()
+        for fmt in fmts
+    })
+    digest = str(calib_hash or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32,64}", digest) is None:
+        raise ValueError(
+            "production cache render identity requires a value-bearing "
+            "calib_hash"
+        )
+    rows = int(max_act_rows)
+    if rows < 1:
+        raise ValueError("production cache render identity requires max_act_rows >= 1")
+    return {
+        "schema": RENDER_IDENTITY_SCHEMA,
+        "render_scope": str(render_scope),
+        "requested_formats": sorted({
+            str(fmt).strip().upper()
+            for fmt in requested_formats
+            if str(fmt).strip()
+        }),
+        "levers": _canonical_json_value(
+            dict(levers), where="production cache render levers"
+        ),
+        "render_mechanism_order": _canonical_json_value(
+            mechanism_records, where="production cache render mechanism order"
+        ),
+        "calib_hash": digest,
+        "hooked_qnames_sha256": _qname_set_sha256(hooked),
+        "hooked_qnames": len(hooked),
+        "rendered_pairs": rendered_pairs,
+        "max_act_rows": rows,
+    }
+
+
+def validate_production_cache_render_identity(
+    value: object, *, where: str = "production cache render identity"
+) -> dict[str, object]:
+    """Validate a render-identity sidecar payload.
+
+    Every rule below is derived from the writer in
+    :func:`build_production_cache_render_identity`: the exact field set, the
+    sorted format/pair lists, and the digest shapes. Present but malformed is
+    an error, never a silent skip.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where} must be a JSON object")
+    raw = dict(value)
+    if raw.get("schema") != RENDER_IDENTITY_SCHEMA:
+        raise ValueError(f"{where} has unsupported schema")
+    base_fields = {
+        "schema",
+        "render_scope",
+        "requested_formats",
+        "levers",
+        "render_mechanism_order",
+        "calib_hash",
+        "hooked_qnames_sha256",
+        "hooked_qnames",
+        "rendered_pairs",
+        "max_act_rows",
+    }
+    append_fields = {
+        MTP_APPEND_SIDECAR_KEY,
+        PACKED_APPEND_SIDECAR_KEY,
+        PACKED_STREAMING_APPEND_SIDECAR_KEY,
+    }
+    admission_fields = {PRE_GUARD_ADMISSION_SIDECAR_KEY}
+    # Not `set(raw) < base_fields`: that is a PROPER-subset test, so a
+    # sidecar missing a base field but carrying an append section is
+    # neither a subset nor an unknown-field case and would fall through
+    # here.  Every base field does raise on its own below, so nothing
+    # got past this in practice -- but a field check should refuse for
+    # the reason it names.
+    if (
+        set(raw) - base_fields - append_fields - admission_fields
+        or not base_fields <= set(raw)
+    ):
+        raise ValueError(f"{where} has unsupported fields")
+    if not isinstance(raw.get("render_scope"), str) or not raw["render_scope"]:
+        raise ValueError(f"{where}.render_scope must be a nonempty string")
+    formats = raw.get("requested_formats")
+    if (
+        not isinstance(formats, list)
+        or not formats
+        or any(not isinstance(fmt, str) or not fmt for fmt in formats)
+        or list(formats) != sorted(formats)
+    ):
+        raise ValueError(
+            f"{where}.requested_formats must be a sorted nonempty string list"
+        )
+    levers = raw.get("levers")
+    if not isinstance(levers, Mapping) or not levers:
+        raise ValueError(f"{where}.levers must be a nonempty JSON object")
+    _canonical_json_value(dict(levers), where=f"{where}.levers")
+    mechanism_order = raw.get("render_mechanism_order")
+    if not isinstance(mechanism_order, list) or not all(
+        isinstance(record, Mapping) for record in mechanism_order
+    ):
+        raise ValueError(
+            f"{where}.render_mechanism_order must be a list of JSON objects"
+        )
+    digest = str(raw.get("calib_hash", "")).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32,64}", digest) is None:
+        raise ValueError(f"{where}.calib_hash must be a hex digest")
+    hook_digest = str(raw.get("hooked_qnames_sha256", "")).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", hook_digest) is None:
+        raise ValueError(
+            f"{where}.hooked_qnames_sha256 must be a SHA-256 digest"
+        )
+    hooked = raw.get("hooked_qnames")
+    if not isinstance(hooked, int) or isinstance(hooked, bool) or hooked < 0:
+        raise ValueError(f"{where}.hooked_qnames must be a non-negative int")
+    pairs = raw.get("rendered_pairs")
+    if (
+        not isinstance(pairs, list)
+        or not pairs
+        or any(not isinstance(pair, str) or "|" not in pair for pair in pairs)
+        or list(pairs) != sorted(pairs)
+    ):
+        raise ValueError(
+            f"{where}.rendered_pairs must be a sorted nonempty "
+            '"qname|FMT" string list'
+        )
+    rows = raw.get("max_act_rows")
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
+        raise ValueError(f"{where}.max_act_rows must be a positive int")
+    identity: dict[str, object] = {
+        "schema": RENDER_IDENTITY_SCHEMA,
+        "render_scope": str(raw["render_scope"]),
+        "requested_formats": list(formats),
+        "levers": _canonical_json_value(
+            dict(levers), where=f"{where}.levers"
+        ),
+        "render_mechanism_order": _canonical_json_value(
+            list(mechanism_order),
+            where=f"{where}.render_mechanism_order",
+        ),
+        "calib_hash": digest,
+        "hooked_qnames_sha256": hook_digest,
+        "hooked_qnames": int(hooked),
+        "rendered_pairs": list(pairs),
+        "max_act_rows": int(rows),
+    }
+    # Append sections (#170) ride in the same sidecar but are owned by their
+    # append writers, not by the base fill. The base fill neither writes nor
+    # compares them; each append compare-or-writes its own section through
+    # ``_check_and_record_append_identity``.
+    if MTP_APPEND_SIDECAR_KEY in raw:
+        identity[MTP_APPEND_SIDECAR_KEY] = validate_mtp_append_identity(
+            raw[MTP_APPEND_SIDECAR_KEY],
+            where=f"{where}.{MTP_APPEND_SIDECAR_KEY}",
+        )
+    if PACKED_APPEND_SIDECAR_KEY in raw:
+        identity[PACKED_APPEND_SIDECAR_KEY] = validate_packed_append_identity(
+            raw[PACKED_APPEND_SIDECAR_KEY],
+            where=f"{where}.{PACKED_APPEND_SIDECAR_KEY}",
+        )
+    if PACKED_STREAMING_APPEND_SIDECAR_KEY in raw:
+        identity[PACKED_STREAMING_APPEND_SIDECAR_KEY] = (
+            validate_packed_streaming_append_identity(
+                raw[PACKED_STREAMING_APPEND_SIDECAR_KEY],
+                where=f"{where}.{PACKED_STREAMING_APPEND_SIDECAR_KEY}",
+            )
+        )
+    # The trust admission (#146) is history, not render input: it is owned
+    # by the guard writers, carried forward by every later sidecar write,
+    # and never compared, so a guarded directory carrying it still resumes
+    # cleanly against a caller identity computed without it.
+    if PRE_GUARD_ADMISSION_SIDECAR_KEY in raw:
+        identity[PRE_GUARD_ADMISSION_SIDECAR_KEY] = validate_pre_guard_admission(
+            raw[PRE_GUARD_ADMISSION_SIDECAR_KEY],
+            where=f"{where}.{PRE_GUARD_ADMISSION_SIDECAR_KEY}",
+        )
+    return identity
+
+
+def build_mtp_append_identity(
+    *,
+    max_act_rows: int,
+    activation_source_hash: str,
+    activation_rows: Mapping[str, int],
+    source_prefix: str,
+    source_tensor_count: int,
+    profile_name: str,
+) -> dict[str, object]:
+    """Build the render identity for one MTP append (#170).
+
+    Every value-bearing input that changes the appended bytes is a field
+    here: the activation-source content hash (what the probe rows contain,
+    not the directory path that held them), the per-module row counts, the
+    reservoir size, and the profile/source binding the synthesized module
+    came from. Deliberately NOT bound: the render narrowing (which
+    ``mtp.*`` subset this call appends) — the append replaces its scope, so
+    consecutive stripes stay legal exactly as
+    ``test_mtp_append_replaces_prior_scope_without_double_counting`` pins.
+    """
+    rows = int(max_act_rows)
+    if rows < 1:
+        raise ValueError("MTP append identity requires max_act_rows >= 1")
+    source_hash = str(activation_source_hash or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32,64}", source_hash) is None:
+        raise ValueError(
+            "MTP append identity requires a value-bearing "
+            "activation_source_hash"
+        )
+    if not isinstance(activation_rows, Mapping) or not activation_rows:
+        raise ValueError(
+            "MTP append identity requires a nonempty activation_rows mapping"
+        )
+    counts = {
+        str(qname): int(count)
+        for qname, count in activation_rows.items()
+    }
+    if (
+        any(not qname for qname in counts)
+        or any(
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 1
+            for count in counts.values()
+        )
+    ):
+        raise ValueError(
+            "MTP append identity requires positive per-module row counts"
+        )
+    prefix = str(source_prefix or "").strip()
+    if not prefix:
+        raise ValueError("MTP append identity requires source_prefix")
+    total = int(source_tensor_count)
+    if total < 1:
+        raise ValueError(
+            "MTP append identity requires source_tensor_count >= 1"
+        )
+    profile = str(profile_name or "").strip()
+    if not profile:
+        raise ValueError("MTP append identity requires profile_name")
+    return {
+        "schema": RENDER_IDENTITY_MTP_APPEND_SCHEMA,
+        "profile_name": profile,
+        "source_prefix": prefix,
+        "source_tensor_count": total,
+        "max_act_rows": rows,
+        "activation_source_hash": source_hash,
+        "activation_rows": _canonical_json_value(
+            counts, where="MTP append activation rows"
+        ),
+    }
+
+
+def validate_mtp_append_identity(
+    value: object, *, where: str = "MTP append identity"
+) -> dict[str, object]:
+    """Validate an MTP append identity section.
+
+    Every rule below is derived from the writer in
+    :func:`build_mtp_append_identity`: the exact field set, the digest
+    shape, and the positive row counts. Present but malformed is an error,
+    never a silent skip.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where} must be a JSON object")
+    raw = dict(value)
+    if raw.get("schema") != RENDER_IDENTITY_MTP_APPEND_SCHEMA:
+        raise ValueError(f"{where} has unsupported schema")
+    if set(raw) != {
+        "schema",
+        "profile_name",
+        "source_prefix",
+        "source_tensor_count",
+        "max_act_rows",
+        "activation_source_hash",
+        "activation_rows",
+    }:
+        raise ValueError(f"{where} has unsupported fields")
+    if not isinstance(raw.get("profile_name"), str) or not raw["profile_name"]:
+        raise ValueError(f"{where}.profile_name must be a nonempty string")
+    if not isinstance(raw.get("source_prefix"), str) or not raw["source_prefix"]:
+        raise ValueError(f"{where}.source_prefix must be a nonempty string")
+    total = raw.get("source_tensor_count")
+    if not isinstance(total, int) or isinstance(total, bool) or total < 1:
+        raise ValueError(
+            f"{where}.source_tensor_count must be a positive int"
+        )
+    rows = raw.get("max_act_rows")
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
+        raise ValueError(f"{where}.max_act_rows must be a positive int")
+    source_hash = str(raw.get("activation_source_hash", "")).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32,64}", source_hash) is None:
+        raise ValueError(
+            f"{where}.activation_source_hash must be a hex digest"
+        )
+    counts = raw.get("activation_rows")
+    if (
+        not isinstance(counts, Mapping)
+        or not counts
+        or any(not isinstance(qname, str) or not qname for qname in counts)
+        or any(
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 1
+            for count in counts.values()
+        )
+    ):
+        raise ValueError(
+            f"{where}.activation_rows must map qnames to positive ints"
+        )
+    return {
+        "schema": RENDER_IDENTITY_MTP_APPEND_SCHEMA,
+        "profile_name": str(raw["profile_name"]),
+        "source_prefix": str(raw["source_prefix"]),
+        "source_tensor_count": int(total),
+        "max_act_rows": int(rows),
+        "activation_source_hash": source_hash,
+        "activation_rows": _canonical_json_value(
+            {str(qname): int(count) for qname, count in counts.items()},
+            where=f"{where}.activation_rows",
+        ),
+    }
+
+
+def build_packed_expert_append_identity(
+    *,
+    module_token_budget: int,
+    max_rows_per_expert: int,
+    eval_rows_per_expert: int,
+    render_mode: str,
+    gate_calibration_hash: str | None,
+    gate_token_budget: int | None,
+    hooked_qnames: Iterable[str],
+    max_layers: int | None,
+    pair_fit_calibration_hashes: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Build the render identity for one packed-expert append (#170).
+
+    Every value-bearing input that changes the appended bytes is a field
+    here: the fit reservoir budget, the per-expert row caps, the render
+    mode, the gate corpus hash plus its own budget (``None`` without a
+    cross-domain gate corpus), and the hooked-module enumeration digest
+    (#145: what the shared priority stream — and therefore every module's
+    kept rows — is a function of). Deliberately NOT bound:
+
+    * the render narrowing (which packed tensors this call renders) — the
+      eager format-menu build and the lazy per-Pareto-point gap-fill render
+      different subsets with identical bytes, so binding the subset would
+      refuse the exact sequence M4 relies on.
+
+    The fit corpus IS bound, but per pair (#173), not per section: each
+    ``"qname|FMT"`` entry records the ``calibration_data_hash`` of the fit
+    corpus its bytes were fitted on. A section-level bind was tried for
+    #170 and reverted — it refused the sanctioned M4 lazy gap-fill, which
+    legitimately renders a disjoint split of the cache under the
+    render-split calibration. Per-pair binding lets that split record its
+    own entries: disjoint pairs merge, while the same pair under a
+    different hash refuses (existing shards are never re-rendered, so the
+    recorded hash is always the bytes on disk). Pipeline builds pass one
+    calib to the fill and all its appends, so the base identity's
+    ``calib_hash`` still covers that path, and CB pairs bind their own fit
+    hash per pair.
+    """
+    budget = int(module_token_budget)
+    if budget < 1:
+        raise ValueError(
+            "packed-expert append identity requires module_token_budget >= 1"
+        )
+    fit_rows = int(max_rows_per_expert)
+    if fit_rows < 1:
+        raise ValueError(
+            "packed-expert append identity requires max_rows_per_expert >= 1"
+        )
+    eval_rows = int(eval_rows_per_expert)
+    if eval_rows < 1:
+        raise ValueError(
+            "packed-expert append identity requires eval_rows_per_expert >= 1"
+        )
+    mode = str(render_mode or "").strip()
+    if mode not in {"batched", "per_expert"}:
+        raise ValueError(
+            "packed-expert append identity requires "
+            "render_mode in {'batched', 'per_expert'}"
+        )
+    gate_hash: str | None = None
+    if gate_calibration_hash is not None:
+        gate_hash = str(gate_calibration_hash).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{32,64}", gate_hash) is None:
+            raise ValueError(
+                "packed-expert append identity requires a hex "
+                "gate_calibration_hash"
+            )
+    gate_budget: int | None = None
+    if gate_token_budget is not None:
+        gate_budget = int(gate_token_budget)
+        if gate_budget < 1:
+            raise ValueError(
+                "packed-expert append identity requires "
+                "gate_token_budget >= 1"
+            )
+    if (gate_hash is None) != (gate_budget is None):
+        raise ValueError(
+            "packed-expert append identity requires gate_token_budget "
+            "exactly when a gate corpus is present"
+        )
+    hooked = sorted({str(q) for q in hooked_qnames})
+    layers: int | None = None
+    if max_layers is not None:
+        layers = int(max_layers)
+        if layers < 1:
+            raise ValueError(
+                "packed-expert append identity requires max_layers >= 1"
+            )
+    pair_map = _validate_pair_fit_map(
+        pair_fit_calibration_hashes,
+        where="packed-expert append identity",
+    )
+    return {
+        "schema": RENDER_IDENTITY_PACKED_APPEND_SCHEMA,
+        "module_token_budget": budget,
+        "max_rows_per_expert": fit_rows,
+        "eval_rows_per_expert": eval_rows,
+        "render_mode": mode,
+        "gate_calibration_hash": gate_hash,
+        "gate_token_budget": gate_budget,
+        "hooked_qnames_sha256": _qname_set_sha256(hooked),
+        "hooked_qnames": len(hooked),
+        "max_layers": layers,
+        "pair_fit_calibration_hashes": pair_map,
+    }
+
+
+def _validate_pair_fit_map(
+    value: Mapping[str, str] | None, *, where: str
+) -> dict[str, str]:
+    """Validate a ``pair -> fit calibration hash`` map (#173).
+
+    Keys are ``"qname|FMT"`` pair names (nonempty, pipe-separated, exactly
+    as the packed render loop names them); values are content hashes of
+    the fit corpus the pair's bytes were fitted on. The shape rule is
+    derived from ``calibration_data_hash`` (blake2b-128 hex, 32 chars;
+    the 32..64 window admits longer digests without admitting garbage).
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"{where} requires pair_fit_calibration_hashes to be a JSON "
+            "object"
+        )
+    pair_map: dict[str, str] = {}
+    for pair, fit_hash in value.items():
+        if (
+            not isinstance(pair, str)
+            or not pair
+            or "|" not in pair
+            or not pair.split("|")[0]
+            or not pair.split("|")[1]
+        ):
+            raise ValueError(
+                f"{where}.pair_fit_calibration_hashes keys must be "
+                '"qname|FMT" pair names'
+            )
+        digest = str(fit_hash or "").strip().lower() if isinstance(
+            fit_hash, str
+        ) else ""
+        if re.fullmatch(r"[0-9a-f]{32,64}", digest) is None:
+            raise ValueError(
+                f"{where}.pair_fit_calibration_hashes[{pair!r}] must be a "
+                "hex digest"
+            )
+        pair_map[str(pair)] = digest
+    return _canonical_json_value(
+        pair_map, where=f"{where}.pair_fit_calibration_hashes"
+    )
+
+
+def validate_packed_append_identity(
+    value: object, *, where: str = "packed-expert append identity"
+) -> dict[str, object]:
+    """Validate a packed-expert append identity section.
+
+    Every rule below is derived from the writer in
+    :func:`build_packed_expert_append_identity`: the exact field set, the
+    digest shapes, and the gate-hash/gate-budget pairing. Present but
+    malformed is an error, never a silent skip.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where} must be a JSON object")
+    raw = dict(value)
+    if raw.get("schema") != RENDER_IDENTITY_PACKED_APPEND_SCHEMA:
+        raise ValueError(f"{where} has unsupported schema")
+    base_field_set = {
+        "schema",
+        "module_token_budget",
+        "max_rows_per_expert",
+        "eval_rows_per_expert",
+        "render_mode",
+        "gate_calibration_hash",
+        "gate_token_budget",
+        "hooked_qnames_sha256",
+        "hooked_qnames",
+        "max_layers",
+    }
+    # #173 added ``pair_fit_calibration_hashes``; a sidecar written by the
+    # #170 guard has the base ten fields and no pair map. Admit it (its
+    # pairs are adopted on the next append) rather than stranding the
+    # directory — fail-closed still holds, since every base field below
+    # raises on its own and the merged map refuses same-pair conflicts.
+    # Two distinct refusals, not one: an unknown field and a missing base
+    # field are different faults, and a single set-equality test reports
+    # both as "unsupported fields" -- a message that names the wrong
+    # reason for half the sidecars it rejects.
+    unknown = set(raw) - base_field_set - {"pair_fit_calibration_hashes"}
+    if unknown:
+        raise ValueError(
+            f"{where} has unsupported fields: {sorted(unknown)}"
+        )
+    absent = base_field_set - set(raw)
+    if absent:
+        raise ValueError(
+            f"{where} is missing required fields: {sorted(absent)}"
+        )
+    budget = raw.get("module_token_budget")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+        raise ValueError(f"{where}.module_token_budget must be a positive int")
+    fit_rows = raw.get("max_rows_per_expert")
+    if (
+        not isinstance(fit_rows, int)
+        or isinstance(fit_rows, bool)
+        or fit_rows < 1
+    ):
+        raise ValueError(
+            f"{where}.max_rows_per_expert must be a positive int"
+        )
+    eval_rows = raw.get("eval_rows_per_expert")
+    if (
+        not isinstance(eval_rows, int)
+        or isinstance(eval_rows, bool)
+        or eval_rows < 1
+    ):
+        raise ValueError(
+            f"{where}.eval_rows_per_expert must be a positive int"
+        )
+    if raw.get("render_mode") not in {"batched", "per_expert"}:
+        raise ValueError(
+            f"{where}.render_mode must be 'batched' or 'per_expert'"
+        )
+    gate_hash_raw = raw.get("gate_calibration_hash")
+    gate_hash: str | None = None
+    if gate_hash_raw is not None:
+        gate_hash = str(gate_hash_raw).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{32,64}", gate_hash) is None:
+            raise ValueError(
+                f"{where}.gate_calibration_hash must be a hex digest"
+            )
+    gate_budget_raw = raw.get("gate_token_budget")
+    gate_budget: int | None = None
+    if gate_budget_raw is not None:
+        if (
+            not isinstance(gate_budget_raw, int)
+            or isinstance(gate_budget_raw, bool)
+            or gate_budget_raw < 1
+        ):
+            raise ValueError(
+                f"{where}.gate_token_budget must be a positive int"
+            )
+        gate_budget = int(gate_budget_raw)
+    if (gate_hash is None) != (gate_budget is None):
+        raise ValueError(
+            f"{where} requires gate_token_budget exactly when a gate "
+            "corpus is present"
+        )
+    hook_digest = str(raw.get("hooked_qnames_sha256", "")).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", hook_digest) is None:
+        raise ValueError(
+            f"{where}.hooked_qnames_sha256 must be a SHA-256 digest"
+        )
+    hooked = raw.get("hooked_qnames")
+    if not isinstance(hooked, int) or isinstance(hooked, bool) or hooked < 0:
+        raise ValueError(f"{where}.hooked_qnames must be a non-negative int")
+    layers_raw = raw.get("max_layers")
+    layers: int | None = None
+    if layers_raw is not None:
+        if (
+            not isinstance(layers_raw, int)
+            or isinstance(layers_raw, bool)
+            or layers_raw < 1
+        ):
+            raise ValueError(f"{where}.max_layers must be a positive int")
+        layers = int(layers_raw)
+    pair_raw = raw.get("pair_fit_calibration_hashes")
+    pair_map: dict[str, str] = {}
+    if pair_raw is not None:
+        if not isinstance(pair_raw, Mapping):
+            raise ValueError(
+                f"{where}.pair_fit_calibration_hashes must be a JSON object"
+            )
+        pair_map = _validate_pair_fit_map(
+            {str(pair): fit for pair, fit in pair_raw.items()},
+            where=where,
+        )
+    return {
+        "schema": RENDER_IDENTITY_PACKED_APPEND_SCHEMA,
+        "module_token_budget": int(budget),
+        "max_rows_per_expert": int(fit_rows),
+        "eval_rows_per_expert": int(eval_rows),
+        "render_mode": str(raw["render_mode"]),
+        "gate_calibration_hash": gate_hash,
+        "gate_token_budget": gate_budget,
+        "hooked_qnames_sha256": hook_digest,
+        "hooked_qnames": int(hooked),
+        "max_layers": layers,
+        "pair_fit_calibration_hashes": pair_map,
+    }
+
+
+def build_packed_streaming_append_identity(
+    *,
+    module_token_budget: int,
+    max_rows_per_expert: int,
+    eval_rows_per_expert: int,
+    render_mode: str,
+    max_layers: int | None,
+    layers: Mapping[str, str],
+) -> dict[str, object]:
+    """Build the render identity for streaming packed-expert appends (#172).
+
+    One streaming call sees a single materialized module (``_render_packed_layer``
+    feeds each layer's input snapshot via ``module_acts_override``), so no
+    single section can describe the directory — the #170 guard recorded
+    nothing at all for that path and the union merged silently. This section
+    is the union: shared budgets/mode plus a per-layer map keyed by the
+    experts-module qname each call saw, each entry holding the content hash
+    of that module's activation snapshot. Consecutive layers merge; the same
+    module under a different budget or a different snapshot refuses.
+    Deliberately NOT bound: the render narrowing (which packed tensors each
+    layer renders) and any cross-domain gate corpus (unsupported on the
+    streaming path, so there is none to bind).
+    """
+    budget = int(module_token_budget)
+    if budget < 1:
+        raise ValueError(
+            "packed streaming append identity requires "
+            "module_token_budget >= 1"
+        )
+    fit_rows = int(max_rows_per_expert)
+    if fit_rows < 1:
+        raise ValueError(
+            "packed streaming append identity requires "
+            "max_rows_per_expert >= 1"
+        )
+    eval_rows = int(eval_rows_per_expert)
+    if eval_rows < 1:
+        raise ValueError(
+            "packed streaming append identity requires "
+            "eval_rows_per_expert >= 1"
+        )
+    mode = str(render_mode or "").strip()
+    if mode not in {"batched", "per_expert"}:
+        raise ValueError(
+            "packed streaming append identity requires "
+            "render_mode in {'batched', 'per_expert'}"
+        )
+    max_l: int | None = None
+    if max_layers is not None:
+        max_l = int(max_layers)
+        if max_l < 1:
+            raise ValueError(
+                "packed streaming append identity requires max_layers >= 1"
+            )
+    layer_map = _validate_streaming_layer_map(
+        layers, where="packed streaming append identity"
+    )
+    if not layer_map:
+        raise ValueError(
+            "packed streaming append identity requires a nonempty layers map"
+        )
+    return {
+        "schema": RENDER_IDENTITY_PACKED_STREAMING_APPEND_SCHEMA,
+        "module_token_budget": budget,
+        "max_rows_per_expert": fit_rows,
+        "eval_rows_per_expert": eval_rows,
+        "render_mode": mode,
+        "max_layers": max_l,
+        "layers": layer_map,
+    }
+
+
+def _validate_streaming_layer_map(
+    value: object, *, where: str
+) -> dict[str, str]:
+    """Validate a ``layers`` map of experts-module qname to snapshot hash."""
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(f"{where}.layers must be a nonempty JSON object")
+    layer_map: dict[str, str] = {}
+    for qname, snapshot_hash in value.items():
+        if not isinstance(qname, str) or not qname:
+            raise ValueError(
+                f"{where}.layers keys must be nonempty qnames"
+            )
+        digest = (
+            str(snapshot_hash or "").strip().lower()
+            if isinstance(snapshot_hash, str)
+            else ""
+        )
+        if re.fullmatch(r"[0-9a-f]{32,64}", digest) is None:
+            raise ValueError(
+                f"{where}.layers[{qname!r}] must be a hex digest"
+            )
+        layer_map[str(qname)] = digest
+    return _canonical_json_value(layer_map, where=f"{where}.layers")
+
+
+def validate_packed_streaming_append_identity(
+    value: object, *, where: str = "packed streaming append identity"
+) -> dict[str, object]:
+    """Validate a packed streaming append identity section.
+
+    Every rule below is derived from the writer in
+    :func:`build_packed_streaming_append_identity`: the exact field set,
+    the shared budgets, and the per-layer snapshot hashes. Present but
+    malformed is an error, never a silent skip.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where} must be a JSON object")
+    raw = dict(value)
+    if raw.get("schema") != RENDER_IDENTITY_PACKED_STREAMING_APPEND_SCHEMA:
+        raise ValueError(f"{where} has unsupported schema")
+    if set(raw) != {
+        "schema",
+        "module_token_budget",
+        "max_rows_per_expert",
+        "eval_rows_per_expert",
+        "render_mode",
+        "max_layers",
+        "layers",
+    }:
+        raise ValueError(f"{where} has unsupported fields")
+    budget = raw.get("module_token_budget")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+        raise ValueError(f"{where}.module_token_budget must be a positive int")
+    fit_rows = raw.get("max_rows_per_expert")
+    if (
+        not isinstance(fit_rows, int)
+        or isinstance(fit_rows, bool)
+        or fit_rows < 1
+    ):
+        raise ValueError(
+            f"{where}.max_rows_per_expert must be a positive int"
+        )
+    eval_rows = raw.get("eval_rows_per_expert")
+    if (
+        not isinstance(eval_rows, int)
+        or isinstance(eval_rows, bool)
+        or eval_rows < 1
+    ):
+        raise ValueError(
+            f"{where}.eval_rows_per_expert must be a positive int"
+        )
+    if raw.get("render_mode") not in {"batched", "per_expert"}:
+        raise ValueError(
+            f"{where}.render_mode must be 'batched' or 'per_expert'"
+        )
+    layers_raw = raw.get("max_layers")
+    max_l: int | None = None
+    if layers_raw is not None:
+        if (
+            not isinstance(layers_raw, int)
+            or isinstance(layers_raw, bool)
+            or layers_raw < 1
+        ):
+            raise ValueError(f"{where}.max_layers must be a positive int")
+        max_l = int(layers_raw)
+    layer_map = _validate_streaming_layer_map(
+        raw.get("layers"), where=where
+    )
+    return {
+        "schema": RENDER_IDENTITY_PACKED_STREAMING_APPEND_SCHEMA,
+        "module_token_budget": int(budget),
+        "max_rows_per_expert": int(fit_rows),
+        "eval_rows_per_expert": int(eval_rows),
+        "render_mode": str(raw["render_mode"]),
+        "max_layers": max_l,
+        "layers": layer_map,
+    }
+
+
+def _refuse_append_mismatch(
+    cache_dir: Path, section_key: str, field: str, cached: object,
+    now: object,
+) -> ValueError:
+    return ValueError(
+        f"production cache directory {cache_dir} {section_key} render "
+        f"identity differs at {field!r}: "
+        f"cached={identity_value_for_error(cached)} "
+        f"current={identity_value_for_error(now)}; the directory holds "
+        "appends from a different configuration — rebuild this directory "
+        "(fresh --cache-dir) instead of appending to it"
+    )
+
+
+def _merge_packed_pair_map_or_refuse(
+    cache_dir: Path,
+    section_key: str,
+    stored_section: Mapping[str, object],
+    current: Mapping[str, object],
+    stored_raw: dict[str, object],
+    sidecar_path: Path,
+    *,
+    progress: bool = True,
+) -> None:
+    """Merge one resident packed append's per-pair fit map (#173).
+
+    Shared fields (budgets, mode, gate corpus, hooked enumeration) compare
+    exactly and refuse on the first difference. The per-pair fit map unions:
+    pairs the directory has never seen are recorded, pairs already recorded
+    under the same hash are idempotent, and the same pair under a different
+    hash refuses — the bytes on disk are the first render's (existing shards
+    are never re-rendered), so a second hash for the same pair names bytes
+    that do not exist. The sanctioned M4 lazy gap-fill renders disjoint
+    pairs under the render-split calib, so it merges without refusing.
+    """
+    stored_shared = {
+        key: value
+        for key, value in stored_section.items()
+        if key != "pair_fit_calibration_hashes"
+    }
+    current_shared = {
+        key: value
+        for key, value in current.items()
+        if key != "pair_fit_calibration_hashes"
+    }
+    difference = first_identity_difference(stored_shared, current_shared)
+    if difference is not None:
+        field, cached, now = difference
+        raise _refuse_append_mismatch(
+            cache_dir, section_key, field, cached, now
+        )
+    stored_pairs = dict(stored_section.get("pair_fit_calibration_hashes") or {})
+    current_pairs = dict(current.get("pair_fit_calibration_hashes") or {})
+    if not isinstance(stored_pairs, Mapping) or not isinstance(
+        current_pairs, Mapping
+    ):
+        raise _refuse_append_mismatch(
+            cache_dir, section_key, "pair_fit_calibration_hashes",
+            stored_pairs, current_pairs,
+        )
+    for pair, fit_hash in current_pairs.items():
+        cached_hash = stored_pairs.get(pair)
+        if cached_hash is not None and cached_hash != fit_hash:
+            raise _refuse_append_mismatch(
+                cache_dir, section_key,
+                f"pair_fit_calibration_hashes[{pair!r}]",
+                cached_hash, fit_hash,
+            )
+    if all(
+        stored_pairs.get(pair) == fit_hash
+        for pair, fit_hash in current_pairs.items()
+    ):
+        if progress:
+            print(
+                f"[prod-cache] append resume: {section_key} render identity "
+                "matches; reusing on-disk shards",
+                flush=True,
+            )
+        return
+    merged_section = dict(stored_section)
+    merged_section["pair_fit_calibration_hashes"] = {
+        **stored_pairs, **current_pairs,
+    }
+    merged = dict(stored_raw)
+    merged[section_key] = merged_section
+    atomic_write_bytes(
+        sidecar_path,
+        json.dumps(merged, indent=2, sort_keys=True).encode("utf-8"),
+    )
+
+
+def _merge_streaming_layer_map_or_refuse(
+    cache_dir: Path,
+    section_key: str,
+    stored_section: Mapping[str, object],
+    current: Mapping[str, object],
+    stored_raw: dict[str, object],
+    sidecar_path: Path,
+    *,
+    progress: bool = True,
+) -> None:
+    """Merge one streaming packed append's per-layer map (#172).
+
+    Shared budgets/mode compare exactly and refuse on the first difference,
+    so layers appended under different budgets cannot land in one directory.
+    The per-layer map unions keyed by experts-module qname: unseen modules
+    are recorded, a re-appended module under the same snapshot hash is
+    idempotent, and the same module under a different snapshot hash refuses.
+    """
+    stored_shared = {
+        key: value
+        for key, value in stored_section.items()
+        if key != "layers"
+    }
+    current_shared = {
+        key: value for key, value in current.items() if key != "layers"
+    }
+    difference = first_identity_difference(stored_shared, current_shared)
+    if difference is not None:
+        field, cached, now = difference
+        raise _refuse_append_mismatch(
+            cache_dir, section_key, field, cached, now
+        )
+    stored_layers = dict(stored_section.get("layers") or {})
+    current_layers = dict(current.get("layers") or {})
+    if not isinstance(stored_layers, Mapping) or not isinstance(
+        current_layers, Mapping
+    ):
+        raise _refuse_append_mismatch(
+            cache_dir, section_key, "layers", stored_layers, current_layers,
+        )
+    for qname, snapshot_hash in current_layers.items():
+        cached_hash = stored_layers.get(qname)
+        if cached_hash is not None and cached_hash != snapshot_hash:
+            raise _refuse_append_mismatch(
+                cache_dir, section_key, f"layers[{qname!r}]",
+                cached_hash, snapshot_hash,
+            )
+    if all(
+        stored_layers.get(qname) == snapshot_hash
+        for qname, snapshot_hash in current_layers.items()
+    ):
+        if progress:
+            print(
+                f"[prod-cache] append resume: {section_key} render identity "
+                "matches; reusing on-disk shards",
+                flush=True,
+            )
+        return
+    merged_section = dict(stored_section)
+    merged_section["layers"] = {**stored_layers, **current_layers}
+    merged = dict(stored_raw)
+    merged[section_key] = merged_section
+    atomic_write_bytes(
+        sidecar_path,
+        json.dumps(merged, indent=2, sort_keys=True).encode("utf-8"),
+    )
+
+
+def _check_and_record_append_identity(
+    cache_dir_path: str | Path,
+    section_key: str,
+    current_section: Mapping[str, object],
+    *,
+    progress: bool = True,
+) -> None:
+    """Enforce one append configuration per cache directory (#170).
+
+    The base ``render_identity.json`` guard (#146) covers only
+    ``fill_production_weight_cache``; the MTP and packed-expert appends
+    stream further shards into the same directory after that fill returns,
+    under their own value-bearing inputs (budgets, gate corpus, activation
+    source). Each append compare-or-writes its own section of the sidecar:
+    the first append records it, every later append compares and refuses on
+    the first differing field. A directory whose sidecar predates the section
+    gains it without disturbing the base identity; a directory with no
+    sidecar at all records an append-only file the base fill later adopts.
+
+    Two sections merge rather than compare whole (#172, #173): the resident
+    packed section unions its per-pair fit map (disjoint pairs merge, the
+    same pair under a different hash refuses), and the streaming section
+    unions its per-layer map (new layers merge, the same module under a
+    different budget or snapshot refuses).
+
+    A ``pre_guard_admission`` record (#146), when present, is carried
+    forward untouched by the section merge and by that later adoption; an
+    append running first in a pre-guard directory records it the same way
+    the base fill does.
+    """
+    if section_key == MTP_APPEND_SIDECAR_KEY:
+        current = validate_mtp_append_identity(
+            _canonical_json_value(
+                dict(current_section),
+                where="MTP append identity",
+            ),
+            where="MTP append identity",
+        )
+    elif section_key == PACKED_APPEND_SIDECAR_KEY:
+        current = validate_packed_append_identity(
+            _canonical_json_value(
+                dict(current_section),
+                where="packed-expert append identity",
+            ),
+            where="packed-expert append identity",
+        )
+    elif section_key == PACKED_STREAMING_APPEND_SIDECAR_KEY:
+        current = validate_packed_streaming_append_identity(
+            _canonical_json_value(
+                dict(current_section),
+                where="packed streaming append identity",
+            ),
+            where="packed streaming append identity",
+        )
+    else:
+        raise ValueError(
+            f"unknown production cache append identity section {section_key!r}"
+        )
+    cache_dir = Path(cache_dir_path)
+    sidecar_path = cache_dir / RENDER_IDENTITY_SIDECAR_FILENAME
+    if not sidecar_path.is_file():
+        payload: dict[str, object] = {section_key: current}
+        trusted = _pre_guard_trusted_shards(cache_dir)
+        if trusted:
+            # An append running first in a pre-guard directory meets the
+            # same shards-on-trust admission as the base fill; the record
+            # goes in now so the base fill's later adoption carries it
+            # forward instead of laundering it.
+            if progress:
+                print(
+                    "[prod-cache] WARNING: cache directory "
+                    f"{cache_dir} holds rendered shards but no "
+                    f"{RENDER_IDENTITY_SIDECAR_FILENAME} (pre-guard "
+                    "directory); admitting existing shards on trust and "
+                    f"recording the {PRE_GUARD_ADMISSION_SIDECAR_KEY} "
+                    f"alongside the {section_key} section.",
+                    flush=True,
+                )
+            payload[PRE_GUARD_ADMISSION_SIDECAR_KEY] = (
+                build_pre_guard_admission(trusted)
+            )
+        atomic_write_bytes(
+            sidecar_path,
+            json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"),
+        )
+        return
+    try:
+        stored_raw = json.loads(sidecar_path.read_bytes().decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            f"production cache directory {cache_dir} has an unreadable "
+            f"{RENDER_IDENTITY_SIDECAR_FILENAME}: {exc}; refusing append — "
+            "rebuild this directory (fresh --cache-dir) instead of mixing "
+            "renders"
+        ) from exc
+    if not isinstance(stored_raw, Mapping):
+        raise ValueError(
+            f"production cache directory {cache_dir} has an invalid "
+            f"{RENDER_IDENTITY_SIDECAR_FILENAME}: expected a JSON object; "
+            "refusing append — rebuild this directory (fresh --cache-dir) "
+            "instead of mixing renders"
+        )
+    stored_raw = dict(stored_raw)
+    if (
+        stored_raw.get("schema") != RENDER_IDENTITY_SCHEMA
+        and MTP_APPEND_SIDECAR_KEY not in stored_raw
+        and PACKED_APPEND_SIDECAR_KEY not in stored_raw
+        and PACKED_STREAMING_APPEND_SIDECAR_KEY not in stored_raw
+    ):
+        raise ValueError(
+            f"production cache directory {cache_dir} has an unrecognized "
+            f"{RENDER_IDENTITY_SIDECAR_FILENAME}; refusing append — rebuild "
+            "this directory (fresh --cache-dir) instead of mixing renders"
+        )
+    stored_section_raw = stored_raw.get(section_key)
+    if stored_section_raw is None:
+        merged = dict(stored_raw)
+        merged[section_key] = current
+        atomic_write_bytes(
+            sidecar_path,
+            json.dumps(merged, indent=2, sort_keys=True).encode("utf-8"),
+        )
+        return
+    try:
+        if section_key == MTP_APPEND_SIDECAR_KEY:
+            stored_section = validate_mtp_append_identity(
+                stored_section_raw,
+                where=(
+                    f"cache directory {cache_dir} MTP append identity"
+                ),
+            )
+        elif section_key == PACKED_STREAMING_APPEND_SIDECAR_KEY:
+            stored_section = validate_packed_streaming_append_identity(
+                stored_section_raw,
+                where=(
+                    f"cache directory {cache_dir} packed streaming append "
+                    "identity"
+                ),
+            )
+        else:
+            stored_section = validate_packed_append_identity(
+                stored_section_raw,
+                where=(
+                    f"cache directory {cache_dir} packed-expert append "
+                    "identity"
+                ),
+            )
+    except ValueError as exc:
+        raise ValueError(
+            f"production cache directory {cache_dir} has an invalid "
+            f"{RENDER_IDENTITY_SIDECAR_FILENAME} section {section_key!r}: "
+            f"{exc}; refusing append — rebuild this directory (fresh "
+            "--cache-dir) instead of appending to it"
+        ) from exc
+    if section_key == PACKED_APPEND_SIDECAR_KEY:
+        _merge_packed_pair_map_or_refuse(
+            cache_dir, section_key, stored_section, current, stored_raw,
+            sidecar_path, progress=progress,
+        )
+        return
+    if section_key == PACKED_STREAMING_APPEND_SIDECAR_KEY:
+        _merge_streaming_layer_map_or_refuse(
+            cache_dir, section_key, stored_section, current, stored_raw,
+            sidecar_path, progress=progress,
+        )
+        return
+    difference = first_identity_difference(stored_section, current)
+    if difference is not None:
+        field, cached, now = difference
+        raise ValueError(
+            f"production cache directory {cache_dir} {section_key} render "
+            f"identity differs at {field!r}: "
+            f"cached={identity_value_for_error(cached)} "
+            f"current={identity_value_for_error(now)}; the directory holds "
+            "appends from a different configuration — rebuild this directory "
+            "(fresh --cache-dir) instead of appending to it"
+        )
+    if progress:
+        print(
+            f"[prod-cache] append resume: {section_key} render identity "
+            "matches; reusing on-disk shards",
+            flush=True,
+        )
+
+
+def _check_production_cache_render_identity(
+    cache_dir_path: Path,
+    current: Mapping[str, object],
+    *,
+    progress: bool = True,
+) -> None:
+    """Enforce one rendering per cache directory (#146, extended by #170).
+
+    The resume loop admits a unit as done by file presence alone, so without
+    this gate a directory resumed under a different scope, include-file,
+    lever string or calibration silently mixes units rendered under different
+    conditions. The first fill writes its render identity into
+    ``render_identity.json``; every later fill compares and refuses on the
+    first differing field. A missing sidecar means a pre-guard directory:
+    warn and admit its shards on trust (refusing would strand existing work),
+    then write the current identity so later mismatches refuse. The admission
+    itself is recorded in the sidecar as ``pre_guard_admission`` — the
+    trusted shard count plus their sorted shard names — so a downstream
+    artifact can read that part of the directory rests on unverified shards.
+    A fresh directory (no shards) carries no such record.
+
+    Append sections (#170, #172) are compared by their own writers, never
+    here: the stored base projection is compared against the current base
+    identity while recorded ``mtp_append`` / ``packed_expert_append`` /
+    ``packed_expert_streaming_append`` sections are preserved untouched. A
+    sidecar that holds only append sections (an append ran before any base
+    fill) is adopted the same way: the current base identity is merged in
+    alongside the validated sections. The trust admission is history rather
+    than render input, so it is carried forward by the adoption instead of
+    compared: a guarded directory carrying it still resumes cleanly against
+    a caller identity computed without it.
+    """
+    current_identity = validate_production_cache_render_identity(
+        _canonical_json_value(dict(current), where="production cache render identity"),
+        where="production cache render identity",
+    )
+    # The base fill owns the base fields only; a caller-supplied append
+    # section is never its to write.
+    current_identity = {
+        key: value
+        for key, value in current_identity.items()
+        if key not in (
+            MTP_APPEND_SIDECAR_KEY,
+            PACKED_APPEND_SIDECAR_KEY,
+            PACKED_STREAMING_APPEND_SIDECAR_KEY,
+        )
+    }
+    sidecar_path = cache_dir_path / RENDER_IDENTITY_SIDECAR_FILENAME
+    if not sidecar_path.is_file():
+        trusted_shards = _pre_guard_trusted_shards(cache_dir_path)
+        if trusted_shards:
+            print(
+                "[prod-cache] WARNING: cache directory "
+                f"{cache_dir_path} holds rendered shards but no "
+                f"{RENDER_IDENTITY_SIDECAR_FILENAME} (pre-guard directory); "
+                "admitting existing shards on trust — confirm the directory "
+                "was rendered under one configuration, then resume only with "
+                "identical settings. Writing the current render identity "
+                f"with a {PRE_GUARD_ADMISSION_SIDECAR_KEY} record naming "
+                "the trusted shards; future mismatches refuse.",
+                flush=True,
+            )
+            current_identity = {
+                **current_identity,
+                PRE_GUARD_ADMISSION_SIDECAR_KEY: build_pre_guard_admission(
+                    trusted_shards
+                ),
+            }
+        atomic_write_bytes(
+            sidecar_path,
+            json.dumps(
+                current_identity, indent=2, sort_keys=True
+            ).encode("utf-8"),
+        )
+        return
+    try:
+        stored_raw = json.loads(sidecar_path.read_bytes().decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            f"production cache directory {cache_dir_path} has an unreadable "
+            f"{RENDER_IDENTITY_SIDECAR_FILENAME}: {exc}; refusing resume — "
+            "rebuild this directory (fresh --cache-dir) instead of mixing "
+            "renders"
+        ) from exc
+    if not isinstance(stored_raw, Mapping):
+        raise ValueError(
+            f"production cache directory {cache_dir_path} has an invalid "
+            f"{RENDER_IDENTITY_SIDECAR_FILENAME}: expected a JSON object; "
+            "refusing resume — rebuild this directory (fresh --cache-dir) "
+            "instead of mixing renders"
+        )
+    stored_raw = dict(stored_raw)
+    base_fields = set(current_identity)
+    stored_base_raw = {
+        key: stored_raw[key] for key in base_fields if key in stored_raw
+    }
+    stored_sections: dict[str, object] = {}
+    for key in (
+        MTP_APPEND_SIDECAR_KEY,
+        PACKED_APPEND_SIDECAR_KEY,
+        PACKED_STREAMING_APPEND_SIDECAR_KEY,
+    ):
+        if key in stored_raw:
+            stored_sections[key] = stored_raw[key]
+    if set(stored_base_raw) != base_fields:
+        # No base identity on file. An append-only sidecar (an append ran
+        # before any base fill, so the file holds sections and no base
+        # fields at all) is adopted: keep its validated sections and record
+        # the current base identity alongside them. A file with some — but
+        # not all — base fields is neither a valid sidecar nor an
+        # append-only one, so it refuses fail-closed like any other invalid
+        # sidecar.
+        unknown = (
+            set(stored_raw) - base_fields
+            - {
+                MTP_APPEND_SIDECAR_KEY,
+                PACKED_APPEND_SIDECAR_KEY,
+                PACKED_STREAMING_APPEND_SIDECAR_KEY,
+            }
+            - {PRE_GUARD_ADMISSION_SIDECAR_KEY}
+        )
+        if not stored_base_raw and stored_sections and not unknown:
+            try:
+                adopted = validate_production_cache_render_identity(
+                    {**stored_raw, **current_identity},
+                    where=(
+                        f"cache directory {cache_dir_path} render identity"
+                    ),
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"production cache directory {cache_dir_path} has an "
+                    f"invalid {RENDER_IDENTITY_SIDECAR_FILENAME}: {exc}; "
+                    "refusing resume — rebuild this directory (fresh "
+                    "--cache-dir) instead of mixing renders"
+                ) from exc
+            print(
+                "[prod-cache] WARNING: cache directory "
+                f"{cache_dir_path} holds append sections but no base render "
+                "identity (append ran before any base fill); adopting the "
+                "recorded append configuration and writing the current base "
+                "identity — resume only with identical settings.",
+                flush=True,
+            )
+            atomic_write_bytes(
+                sidecar_path,
+                json.dumps(adopted, indent=2, sort_keys=True).encode("utf-8"),
+            )
+            return
+        raise ValueError(
+            f"production cache directory {cache_dir_path} has an invalid "
+            f"{RENDER_IDENTITY_SIDECAR_FILENAME}: missing base render "
+            "identity fields; refusing resume — rebuild this directory "
+            "(fresh --cache-dir) instead of mixing renders"
+        )
+    try:
+        stored = validate_production_cache_render_identity(
+            stored_raw,
+            where=f"cache directory {cache_dir_path} render identity",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"production cache directory {cache_dir_path} has an invalid "
+            f"{RENDER_IDENTITY_SIDECAR_FILENAME}: {exc}; refusing resume — "
+            "rebuild this directory (fresh --cache-dir) instead of mixing "
+            "renders"
+        ) from exc
+    stored_base = {
+        key: stored[key] for key in base_fields
+    }
+    difference = first_identity_difference(stored_base, current_identity)
+    if difference is not None:
+        field, cached, now = difference
+        raise ValueError(
+            f"production cache directory {cache_dir_path} render identity "
+            f"differs at {field!r}: cached={identity_value_for_error(cached)} "
+            f"current={identity_value_for_error(now)}; the directory holds "
+            "renders from a different configuration — rebuild this directory "
+            "(fresh --cache-dir) instead of resuming it"
+        )
+    if progress:
+        print(
+            "[prod-cache] resume: render identity matches "
+            f"({len(current_identity['rendered_pairs'])} pairs); "
+            "reusing on-disk shards",
+            flush=True,
+        )
+
+
 def fill_production_weight_cache(
     model: nn.Module,
     calib_ids: torch.Tensor,
@@ -2208,6 +6989,7 @@ def fill_production_weight_cache(
     *,
     formats: Sequence[str] = ("NVFP4",),
     render_assignment: Mapping[str, str] | None = None,
+    render_qnames: Iterable[str] | None = None,
     levers: Mapping[str, bool] | None = None,
     max_act_rows: int = 256,
     progress: bool = True,
@@ -2218,6 +7000,8 @@ def fill_production_weight_cache(
     recache_include_activation_quant: bool = True,
     recache_microbatch_size: int = 1,
     h_detail_dir: str | Path | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    cb_serialization_context=None,
 ) -> ProductionWeightCache:
     """End-to-end fill: collect activations, render production δw per
     (qname, fmt), return a `ProductionWeightCache`.
@@ -2227,12 +7011,19 @@ def fill_production_weight_cache(
       calib_ids: ``[N, T]`` token id tensor for activation collection.
       qnames: which Linears are eligible to render (skips MoE packed
         experts; handle those separately via `_quantize_3d_packed`
-        extensions).
+        extensions). This is also the set the activation collector HOOKS,
+        and the rendered bytes are a function of it: pass the whole
+        enumeration and narrow with `render_assignment`/`render_qnames`, never
+        by shortening this list (#130).
       formats: which formats to pre-render when `render_assignment` is not
         supplied.
       render_assignment: optional concrete export assignment. When supplied,
         render exactly the non-BF16 `(qname, fmt)` entries used by that
         assignment instead of the full `qnames x formats` menu.
+      render_qnames: optional render-only narrowing, orthogonal to
+        `render_assignment`. Render just these qnames (a stripe, a shard) while
+        still hooking all of `qnames`, so the shard's bytes are the whole
+        run's bytes. `None` renders everything in scope.
       levers: which production levers to enable (default: GPTQ with optional
         joint NVFP4 scale optimization when requested by the caller).
       recache_pass: when True, run a second calibration forward with the
@@ -2243,6 +7034,16 @@ def fill_production_weight_cache(
         needs the actual export assignment.
       h_detail_dir: optional probe h-detail directory retained for archived
         Fisher ablations. V1 production defaults do not require it.
+      col_weights: optional ``{qname: (in_features,)}`` imatrix map (re-vet R3
+        / CB Milestone C). Applied only to the weighted-render families
+        (``WEIGHTED_RENDER_FAMILIES``); every other format's rendered bytes are
+        bit-identical whether it is supplied or not. This is what lets the CB
+        lane's allocator cost, frontier KL and shipped bytes all come from ONE
+        ``ProductionWeightCache`` render instead of a separate
+        skeleton-requantize path.
+      cb_serialization_context: explicit artifact serialization identity for
+        every CB render. Required when the scope contains a CB format; never
+        inferred from the current environment.
     """
     if recache_pass and not recache_assignment:
         raise ValueError(
@@ -2266,12 +7067,26 @@ def fill_production_weight_cache(
     requested_formats = tuple(
         dict.fromkeys(_canon(f) for f in formats if str(f).strip())
     )
+    # #130/#135: ``eligible_qnames`` is the enumeration the activation
+    # collector hooks, and it is deliberately NOT narrowed by anything below.
+    # One shared generator feeds every hooked Linear's priority reservoir, so
+    # the rows a Linear keeps are a function of how many rows every EARLIER
+    # hook consumed. Narrowing the hook set therefore changes the rows, the
+    # GPTQ Hessian and the rendered bytes. The invariant this buys: the bytes
+    # of a (qname, fmt) pair depend on ``qnames`` and the calibration, never on
+    # which subset of them this call happens to render. That is what makes a
+    # stripe, an assignment scope and a resume all reproduce the whole run.
     eligible_qnames = set(qnames)
+    render_scope_qnames: set[str] | None = (
+        {str(q) for q in render_qnames} if render_qnames is not None else None
+    )
     if render_assignment is not None:
         render_formats_by_qname: dict[str, tuple[str, ...]] = {}
         for qname, fmt in render_assignment.items():
             q = str(qname)
             if q not in eligible_qnames:
+                continue
+            if render_scope_qnames is not None and q not in render_scope_qnames:
                 continue
             fmt_canon = _canon(fmt)
             if fmt_canon == "BF16":
@@ -2284,12 +7099,36 @@ def fill_production_weight_cache(
             f for f in requested_formats if f != "BF16"
         )
         render_formats_by_qname = {
-            q: non_bf16_formats for q in eligible_qnames
+            q: non_bf16_formats
+            for q in eligible_qnames
+            if render_scope_qnames is None or q in render_scope_qnames
         }
         qname_set = {
             q for q, fmts in render_formats_by_qname.items() if fmts
         }
         render_scope = "format-menu"
+
+    cb_render_identity = build_production_cache_cb_render_identity(
+        render_formats_by_qname,
+        cb_serialization_context=cb_serialization_context,
+        col_weights=col_weights,
+        render_levers=levers,
+        render_mechanism_plan=mechanism_plan,
+    )
+    if cb_render_identity is not None:
+        named_modules = dict(model.named_modules())
+        cb_source_weights = {
+            qname: named_modules[qname].weight.detach()
+            for qname in cb_render_identity["col_weights_qnames"]
+            if qname in named_modules
+            and hasattr(named_modules[qname], "weight")
+        }
+        cb_render_identity = bind_cb_render_identity_source_weights(
+            cb_render_identity,
+            cb_source_weights,
+            require_complete=True,
+            where="ProductionWeightCache dense source binding",
+        )
 
     if not qname_set:
         return ProductionWeightCache(
@@ -2299,13 +7138,26 @@ def fill_production_weight_cache(
                 "render_scope": render_scope,
                 "requested_formats": list(requested_formats),
                 "requested_entries": 0,
+                **({
+                    CB_RENDER_IDENTITY_METADATA_KEY: cb_render_identity,
+                } if cb_render_identity is not None else {}),
             },
         )
     model_profile = recache_profile
     if model_profile is None:
+        from .model_profiles import (
+            DeadVendoredOverrideError,
+            profile_from_model,
+        )
         try:
-            from .model_profiles import profile_from_model
             model_profile = profile_from_model(model)
+        except DeadVendoredOverrideError:
+            # This is the render that produces the production weight cache --
+            # the bytes an export later ships. A dead override means those
+            # bytes would be rendered from UPSTREAM modelling code, and
+            # `model_profile = None` also drops the profile's pinned names, so
+            # components the profile forbids quantizing get quantized (#202).
+            raise
         except Exception:
             model_profile = None
 
@@ -2326,15 +7178,147 @@ def fill_production_weight_cache(
     # collection memory + compute by 99% — and lets a borderline-OOM
     # job finish on the same hardware.
     cache_dir_path: Path | None = None
+    cb_pair_identities: dict[tuple[str, str], dict[str, object]] = {}
+    cb_pair_calibration_hash: str | None = None
+    admitted_cb_pairs: dict[
+        tuple[str, str], dict[str, object]
+    ] = {}
+    rerender_expected_cb_pairs: dict[
+        tuple[str, str], dict[str, object]
+    ] = {}
     if cache_dir is not None:
         cache_dir_path = Path(cache_dir)
         cache_dir_path.mkdir(parents=True, exist_ok=True)
+        from prismaquant.perturbed_x_cache import calibration_data_hash
+
+        # #146: resume admits a unit as done by file presence alone, so a
+        # directory resumed under a different scope, include-file, lever
+        # string or calibration would silently mix units rendered under
+        # different conditions. Compare this call's render identity against
+        # the sidecar before any shard is read or written; refuse on mismatch.
+        _check_production_cache_render_identity(
+            cache_dir_path,
+            build_production_cache_render_identity(
+                render_scope=render_scope,
+                requested_formats=requested_formats,
+                levers=levers,
+                mechanism_plan=mechanism_plan,
+                calib_hash=calibration_data_hash(calib_ids),
+                eligible_qnames=eligible_qnames,
+                render_formats_by_qname=render_formats_by_qname,
+                max_act_rows=max_act_rows,
+            ),
+            progress=progress,
+        )
+        if cb_render_identity is not None:
+            cb_pair_context = validate_cb_render_identity_metadata(
+                cb_render_identity,
+                expected_context=cb_serialization_context,
+                require_source_complete=True,
+                where="ProductionWeightCache dense pair resume",
+            )
+            calibration_hash = calibration_data_hash(calib_ids)
+            cb_pair_calibration_hash = calibration_hash
+            git_commit = _production_cache_git_commit()
+            producer_source_sha256 = _production_cache_source_sha256()
+            named_modules = dict(model.named_modules())
+            # Validate every pre-existing pair before file-existence pruning.
+            # A single mismatch aborts the whole launch before an activation
+            # forward or encoder call, so stale bytes are neither reused nor
+            # silently replaced.
+            for qname, fmts in render_formats_by_qname.items():
+                mod = named_modules.get(qname)
+                for fmt in fmts:
+                    if not _is_cb_format_name(fmt):
+                        continue
+                    if mod is None or not hasattr(mod, "weight"):
+                        raise ValueError(
+                            f"production CB cache pair source module is "
+                            f"missing for {qname}@{fmt}"
+                        )
+                    key = (qname, fmt)
+                    pair_identity = build_cb_cache_pair_identity(
+                        cb_render_identity,
+                        qname=qname,
+                        fmt=fmt,
+                        calibration_hash=calibration_hash,
+                        git_commit=git_commit,
+                        source_weight_dtype=mod.weight.dtype,
+                        cb_serialization_context=cb_serialization_context,
+                        render_input_contract={
+                            "path": "dense",
+                            "max_act_rows": int(max_act_rows),
+                        },
+                        validated_context=cb_pair_context,
+                        producer_source_sha256=producer_source_sha256,
+                    )
+                    cb_pair_identities[key] = pair_identity
+                    admitted = _validate_cb_cache_pair_resume(
+                        cache_dir_path=cache_dir_path,
+                        qname=qname,
+                        fmt=fmt,
+                        expected_identity=pair_identity,
+                        require_render_score=True,
+                        allow_missing_shard=True,
+                    )
+                    if admitted is not None:
+                        shard_path = (
+                            cache_dir_path
+                            / _cache_weight_filename(qname, fmt)
+                        )
+                        if shard_path.is_file():
+                            admitted_cb_pairs[key] = admitted
+                        else:
+                            # A streamed-menu consumer intentionally leaves
+                            # only the identity-bound scalar + canonical tensor
+                            # digest.  The selected assignment is re-rendered,
+                            # and publication is allowed only if its canonical
+                            # bytes match what that scalar scored.
+                            rerender_expected_cb_pairs[key] = admitted
     render_score_sidecar_path: Path | None = (
         cache_dir_path / "render_scores.json"
         if cache_dir_path is not None else None
     )
     render_score_records: dict[str, dict[str, object]] = (
         _load_render_score_sidecar(render_score_sidecar_path)
+    )
+    # The global score sidecar is name-keyed and cannot independently admit a
+    # CB score.  Restore admitted scores only from their per-pair sidecars,
+    # whose identity binds the exact calibration/sampling contract and rendered
+    # tensor digest.  Missing pairs discard any stale global record.
+    fresh_cb_score_keys = {
+        _render_score_record_key(qname, fmt)
+        for qname, fmts in render_formats_by_qname.items()
+        for fmt in fmts
+        if _is_cb_format_name(fmt)
+    }
+    for score_key in fresh_cb_score_keys:
+        render_score_records.pop(score_key, None)
+    for (qname, fmt), sidecar in admitted_cb_pairs.items():
+        score = sidecar.get("render_score")
+        if not isinstance(score, Mapping):
+            raise RuntimeError(
+                f"production CB cache resume internal score gate failure for "
+                f"{qname}@{fmt}; refusing reuse or re-render"
+            )
+        render_score_records[_render_score_record_key(qname, fmt)] = dict(score)
+    # Every retained cost enters the fill here -- the disk-resume branch below
+    # keeps them by key, and a fully-rendered directory never reaches that
+    # branch at all -- so this is the one place to ask whether they were
+    # priced under the activation-scale policy this run applies (#227).  A
+    # directory whose render identity was compared already refused on
+    # ``levers.nvfp4_input_global_scale_policy``; this still holds for the
+    # pre-guard directory admitted on trust, for a sidecar restored beside a
+    # fresh identity, and for in-memory callers.
+    render_score_policy = _render_levers_input_global_scale_policy(levers)
+    _check_resumed_render_score_policies(
+        render_score_records,
+        policy=render_score_policy,
+        where=(
+            "production cache resume"
+            if cache_dir_path is None
+            else f"production cache resume @ {cache_dir_path}"
+        ),
     )
     if progress and render_score_records:
         print(
@@ -2349,6 +7333,13 @@ def fill_production_weight_cache(
         for fmt in fmts
     }
     render_base_fmt_set = {_render_base_format(fmt) for fmt in fmt_set}
+    # Whether any requested format is served under a calibrated STATIC
+    # activation scale, so the fill must measure per-unit max|x| (the scale
+    # identity its records retain and the assignment-KL hooks price with).
+    # Read from the specs, not from ``"NVFP4" in`` the set: a Tessera W4A4
+    # rung is served under the same contract with a different name (#205).
+    needs_static_activation_max = _formats_need_static_activation_max(
+        render_base_fmt_set)
     # Store activations for every missing rendered format.  NVFP4 needs them
     # for GPTQ/JSO; FP8_DYNAMIC/FP8_E4M3 and explicit MX formats need them
     # for their activation-aware renders, and the production-render allocator
@@ -2417,7 +7408,7 @@ def fill_production_weight_cache(
         and not qnames_needing_activation
         and (
             (sidecar_path is not None and sidecar_path.is_file())
-            or "NVFP4" not in render_base_fmt_set
+            or not needs_static_activation_max
         )
     )
     collector = None  # may stay None on the skip_forward path
@@ -2430,11 +7421,15 @@ def fill_production_weight_cache(
             )
         activations: dict[str, torch.Tensor] = {}
     else:
-        # Hook every relevant Linear so we always get max_abs (cheap), but
-        # only STORE full activations for Linears we still need to render.
+        # Hook the WHOLE eligible enumeration -- not the render-narrowed
+        # ``qname_set``. Hooking is cheap (an amax plus one CPU
+        # ``torch.rand`` per call), and hooking the full set is what keeps the
+        # shared priority stream identical across a stripe, an assignment
+        # scope and a resume (#130/#135). Only STORE full activations for
+        # Linears we still need to render.
         collector = _LinearActivationCollector(
             model,
-            qnames=qname_set,
+            qnames=eligible_qnames,
             max_rows=max_act_rows,
             store_qnames=qnames_needing_activation,
             store_device=activation_store_device,
@@ -2477,7 +7472,8 @@ def fill_production_weight_cache(
         activation_devices = sorted({str(t.device) for t in activations.values()})
         print(
             f"[prod-cache] collected activations for "
-            f"{len(activations)}/{len(qname_set)} Linears "
+            f"{len(activations)} of {len(qname_set)} rendered "
+            f"({len(eligible_qnames)} hooked) Linears "
             f"resident_bytes={activation_bytes:,} "
             f"devices={activation_devices}",
             flush=True,
@@ -2564,23 +7560,17 @@ def fill_production_weight_cache(
     # rendered qnames.  ``sidecar_path`` was defined earlier (before the
     # forward-skip decision); re-using it here.
     if sidecar_path is not None and sidecar_path.is_file():
-        import json as _json
-        try:
-            activation_max_abs.update(_json.loads(sidecar_path.read_text()))
-            if progress:
-                print(
-                    f"[prod-cache] resume: loaded {len(activation_max_abs)} "
-                    f"max_abs entries from sidecar",
-                    flush=True,
-                )
-        except Exception as e:
-            if progress:
-                print(
-                    f"[prod-cache] sidecar load failed ({e}); recomputing",
-                    flush=True,
-                )
+        activation_max_abs.update(
+            _load_activation_max_abs_sidecar(sidecar_path)
+        )
+        if progress:
+            print(
+                f"[prod-cache] resume: loaded {len(activation_max_abs)} "
+                f"max_abs entries from sidecar",
+                flush=True,
+            )
 
-    if "NVFP4" in render_base_fmt_set:
+    if needs_static_activation_max:
         # Group by fused sibling key for max-across-siblings unification.
         from prismaquant.decision_units import fused_group_key
 
@@ -2632,8 +7622,10 @@ def fill_production_weight_cache(
         # Persist max_abs to sidecar so future resume runs can skip
         # activation collection entirely for completed qnames.
         if sidecar_path is not None and activation_max_abs:
-            import json as _json
-            sidecar_path.write_text(_json.dumps(activation_max_abs, indent=2))
+            atomic_write_bytes(
+                sidecar_path,
+                json.dumps(activation_max_abs, indent=2).encode("utf-8"),
+            )
 
     # MEM: free per-Linear activation tensors after each render so peak
     # memory stays bounded.  On 27B, 497 Linears × ~10K in_features × 512
@@ -2666,7 +7658,8 @@ def fill_production_weight_cache(
             _nvfp4_input_global_scale_from_max_abs,
         )
         export_scale = (
-            _nvfp4_input_global_scale_from_max_abs(float(max_abs))
+            _nvfp4_input_global_scale_from_max_abs(
+                float(max_abs), policy=render_score_policy)
             if (max_abs is not None and max_abs > 0)
             else None
         )
@@ -2689,10 +7682,24 @@ def fill_production_weight_cache(
                 fname = _cache_weight_filename(qname, fmt_key)
                 disk_path = cache_dir_path / fname
                 if disk_path.is_file():
+                    if _is_cb_format_name(fmt_key):
+                        if (qname, fmt_key) not in admitted_cb_pairs:
+                            raise RuntimeError(
+                                "production CB cache resume internal gate "
+                                f"failure for {qname}@{fmt_key}: shard "
+                                f"{disk_path} was not identity-admitted; "
+                                "refusing reuse or re-render"
+                            )
                     weights[(qname, fmt_key)] = fname
                     skipped_resumed += 1
                     score_key = _render_score_record_key(qname, fmt_key)
                     if score_key not in render_score_records:
+                        if _is_cb_format_name(fmt_key):
+                            raise RuntimeError(
+                                f"identity-admitted CB cache pair "
+                                f"{qname}@{fmt_key} has no admitted render "
+                                "score; refusing partial surrogate reuse"
+                            )
                         try:
                             cached = torch.load(
                                 disk_path,
@@ -2707,6 +7714,7 @@ def fill_production_weight_cache(
                                 rendered_weight=cached,
                                 activations=activations_local.get(qname),
                                 activation_max_abs=max_abs,
+                                input_global_scale_policy=render_score_policy,
                             )
                             del cached
                         except Exception:
@@ -2720,6 +7728,13 @@ def fill_production_weight_cache(
                     continue
             try:
                 gate_trace: list[dict[str, object]] = []
+                timed_cb_pair = (
+                    cache_dir_path is not None
+                    and _is_cb_format_name(fmt_key)
+                )
+                if timed_cb_pair and weight.device.type == "cuda":
+                    torch.cuda.synchronize(weight.device)
+                encode_started = time.perf_counter()
                 w_dq = render_production_weight(
                     weight, render_fmt,
                     qname=qname,
@@ -2728,7 +7743,18 @@ def fill_production_weight_cache(
                     joint_global_real=joint,
                     input_global_scale=export_scale,
                     fisher_row_weights=row_weights,
+                    col_weights=(
+                        None if col_weights is None
+                        else col_weights.get(qname)
+                    ),
+                    cb_serialization_context=cb_serialization_context,
                     gate_trace=gate_trace,
+                )
+                if timed_cb_pair and weight.device.type == "cuda":
+                    torch.cuda.synchronize(weight.device)
+                encode_seconds = (
+                    time.perf_counter() - encode_started
+                    if timed_cb_pair else 0.0
                 )
                 render_score_records[_render_score_record_key(qname, fmt_key)] = (
                     _render_score_record(
@@ -2739,6 +7765,7 @@ def fill_production_weight_cache(
                         rendered_weight=w_dq,
                         activations=activations_local.get(qname),
                         activation_max_abs=max_abs,
+                        input_global_scale_policy=render_score_policy,
                     )
                 )
                 if gate_trace:
@@ -2761,6 +7788,56 @@ def fill_production_weight_cache(
             # fp32 but we always re-cast at install time, so storing fp32
             # is wasteful (2× memory).  On 27B this drops the cache from
             # ~25 GB to ~12 GB.
+            if cache_dir_path is not None and _is_cb_format_name(fmt_key):
+                pair_identity = cb_pair_identities.get((qname, fmt_key))
+                if pair_identity is None:
+                    raise RuntimeError(
+                        f"production CB cache pair identity missing before "
+                        f"publishing {qname}@{fmt_key}"
+                    )
+                expected_sidecar = rerender_expected_cb_pairs.get(
+                    (qname, fmt_key)
+                )
+                if expected_sidecar is not None:
+                    observed_tensor = _cb_cache_tensor_identity(
+                        _canonical_rendered_weight_tensor(
+                            w_dq,
+                            weight_dtype=weight.dtype,
+                        )
+                    )
+                    tensor_difference = first_identity_difference(
+                        expected_sidecar.get("tensor"),
+                        observed_tensor,
+                        path="tensor",
+                    )
+                    if tensor_difference is not None:
+                        field, stored, expected = tensor_difference
+                        raise RuntimeError(
+                            "selected CB assignment re-render differs from "
+                            f"the streamed scalar for {qname}@{fmt_key} at "
+                            f"'{field}': stored={identity_value_for_error(stored)} "
+                            f"rerendered={identity_value_for_error(expected)}; "
+                            "refusing publication"
+                        )
+                _write_cb_cache_pair_sidecar(
+                    cache_dir_path=cache_dir_path,
+                    qname=qname,
+                    fmt=fmt_key,
+                    identity=pair_identity,
+                    tensor=w_dq,
+                    encode_seconds=encode_seconds,
+                    render_score=render_score_records[
+                        _render_score_record_key(qname, fmt_key)
+                    ],
+                    consumer_receipt=(
+                        expected_sidecar.get("consumer_receipt")
+                        if expected_sidecar is not None
+                        and isinstance(
+                            expected_sidecar.get("consumer_receipt"), Mapping
+                        )
+                        else None
+                    ),
+                )
             _store_rendered_weight_entry(
                 weights=weights,
                 cache_dir_path=cache_dir_path,
@@ -2768,6 +7845,7 @@ def fill_production_weight_cache(
                 fmt=fmt_key,
                 tensor=w_dq,
                 weight_dtype=weight.dtype,
+                durable=_is_cb_format_name(fmt_key),
             )
             done += 1
             del w_dq
@@ -2798,6 +7876,78 @@ def fill_production_weight_cache(
         )
     _write_render_score_sidecar(render_score_sidecar_path, render_score_records)
     render_gate_summary = _summarize_render_gate_records(render_gate_records)
+    cb_pair_identity_summary: dict[str, object] | None = None
+    cb_pair_artifact_records: dict[str, dict[str, object]] = {}
+    if cb_pair_identities:
+        canonical_pairs = {
+            f"{qname}|{fmt}": pair
+            for (qname, fmt), pair in sorted(cb_pair_identities.items())
+        }
+        if cache_dir_path is not None:
+            for (qname, fmt), pair in sorted(cb_pair_identities.items()):
+                sidecar_path = (
+                    cache_dir_path
+                    / _cache_pair_identity_filename(qname, fmt)
+                )
+                shard_path = cache_dir_path / _cache_weight_filename(qname, fmt)
+                if not sidecar_path.is_file() or not shard_path.is_file():
+                    continue
+                sidecar = _read_cb_cache_pair_sidecar(
+                    sidecar_path,
+                    qname=qname,
+                    fmt=fmt,
+                )
+                difference = first_identity_difference(
+                    sidecar.get("identity"),
+                    pair,
+                )
+                if difference is not None:
+                    field, stored, expected = difference
+                    raise RuntimeError(
+                        f"production CB cache publication identity differs "
+                        f"for {qname}@{fmt} at '{field}': "
+                        f"stored={identity_value_for_error(stored)} "
+                        f"expected={identity_value_for_error(expected)}"
+                    )
+                cb_pair_artifact_records[f"{qname}|{fmt}"] = {
+                    "identity": pair,
+                    "tensor": sidecar.get("tensor"),
+                    "render_score": sidecar.get("render_score"),
+                    "render_score_sha256": sidecar.get(
+                        "render_score_sha256"
+                    ),
+                }
+        cb_pair_identity_summary = {
+            "schema": "prismaquant.production_weight_cache.cb_pair_set.v1",
+            "pair_schema": CB_CACHE_PAIR_IDENTITY_SCHEMA,
+            "entries": len(canonical_pairs),
+            "identity_sha256": _canonical_json_sha256(
+                canonical_pairs,
+                where="CB cache pair identity set",
+            ),
+            "published_entries": len(cb_pair_artifact_records),
+            "artifact_sha256": _canonical_json_sha256(
+                cb_pair_artifact_records,
+                where="CB cache pair artifact set",
+            ),
+            "codebook_bundle_sha256": sorted({
+                str(pair["codebook_bundle_sha256"])
+                for pair in canonical_pairs.values()
+                if pair.get("codebook_bundle_sha256") is not None
+            }),
+            "calibration_hashes": sorted({
+                str(pair["calibration_hash"])
+                for pair in canonical_pairs.values()
+            }),
+            "git_commits": sorted({
+                str(pair["git_commit"])
+                for pair in canonical_pairs.values()
+            }),
+            "producer_source_sha256": sorted({
+                str(pair["producer_source_sha256"])
+                for pair in canonical_pairs.values()
+            }),
+        }
     cache = ProductionWeightCache(
         weights=weights,
         levers=dict(levers),
@@ -2868,8 +8018,39 @@ def fill_production_weight_cache(
                 ),
             },
             "render_scope": render_scope,
+            # #130: render_scope alone cannot tell a reader which rows this
+            # cache was rendered against -- a stripe and a whole build both
+            # stamp "format-menu". The hooked enumeration is what the shared
+            # priority stream is a function of, so record it: two caches with
+            # equal hook digests and equal calibration rendered the same rows,
+            # whatever subset each one rendered.
+            ACTIVATION_HOOK_SCOPE_KEY: {
+                "schema": ACTIVATION_HOOK_SCOPE_SCHEMA,
+                "hooked_qnames_sha256": _qname_set_sha256(eligible_qnames),
+                "hooked_qnames": len(eligible_qnames),
+                "rendered_qnames": len(qname_set),
+                "render_narrowed": len(qname_set) != len(eligible_qnames),
+            },
             "requested_formats": list(requested_formats),
             "requested_entries": int(n),
+            **({
+                "calib_hash": cb_pair_calibration_hash,
+            } if cb_pair_calibration_hash is not None else {}),
+            **({
+                "cb_cache_pair_identity": cb_pair_identity_summary,
+            } if cb_pair_identity_summary is not None else {}),
+            **({
+                "cb_cache_pair_artifacts": {
+                    "schema": (
+                        "prismaquant.production_weight_cache."
+                        "cb_pair_artifact_set.v1"
+                    ),
+                    "records": cb_pair_artifact_records,
+                },
+            } if cb_pair_artifact_records else {}),
+            **({
+                CB_RENDER_IDENTITY_METADATA_KEY: cb_render_identity,
+            } if cb_render_identity is not None else {}),
         },
     )
     if recache_pass:
@@ -2921,6 +8102,14 @@ class _PackedExpertActivationCollector:
     larger than the per-Linear ``max_rows`` budget: with top-k routing over E
     experts each expert only sees ~``top_k/E`` of the tokens, so a stable
     per-expert Hessian needs ``~max_rows_per_expert * E / top_k`` module tokens.
+
+    An optional ``row_consumer(qname, X)`` observes each full, live input before
+    storage selection. It must consume synchronously rather than retain X;
+    campaigns use it to accumulate full-calibration Hessians without creating
+    a second module-input cache. An optional boundary_consumer receives the
+    original module, positional and keyword arguments before row selection or
+    dtype conversion, preserving actual routing tensors for native validation.
+    The default leaves reservoir sampling intact.
     """
 
     def __init__(
@@ -2932,10 +8121,28 @@ class _PackedExpertActivationCollector:
         store_device: torch.device | str,
         store_dtype: torch.dtype = torch.float32,
         profile=None,
+        store_qnames: set[str] | None = None,
+        row_consumer=None,
+        boundary_consumer=None,
     ):
         self.model = model
         self.profile = profile
+        self.row_consumer = row_consumer
+        self.boundary_consumer = boundary_consumer
+        # #145: ``experts_qnames`` is the enumeration the collector HOOKS --
+        # the full visible module set -- and ``store_qnames`` narrows only
+        # which modules keep full activation tensors. One shared generator
+        # feeds every hooked module's priority reservoir, so the rows a
+        # module keeps are a function of how many rows every EARLIER hook
+        # consumed; narrowing the hook set therefore changes the rows, the
+        # per-expert Hessians and the rendered bytes. This mirrors the dense
+        # ``_LinearActivationCollector`` (``qnames``/``store_qnames``) fix
+        # from #130/#135: hook the whole enumeration, narrow only the render.
         self.experts_qnames = set(experts_qnames)
+        self.store_qnames = (
+            set(store_qnames) if store_qnames is not None
+            else set(experts_qnames)
+        )
         self.module_token_budget = int(module_token_budget)
         self.store_device = torch.device(store_device)
         self.store_dtype = store_dtype
@@ -2952,19 +8159,51 @@ class _PackedExpertActivationCollector:
             if qname not in self.experts_qnames:
                 continue
             self._modules_by_qname[qname] = mod
-            self.activations[qname] = []
+            if qname in self.store_qnames:
+                self.activations[qname] = []
 
     def install(self) -> None:
         for qname, mod in self._modules_by_qname.items():
-            self._handles.append(
-                mod.register_forward_pre_hook(self._make_hook(qname))
-            )
+            if self.boundary_consumer is None:
+                handle = mod.register_forward_pre_hook(self._make_hook(qname))
+            else:
+                handle = mod.register_forward_pre_hook(self._make_hook(qname), with_kwargs=True)
+            self._handles.append(handle)
 
     def _make_hook(self, qname: str):
-        def hook(module, args):
+        def hook(module, args, kwargs=None):
+            if self.boundary_consumer is not None:
+                self.boundary_consumer(qname, module, args, kwargs or {})
             if not args or not isinstance(args[0], torch.Tensor):
                 return
             x = args[0]
+            if self.row_consumer is not None:
+                self.row_consumer(qname, x)
+            # Draw this call's row priorities for EVERY hooked module,
+            # stored or not. One generator feeds every module's reservoir, so
+            # the slice of the stream a module receives is a function of how
+            # many rows every earlier hook consumed. Drawing only for stored
+            # modules makes a run that renders a subset -- an assignment scope
+            # that BF16s one layer's experts, or the force_format frontier
+            # build vs the export build -- keep DIFFERENT rows than the full
+            # run, and the rendered bytes follow the rows. Draws are CPU
+            # floats; the cost is noise next to the D2H copy below. Only
+            # modules in the store set keep the full activation tensor.
+            # Memory bound: store_qnames x module_token_budget x hidden.
+            last_dim = int(x.shape[-1]) if x.dim() >= 1 else 0
+            n_rows = (x.numel() // last_dim) if last_dim > 0 else 0
+            new_priorities = (
+                torch.rand(
+                    int(n_rows),
+                    generator=self._gen,
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+                if n_rows > 0 and self.module_token_budget > 0
+                else None
+            )
+            if qname not in self.store_qnames:
+                return
             # NOT non_blocking: async D2H into pageable memory can read
             # the tensor before the producing kernel finishes under GPU
             # contention, deterministically corrupting the snapshot to NaN
@@ -2983,7 +8222,7 @@ class _PackedExpertActivationCollector:
                 self._priorities.get(qname),
                 flat,
                 max_rows=self.module_token_budget,
-                generator=self._gen,
+                new_priorities=new_priorities,
             )
             self.activations[qname] = [] if sampled is None else [sampled]
             if priorities is None:
@@ -3005,6 +8244,500 @@ class _PackedExpertActivationCollector:
         return out
 
 
+PACKED_EXPERT_RENDER_SCORE_SCHEMA = (
+    "prismaquant.production_render_scores.packed_expert.v1"
+)
+PACKED_EXPERT_RENDER_GATE_SCHEMA = (
+    "prismaquant.production_render_gates.packed_expert.v1"
+)
+PACKED_ACTIVATION_HOOK_SCOPE_SCHEMA = (
+    "prismaquant.production_weight_cache.packed_activation_hook_scope.v1"
+)
+PACKED_ACTIVATION_HOOK_SCOPE_KEY = "activation_hook_scope_packed"
+
+
+def _stamp_packed_hook_scope(
+    cache: ProductionWeightCache,
+    *,
+    hook_qnames: set[str],
+) -> None:
+    """Stamp which packed-experts enumeration a render hooked (#145).
+
+    The stamp carries ONLY the hooked enumeration (digest + count), never a
+    rendered count: the M4 lazy gap-fill calls this path repeatedly with
+    overlapping assignments, so any rendered subset would describe the last
+    call rather than the cache. The hook enumeration is what the shared
+    priority stream is a function of, so equal digests (+ equal calibration)
+    is the readable claim "these packed bytes were rendered against the same
+    rows". A repeat call that hooked a different enumeration is a different
+    rendering and is refused rather than silently re-stamped.
+    """
+    scope = {
+        "schema": PACKED_ACTIVATION_HOOK_SCOPE_SCHEMA,
+        "hooked_qnames_sha256": _qname_set_sha256(hook_qnames),
+        "hooked_qnames": len(hook_qnames),
+    }
+    metadata = cache.metadata
+    if metadata is None:
+        cache.metadata = metadata = {}
+    existing = metadata.get(PACKED_ACTIVATION_HOOK_SCOPE_KEY)
+    if existing is None:
+        metadata[PACKED_ACTIVATION_HOOK_SCOPE_KEY] = scope
+        return
+    if not isinstance(existing, Mapping):
+        raise ValueError(
+            "ProductionWeightCache activation_hook_scope_packed is malformed"
+        )
+    if (
+        existing.get("schema") != scope["schema"]
+        or existing.get("hooked_qnames_sha256")
+        != scope["hooked_qnames_sha256"]
+        or int(existing.get("hooked_qnames", -1)) != scope["hooked_qnames"]
+    ):
+        raise ValueError(
+            "packed-expert activation hook enumeration differs from the "
+            "cache's stamped rendering; refusing to mix two renderings in "
+            "one cache"
+        )
+
+
+def packed_activation_hook_scope_of(
+    source: object,
+) -> dict[str, object] | None:
+    """Canonical reader for the packed activation-hook stamp (#145).
+
+    Returns the stamped enumeration (schema, digest, count), or ``None``
+    when the cache rendered no packed experts. A present-but-malformed
+    stamp is refused: "no stamp" (dense-only cache) and "a stamp that
+    cannot be checked" must not be conflated. ``union_production_cache``
+    and the cost/export pair gate share this reader so the digest
+    comparison is one rule, not three.
+    """
+    metadata = (
+        source.metadata if isinstance(source, ProductionWeightCache) else source
+    )
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            "packed activation hook scope needs a cache or metadata mapping"
+        )
+    scope = metadata.get(PACKED_ACTIVATION_HOOK_SCOPE_KEY)
+    if scope is None:
+        return None
+    if not isinstance(scope, Mapping):
+        raise ValueError(
+            "ProductionWeightCache activation_hook_scope_packed is malformed"
+        )
+    digest = str(scope.get("hooked_qnames_sha256", "")).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError(
+            "ProductionWeightCache activation_hook_scope_packed digest "
+            "is malformed"
+        )
+    if scope.get("schema") != PACKED_ACTIVATION_HOOK_SCOPE_SCHEMA:
+        raise ValueError(
+            "ProductionWeightCache activation_hook_scope_packed schema "
+            "is unsupported"
+        )
+    count = scope.get("hooked_qnames")
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or int(count) < 0
+    ):
+        raise ValueError(
+            "ProductionWeightCache activation_hook_scope_packed count "
+            "is malformed"
+        )
+    return {
+        "schema": PACKED_ACTIVATION_HOOK_SCOPE_SCHEMA,
+        "hooked_qnames_sha256": digest,
+        "hooked_qnames": int(count),
+    }
+
+
+def _packed_expert_score_rows(
+    per_expert_acts: Sequence[torch.Tensor | None] | None,
+    expert: int,
+    *,
+    eval_rows: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Return the scoring rows for one packed expert, or ``None``.
+
+    The tail of the expert's routed fit rows is used, capped at
+    ``eval_rows`` — the same slice the batched do-no-harm gate holds out
+    when a same-corpus holdout is available.  Experts the router never
+    sent a token to have no activation evidence and score weight-only.
+    """
+    if per_expert_acts is None or expert >= len(per_expert_acts):
+        return None
+    rows_tensor = per_expert_acts[expert]
+    if rows_tensor is None or rows_tensor.numel() == 0:
+        return None
+    n_rows = int(rows_tensor.shape[0])
+    cap = int(eval_rows) if int(eval_rows) > 0 else n_rows
+    tail = rows_tensor[max(0, n_rows - cap):]
+    return tail.detach().to(device=device, dtype=torch.float32)
+
+
+def _packed_expert_render_score_record(
+    *,
+    qname: str,
+    fmt: str,
+    render_format: str,
+    reference: torch.Tensor,
+    rendered: torch.Tensor,
+    per_expert_acts: Sequence[torch.Tensor | None] | None,
+    activation_max_abs: float | None,
+    eval_rows: int,
+    device: torch.device,
+    score_rows_source: str,
+    input_global_scale_policy: str | None = None,
+) -> dict[str, object]:
+    """Score one packed 3-D expert cache entry honestly.
+
+    Every expert in the stack is scored with the SAME scorer the dense path
+    uses (``_render_score_record`` on ``[out, in]`` slices), against its own
+    routed rows; the per-expert records are then summed into the one record
+    the cache key owns.  Sums, not means-of-means: ``score`` is
+    ``sum(score_sum) / sum(normalizer)`` so an expert with more routed rows
+    weighs proportionally, exactly as a single dense Linear's rows do.
+
+    Experts with no routed rows have no activation evidence.  They are
+    excluded from the output metric (averaging an undefined error in would
+    be a fabrication) and counted in ``experts_without_activations``;
+    ``weight_mse`` is activation-independent and always covers every expert.
+    """
+    if reference.dim() != 3:
+        raise RuntimeError(
+            f"packed expert render score for {qname}@{fmt} needs a 3-D "
+            f"[E, out, in] reference, got shape {tuple(reference.shape)}"
+        )
+    if tuple(rendered.shape) != tuple(reference.shape):
+        raise RuntimeError(
+            f"packed expert render score for {qname}@{fmt}: rendered shape "
+            f"{tuple(rendered.shape)} differs from reference "
+            f"{tuple(reference.shape)}"
+        )
+    n_experts = int(reference.shape[0])
+    per_expert: list[dict[str, object]] = []
+    for expert in range(n_experts):
+        acts_e = _packed_expert_score_rows(
+            per_expert_acts, expert, eval_rows=eval_rows, device=device,
+        )
+        per_expert.append(
+            _render_score_record(
+                qname=f"{qname}.e{expert}",
+                fmt=fmt,
+                render_format=render_format,
+                reference_weight=reference[expert].detach().to(
+                    device=device, dtype=torch.float32,
+                ),
+                rendered_weight=rendered[expert].detach().to(device=device),
+                activations=acts_e,
+                activation_max_abs=activation_max_abs,
+                input_global_scale_policy=input_global_scale_policy,
+            )
+        )
+        del acts_e
+    if not per_expert:
+        raise RuntimeError(
+            f"packed expert render score for {qname}@{fmt} has zero experts"
+        )
+    with_acts = [
+        record for record in per_expert
+        if int(record["activation_rows"]) > 0  # type: ignore[arg-type]
+    ]
+    scored = with_acts or per_expert
+    metrics = {str(record["metric"]) for record in scored}
+    raw_metrics = {str(record["raw_render_metric"]) for record in scored}
+    if len(metrics) != 1 or len(raw_metrics) != 1:
+        raise RuntimeError(
+            f"packed expert render score for {qname}@{fmt} mixes metrics: "
+            f"metric={sorted(metrics)} raw={sorted(raw_metrics)}"
+        )
+    normalizer = sum(float(record["normalizer"]) for record in scored)
+    score_sum = sum(float(record["score_sum"]) for record in scored)
+    raw_score_sum = sum(
+        float(record["raw_render_score_sum"]) for record in scored
+    )
+    weight_mse_sum = sum(
+        float(record["weight_mse_sum"]) for record in per_expert
+    )
+    n_weights = sum(int(record["n_weights"]) for record in per_expert)
+    activation_rows = sum(int(record["activation_rows"]) for record in scored)
+    clip_values = {
+        float(record["activation_max_abs"])
+        for record in scored
+        if record["activation_max_abs"] is not None
+    }
+    # Every expert in the stack was priced from the one ``activation_max_abs``
+    # this entry owns, so a served-contract stack has exactly one static G and
+    # one policy.  Carry them the way the dense record does, so a packed cost
+    # is checkable against a later policy too (#227); a stack scored under a
+    # dynamic quantizer records neither.
+    scale_values = {
+        float(record["input_global_scale"])
+        for record in scored
+        if record.get("input_global_scale") is not None
+    }
+    if len(scale_values) > 1:
+        raise RuntimeError(
+            f"packed expert render score for {qname}@{fmt} mixes static "
+            f"activation scales {sorted(scale_values)}; one entry is priced "
+            "under one input_global_scale"
+        )
+    policy_values = {
+        str(record["input_global_scale_policy"])
+        for record in scored
+        if record.get("input_global_scale_policy") is not None
+    }
+    return {
+        "qname": str(qname),
+        "format": str(fmt).upper(),
+        "render_format": str(render_format).upper(),
+        "schema": PACKED_EXPERT_RENDER_SCORE_SCHEMA,
+        "metric": next(iter(metrics)),
+        "score": float(score_sum / normalizer) if normalizer > 0 else 0.0,
+        "score_sum": float(score_sum),
+        "raw_render_metric": next(iter(raw_metrics)),
+        "raw_render_score": (
+            float(raw_score_sum / normalizer) if normalizer > 0 else 0.0
+        ),
+        "raw_render_score_sum": float(raw_score_sum),
+        "weight_mse": (
+            float(weight_mse_sum / n_weights) if n_weights > 0 else 0.0
+        ),
+        "weight_mse_sum": float(weight_mse_sum),
+        "n_weights": int(n_weights),
+        "normalizer": float(normalizer),
+        "activation_rows": int(activation_rows),
+        "activation_quantized": any(
+            bool(record["activation_quantized"]) for record in scored
+        ),
+        "activation_clipped": any(
+            bool(record["activation_clipped"]) for record in scored
+        ),
+        "activation_max_abs": (
+            float(max(clip_values)) if clip_values else None
+        ),
+        "input_global_scale": (
+            float(next(iter(scale_values))) if scale_values else None
+        ),
+        "input_global_scale_policy": (
+            str(next(iter(policy_values)))
+            if scale_values and policy_values else None
+        ),
+        "out_features": int(reference.shape[1]),
+        "in_features": int(reference.shape[2]),
+        "packed_experts": int(n_experts),
+        "experts_scored_with_activations": int(len(with_acts)),
+        "experts_without_activations": int(n_experts - len(with_acts)),
+        "expert_score_aggregation": "sum_over_experts",
+        "score_rows_source": str(score_rows_source),
+        "score_rows_per_expert_cap": int(eval_rows),
+    }
+
+
+def _packed_expert_render_gate_record(
+    *,
+    qname: str,
+    fmt: str,
+    render_format: str,
+    render_mode: str,
+    batched: bool,
+    resumed: bool,
+    coverage_record: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Return the truthful render-gate record for a packed expert entry.
+
+    The packed path runs NO progressive-gate mechanism, so this record
+    carries an EMPTY trace: synthesizing a step would claim a gate evaluated
+    candidates it never saw.  What it records instead is what actually
+    executed, plus the per-expert GPTQ-vs-RTN do-no-harm decision counts the
+    render did measure.
+    """
+    if resumed:
+        mechanism = "resumed_shard"
+        progressive_gate = "not-run"
+        detail = (
+            "packed-MoE expert entry resumed from an existing shard; no "
+            "render mechanism ran in this process. Render telemetry is the "
+            "producing run's, carried in packed_expert_coverage."
+        )
+    elif batched:
+        mechanism = "batched_gptq_fixed_damp"
+        progressive_gate = "not-run"
+        detail = (
+            "packed-MoE expert render: no progressive-gate mechanism ran. "
+            "The batched path applies one fixed-damp GPTQ column update "
+            "across the layer's experts; joint_scale_opt, static_act_order "
+            "and the damp sweep are deliberately not run (each forces a "
+            "per-expert loop). The GPTQ-vs-RTN do-no-harm decision recorded "
+            "below WAS measured, per expert."
+        )
+    else:
+        mechanism = "render_production_weight_per_expert"
+        progressive_gate = "ran-untraced"
+        detail = (
+            "packed-MoE expert render in per_expert mode: progressive gates "
+            "ran inside render_production_weight for each expert, but the "
+            "packed path collects no per-expert gate trace, so no mechanism "
+            "step is claimed here."
+        )
+    record: dict[str, object] = {
+        "qname": str(qname),
+        "format": str(fmt).upper(),
+        "render_format": str(render_format).upper(),
+        "schema": PACKED_EXPERT_RENDER_GATE_SCHEMA,
+        "trace": [],
+        "progressive_gate": progressive_gate,
+        "mechanism": mechanism,
+        "render_mode": str(render_mode),
+        "detail": detail,
+    }
+    if isinstance(coverage_record, Mapping):
+        record["expert_do_no_harm"] = {
+            field: coverage_record[field]
+            for field in (
+                "n_experts",
+                "empty_experts",
+                "rtn_fallbacks",
+                "heldout_reverts",
+                "gptq_experts",
+                "cross_gated_experts",
+                "gate_mode",
+            )
+            if field in coverage_record
+        }
+    return record
+
+
+def _packed_expert_metadata_scope(
+    metadata: Mapping[str, object],
+    key: str,
+) -> dict[str, object]:
+    value = metadata.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise RuntimeError(
+            f"ProductionWeightCache metadata.{key} is not a mapping"
+        )
+    return dict(value)
+
+
+def _finalize_packed_expert_cache_metadata(
+    cache: ProductionWeightCache,
+    *,
+    packed_scope_names: set[str],
+    score_records: Mapping[str, Mapping[str, object]],
+    gate_records: Mapping[tuple[str, str], Mapping[str, object]],
+    coverage: Mapping[str, Mapping[str, object]],
+    cache_dir_path: Path | None,
+) -> None:
+    """Restore the cache's render-identity invariants after a packed append.
+
+    ``union_production_cache`` treats three counters as invariants of a
+    materialized cache: ``requested_entries == len(cache)``, one
+    ``render_scores`` record per cache key, and one ``render_gates`` record
+    per non-MTP cache key.  A packed-expert append that only pushes keys
+    into ``cache.weights`` leaves all three stale and the exact union
+    refuses at its first subcommand.
+
+    The packed append is replaced as ONE exact scope (the MTP doctrine at
+    ``mtp_production_cache``): records for packed-expert tensor names that
+    are no longer cache keys are dropped, records for the keys present are
+    upserted, and every counter is RECOMPUTED from the cache rather than
+    incremented — the M4 lazy gap-fill calls this path repeatedly with
+    overlapping assignments, and an increment drifts on every rerun.
+    """
+    if cache.metadata is None:
+        cache.metadata = {}
+    metadata = cache.metadata
+    live_keys = set(cache.weights)
+
+    def _is_orphan_packed_key(qname: str, fmt: str) -> bool:
+        return (
+            qname in packed_scope_names
+            and (qname, fmt) not in live_keys
+        )
+
+    score_meta = _packed_expert_metadata_scope(metadata, "render_scores")
+    existing_scores = score_meta.get("records", {})
+    if not isinstance(existing_scores, Mapping):
+        raise RuntimeError(
+            "ProductionWeightCache render_scores.records is not a mapping"
+        )
+    merged_scores: dict[str, dict[str, object]] = {}
+    for raw_key, value in existing_scores.items():
+        if not isinstance(value, Mapping):
+            raise RuntimeError(
+                f"ProductionWeightCache render score is not a mapping: "
+                f"{raw_key!r}"
+            )
+        parts = str(raw_key).rsplit("|", 1)
+        if len(parts) == 2 and _is_orphan_packed_key(parts[0], parts[1]):
+            continue
+        merged_scores[str(raw_key)] = dict(value)
+    for raw_key, value in score_records.items():
+        merged_scores[str(raw_key)] = dict(value)
+    score_meta.setdefault(
+        "schema", "prismaquant.production_render_scores.v1"
+    )
+    score_meta["entries"] = int(len(merged_scores))
+    score_meta["records"] = dict(sorted(merged_scores.items()))
+    metadata["render_scores"] = score_meta
+
+    # render_gates is written by the non-streaming dense fill only. When it is
+    # absent the union skips its coverage check entirely; creating a
+    # packed-only structure here would turn that skip into a guaranteed
+    # refusal, so absence is preserved.
+    if "render_gates" in metadata:
+        gate_meta = _packed_expert_metadata_scope(metadata, "render_gates")
+        existing_gate_records = gate_meta.get("records", [])
+        if not isinstance(existing_gate_records, list):
+            raise RuntimeError(
+                "ProductionWeightCache render_gates.records is not a list"
+            )
+        merged_gates: dict[tuple[str, str], dict[str, object]] = {}
+        for value in existing_gate_records:
+            if not isinstance(value, Mapping):
+                raise RuntimeError(
+                    "ProductionWeightCache render gate record is not a mapping"
+                )
+            pair = (str(value.get("qname", "")), str(value.get("format", "")))
+            if _is_orphan_packed_key(*pair):
+                continue
+            merged_gates[pair] = dict(value)
+        for pair, value in gate_records.items():
+            merged_gates[pair] = dict(value)
+        ordered_gates = [
+            merged_gates[pair] for pair in sorted(merged_gates)
+        ]
+        enabled = gate_meta.get("enabled", True)
+        summary = _summarize_render_gate_records(ordered_gates)
+        summary["enabled"] = enabled
+        metadata["render_gates"] = {**summary, "records": ordered_gates}
+
+    if coverage or "packed_expert_coverage" in metadata:
+        merged_coverage = _packed_expert_metadata_scope(
+            metadata, "packed_expert_coverage"
+        )
+        merged_coverage.update({
+            str(qname): dict(record) for qname, record in coverage.items()
+        })
+        metadata["packed_expert_coverage"] = dict(
+            sorted(merged_coverage.items())
+        )
+
+    metadata["requested_entries"] = int(len(cache.weights))
+    if cache_dir_path is not None:
+        _write_render_score_sidecar(
+            cache_dir_path / "render_scores.json", merged_scores,
+        )
+
+
 def fill_packed_expert_cache_entries(
     cache: ProductionWeightCache,
     model: nn.Module,
@@ -3024,6 +8757,8 @@ def fill_packed_expert_cache_entries(
     gate_calib_ids: torch.Tensor | None = None,
     gate_token_budget: int | None = None,
     module_acts_override: Mapping[str, torch.Tensor] | None = None,
+    col_weights: Mapping[str, torch.Tensor] | None = None,
+    cb_serialization_context=None,
 ) -> dict:
     """Render packed-MoE experts into ``ProductionWeightCache`` entries.
 
@@ -3057,6 +8792,15 @@ def fill_packed_expert_cache_entries(
     cached 3-D dequant and re-packs it — exactly the
     ``_pack_production_cached_2d`` contract, lifted to packed experts.
 
+    Hook invariant (#145, mirrors the dense #130/#135 one): the activation
+    collector hooks EVERY packed-experts module this call can see
+    (``eligible_experts_qnames``), and ``render_assignment``/``force_format`` narrow
+    only which tensors get rendered. The bytes of a packed (tensor, fmt)
+    pair are therefore a function of the visible modules and the
+    calibration, never of which subset a call renders — a ``force_format``
+    frontier build and an assignment-scoped export build that BF16s one
+    layer's experts render identical bytes for the rest.
+
     Args:
       cache: the ``ProductionWeightCache`` produced by
         ``fill_production_weight_cache``.  New 3-D ``(experts_qname.pn, fmt)``
@@ -3071,6 +8815,16 @@ def fill_packed_expert_cache_entries(
       module_token_budget: reservoir size for each experts module's input X.
       max_rows_per_expert: cap on routed rows fed to each expert's GPTQ.
       max_layers: debug/timing cap — render only the first N experts modules.
+      col_weights: optional ``{qname: vector}`` imatrix map (re-vet R3 / CB
+        Milestone C), keyed by the packed tensor name (``…experts.w1`` etc.)
+        with either one shared ``(in_features,)`` vector or a per-expert
+        ``(E, in_features)`` stack — the layout
+        ``moe_imatrix.synthesize_packed_expert_col_weights`` emits. Applied
+        only on the per-expert render path and only for the weighted-render
+        families; NVFP4/FP8 expert bytes are unchanged.
+      cb_serialization_context: explicit artifact serialization identity for
+        CB expert renders. Required for CB and never inferred from process
+        environment defaults.
       module_acts_override: streaming build. ``{experts_qname: X}`` module-level
         input snapshots sourced from the probe's activation cache instead of a
         fresh forward pass. When supplied, no calibration forward runs, in-scope
@@ -3097,7 +8851,19 @@ def fill_packed_expert_cache_entries(
     )
     from prismaquant import format_registry as fr
 
-    device = next(model.parameters()).device
+    # Device probe: the streamed export materializes ONLY the current
+    # decoder layer (+ head) — on a multimodal-forced skeleton
+    # (glm5_next) the module-order-first parameter is a META visual-tower
+    # weight, so `next(model.parameters())` is not a valid device probe
+    # (it silently .to(meta)'d the activation snapshot and crashed the
+    # router forward). Use the first NON-meta parameter instead.
+    device = None
+    for _probe_param in model.parameters():
+        if not _probe_param.is_meta:
+            device = _probe_param.device
+            break
+    if device is None:
+        device = next(model.parameters()).device
     cache_dir_path = Path(cache_dir) if cache_dir is not None else None
     if cache_dir_path is not None:
         cache_dir_path.mkdir(parents=True, exist_ok=True)
@@ -3124,8 +8890,28 @@ def fill_packed_expert_cache_entries(
 
     # 1. Resolve in-scope packed-expert tensors (non-BF16 in the assignment).
     #    Each entry: (experts_qname, mod, parent, pn, full, fmt).
+    #
+    #    #145: ``eligible_experts_qnames`` is the enumeration the activation
+    #    collector hooks, and it is deliberately NOT narrowed by the
+    #    render assignment below. One shared generator feeds every hooked
+    #    module's priority reservoir, so the rows a module keeps are a
+    #    function of how many rows every EARLIER hook consumed. Narrowing
+    #    the hook set therefore changes the rows, the per-expert Hessians
+    #    and the rendered bytes. The invariant this buys -- the same one
+    #    #130/#135 bought the dense path: the bytes of a (tensor, fmt) pair
+    #    depend on the visible modules and the calibration, never on which
+    #    subset of them this call happens to render. That is what makes a
+    #    force_format frontier build and an assignment-scoped export build
+    #    reproduce each other's bytes.
     in_scope: list[tuple[str, nn.Module, nn.Module, str, str, str]] = []
     experts_qnames: set[str] = set()
+    eligible_experts_qnames: set[str] = set()
+    # Every packed-expert tensor name this call can SEE, BF16 and
+    # out-of-assignment included. This is the exact scope inside which stale
+    # render-score / render-gate records may be pruned at the end of the call;
+    # dense and MTP records, and other layers' packed records on the streaming
+    # path, are never in it.
+    all_packed_fullnames: set[str] = set()
     modules_seen = 0
     for experts_qname, mod in model.named_modules():
         if not _is_packed_experts_module(mod, profile):
@@ -3141,9 +8927,14 @@ def fill_packed_expert_cache_entries(
         if max_layers is not None and modules_seen >= max_layers:
             break
         modules_seen += 1
+        # Hooked whether or not this module renders below: the hook set is
+        # the visible enumeration, and the render assignment narrows only
+        # the render (#145).
+        eligible_experts_qnames.add(experts_qname)
         parent = _packed_experts_parent_module(model, experts_qname)
         for pn in _packed_experts_param_names(mod, profile):
             full = f"{experts_qname}.{pn}" if experts_qname else pn
+            all_packed_fullnames.add(full)
             if force_format is not None:
                 # Force-format mode: render every packed expert at one format,
                 # ignoring render_assignment. Used by the format-menu frontier
@@ -3171,12 +8962,277 @@ def fill_packed_expert_cache_entries(
             print("[prod-cache/experts] no non-BF16 packed experts in scope",
                   flush=True)
         return coverage
+    if cache_dir_path is not None:
+        from prismaquant.perturbed_x_cache import calibration_data_hash
+
+        if module_acts_override is None:
+            _check_and_record_append_identity(
+                cache_dir_path,
+                PACKED_APPEND_SIDECAR_KEY,
+                build_packed_expert_append_identity(
+                    module_token_budget=int(module_token_budget),
+                    max_rows_per_expert=int(max_rows_per_expert),
+                    eval_rows_per_expert=int(eval_rows_per_expert),
+                    render_mode=str(render_mode),
+                    gate_calibration_hash=(
+                        calibration_data_hash(gate_calib_ids)
+                        if gate_calib_ids is not None
+                        else None
+                    ),
+                    gate_token_budget=(
+                        int(gate_token_budget or module_token_budget)
+                        if gate_calib_ids is not None
+                        else None
+                    ),
+                    hooked_qnames=eligible_experts_qnames,
+                    max_layers=max_layers,
+                    pair_fit_calibration_hashes={
+                        f"{full}|{fmt}": calibration_data_hash(calib_ids)
+                        for (_q, _m, _p, _pn, full, fmt) in in_scope
+                    },
+                ),
+                progress=progress,
+            )
+        else:
+            # #172: streaming builds render one materialized layer per call
+            # from supplied snapshots — each call sees a different single
+            # module, so no single section can describe the directory. Record
+            # a per-layer section list keyed by the module this call saw
+            # (the union of what each streaming call rendered) BEFORE any
+            # render, so a hand-mixed streaming configuration refuses instead
+            # of merging silently. The render narrowing (which packed tensors
+            # this layer renders) is deliberately NOT bound, exactly as on
+            # the resident path.
+            snapshot_layers = {
+                str(experts_qname): calibration_data_hash(
+                    module_acts_override[experts_qname]
+                )
+                for experts_qname in sorted(experts_qnames)
+                if experts_qname in module_acts_override
+            }
+            if snapshot_layers:
+                _check_and_record_append_identity(
+                    cache_dir_path,
+                    PACKED_STREAMING_APPEND_SIDECAR_KEY,
+                    build_packed_streaming_append_identity(
+                        module_token_budget=int(module_token_budget),
+                        max_rows_per_expert=int(max_rows_per_expert),
+                        eval_rows_per_expert=int(eval_rows_per_expert),
+                        render_mode=str(render_mode),
+                        max_layers=max_layers,
+                        layers=snapshot_layers,
+                    ),
+                    progress=progress,
+                )
+    if module_acts_override is None:
+        # Resident builds hook the visible enumeration through the shared
+        # collector, so the stamp names a real rendering. Streaming builds
+        # render one materialized layer per call from supplied snapshots --
+        # no collector runs, nothing is hooked, and each call sees a
+        # different single module -- so there is no enumeration to stamp.
+        # The per-layer sidecar union (#172) is what guards that path, not
+        # this stamp.
+        _stamp_packed_hook_scope(cache, hook_qnames=eligible_experts_qnames)
+
+    # Render-identity bookkeeping for this append. Every packed key that ends
+    # up in ``cache.weights`` owes a render-score record and a render-gate
+    # record, and the counters are recomputed from the cache at the end of the
+    # call (``_finalize_packed_expert_cache_metadata``). Records already on the
+    # cache are honored as-is so a repeat call with an overlapping assignment
+    # neither re-renders nor re-scores.
+    existing_score_records = _packed_expert_metadata_scope(
+        cache.metadata or {}, "render_scores",
+    ).get("records", {})
+    if not isinstance(existing_score_records, Mapping):
+        raise RuntimeError(
+            "ProductionWeightCache render_scores.records is not a mapping"
+        )
+    packed_score_records: dict[str, dict[str, object]] = {}
+    packed_gate_records: dict[tuple[str, str], dict[str, object]] = {}
+    existing_coverage_records = _packed_expert_metadata_scope(
+        cache.metadata or {}, "packed_expert_coverage",
+    )
+
+    def _has_render_score(qname: str, fmt: str) -> bool:
+        score_key = _render_score_record_key(qname, fmt)
+        return (
+            score_key in packed_score_records
+            or score_key in existing_score_records
+        )
+
+    packed_formats_by_qname = {
+        full: (fmt,)
+        for _experts_qname, _mod, _parent, _pn, full, fmt in in_scope
+    }
+    resolved_packed_levers = _resolve_production_render_levers(levers)
+    packed_score_policy = _render_levers_input_global_scale_policy(
+        resolved_packed_levers
+    )
+    packed_mechanism_plan = _resolve_render_mechanism_plan(
+        resolved_packed_levers
+    )
+    _extend_production_cache_cb_render_identity(
+        cache,
+        packed_formats_by_qname,
+        cb_serialization_context=cb_serialization_context,
+        col_weights=col_weights,
+        render_levers=resolved_packed_levers,
+        render_mechanism_plan=packed_mechanism_plan,
+    )
+    packed_cb_source_weights = {
+        full: getattr(mod, pn).detach()
+        for _experts_qname, mod, _parent, pn, full, fmt in in_scope
+        if _is_cb_format_name(fmt)
+    }
+    if packed_cb_source_weights:
+        bind_production_cache_cb_source_weights(
+            cache,
+            packed_cb_source_weights,
+            require_complete=False,
+            where="ProductionWeightCache packed source binding",
+        )
+
+    packed_cb_pair_identities: dict[
+        tuple[str, str], dict[str, object]
+    ] = {}
+    admitted_packed_cb_pairs: dict[
+        tuple[str, str], dict[str, object]
+    ] = {}
+    if cache_dir_path is not None and packed_cb_source_weights:
+        from prismaquant.perturbed_x_cache import calibration_data_hash
+
+        fit_calibration_inputs: object
+        if module_acts_override is not None:
+            # calibration_data_hash handles a direct tensor mapping by content;
+            # wrapping it in another mapping would hash dict repr/address data.
+            fit_calibration_inputs = module_acts_override
+            activation_source = "streaming_module_activations"
+        else:
+            fit_calibration_inputs = calib_ids
+            activation_source = "resident_token_ids"
+        packed_calibration_hash = calibration_data_hash(
+            fit_calibration_inputs
+        )
+        packed_gate_calibration_hash = (
+            calibration_data_hash(gate_calib_ids)
+            if gate_calib_ids is not None
+            else None
+        )
+        packed_render_input_contract = {
+            "path": "packed_expert",
+            "activation_source": activation_source,
+            "fit_calibration_hash": packed_calibration_hash,
+            "gate_calibration_hash": packed_gate_calibration_hash,
+            "module_token_budget": int(module_token_budget),
+            "max_rows_per_expert": int(max_rows_per_expert),
+            "eval_rows_per_expert": int(eval_rows_per_expert),
+            "gate_token_budget": (
+                int(gate_token_budget or module_token_budget)
+                if gate_calib_ids is not None
+                else None
+            ),
+            "gate_policy": (
+                "cross-domain"
+                if gate_calib_ids is not None
+                else "in-domain-holdout"
+            ),
+            "render_mode": str(render_mode),
+            "max_layers": (
+                int(max_layers) if max_layers is not None else None
+            ),
+        }
+        packed_git_commit = _production_cache_git_commit()
+        packed_producer_source_sha256 = _production_cache_source_sha256()
+        packed_identity = cache.metadata[CB_RENDER_IDENTITY_METADATA_KEY]
+        packed_pair_context = validate_cb_render_identity_metadata(
+            packed_identity,
+            expected_context=cb_serialization_context,
+            require_source_complete=False,
+            where="ProductionWeightCache packed pair resume",
+        )
+        for _experts_qname, mod, _parent, pn, full, fmt in in_scope:
+            if not _is_cb_format_name(fmt):
+                continue
+            key = (full, fmt)
+            pair_identity = build_cb_cache_pair_identity(
+                packed_identity,
+                qname=full,
+                fmt=fmt,
+                calibration_hash=packed_calibration_hash,
+                git_commit=packed_git_commit,
+                source_weight_dtype=getattr(mod, pn).dtype,
+                cb_serialization_context=cb_serialization_context,
+                render_input_contract=packed_render_input_contract,
+                validated_context=packed_pair_context,
+                producer_source_sha256=packed_producer_source_sha256,
+            )
+            packed_cb_pair_identities[key] = pair_identity
+            admitted = _validate_cb_cache_pair_resume(
+                cache_dir_path=cache_dir_path,
+                qname=full,
+                fmt=fmt,
+                expected_identity=pair_identity,
+                legacy_kind="production packed-",
+                require_packed_state=True,
+            )
+            if admitted is not None:
+                existing_value = cache.weights.get(key)
+                if (
+                    existing_value is not None
+                    and not isinstance(existing_value, torch.Tensor)
+                ):
+                    admitted_path = (
+                        cache_dir_path / _cache_weight_filename(full, fmt)
+                    ).resolve()
+                    existing_path = Path(
+                        cache._path_for_value(existing_value)
+                    ).resolve()
+                    if existing_path != admitted_path:
+                        raise RuntimeError(
+                            "production packed-CB cache resume refused for "
+                            f"{full}@{fmt}: identity field 'shard_path' "
+                            f"differs: stored={existing_path!s} "
+                            f"expected={admitted_path!s}; refusing reuse or "
+                            "re-render"
+                        )
+                # The verified flat shard is the sole admitted payload. Do not
+                # retain an in-memory or external path under the same pair key.
+                cache.weights[key] = _cache_weight_filename(full, fmt)
+                packed_state = admitted["packed_state"]
+                if cache.activation_max_abs is None:
+                    cache.activation_max_abs = {}
+                    cache.activation_scales = cache.activation_max_abs
+                cache.activation_max_abs[full] = float(
+                    packed_state["activation_max_abs"]
+                )
+                coverage[full] = dict(packed_state["coverage"])
+                admitted_packed_cb_pairs[key] = admitted
+                # An identity-admitted pair carries the render score its own
+                # render measured. Reuse it; a legacy sidecar without one
+                # falls through to the resume-score path below.
+                admitted_score = admitted.get("render_score")
+                if isinstance(admitted_score, Mapping):
+                    packed_score_records[
+                        _render_score_record_key(full, fmt)
+                    ] = dict(admitted_score)
+
+    # Retained packed costs are reused by key exactly as the dense ones are,
+    # so they answer the same question before this append prices anything
+    # else (#227).
+    for retained, retained_where in (
+        (existing_score_records, "packed expert cache resume"),
+        (packed_score_records, "packed expert CB pair resume"),
+    ):
+        _check_resumed_render_score_policies(
+            retained, policy=packed_score_policy, where=retained_where,
+        )
 
     if progress:
         print(
             f"[prod-cache/experts] {len(in_scope)} packed-expert tensors across "
-            f"{len(experts_qnames)} modules; capturing module activations "
-            f"(budget={module_token_budget} tokens/module)",
+            f"{len(experts_qnames)} modules "
+            f"({len(eligible_experts_qnames)} hooked); capturing module "
+            f"activations (budget={module_token_budget} tokens/module)",
             flush=True,
         )
 
@@ -3194,8 +9250,16 @@ def fill_packed_expert_cache_entries(
     )
     if expert_sidecar_path is not None and expert_sidecar_path.is_file():
         try:
-            cache.activation_max_abs.update(_json.loads(
-                expert_sidecar_path.read_text()))
+            loaded_scales = _json.loads(expert_sidecar_path.read_text())
+            if isinstance(loaded_scales, Mapping):
+                admitted_qnames = {
+                    qname for qname, _fmt in admitted_packed_cb_pairs
+                }
+                cache.activation_max_abs.update({
+                    str(qname): float(value)
+                    for qname, value in loaded_scales.items()
+                    if str(qname) not in admitted_qnames
+                })
         except Exception:
             pass
 
@@ -3224,12 +9288,21 @@ def fill_packed_expert_cache_entries(
     # missing its calibrated scale — a fully-resumed build with a complete
     # sidecar skips the forward entirely.
     def _needs_work(full: str, fmt: str) -> bool:
+        # A missing render score is work too: scoring needs this module's
+        # routed activations, so the capture below must run for it exactly as
+        # the dense path's ``missing_activation_score`` makes it run there.
         if (full, fmt) in cache.weights:
-            return cache.activation_max_abs.get(full) is None
+            return (
+                cache.activation_max_abs.get(full) is None
+                or not _has_render_score(full, fmt)
+            )
         if cache_dir_path is not None:
             shard = cache_dir_path / _cache_weight_filename(full, fmt)
             if shard.is_file():
-                return cache.activation_max_abs.get(full) is None
+                return (
+                    cache.activation_max_abs.get(full) is None
+                    or not _has_render_score(full, fmt)
+                )
         return True
 
     work_remaining = any(_needs_work(full, fmt) for full, fmt in in_scope_keys)
@@ -3262,9 +9335,17 @@ def fill_packed_expert_cache_entries(
         # in the CUDA pool fragments/OOMs the capture (observed). CPU storage
         # keeps them out of the CUDA segment pool; derive moves one module's X
         # back to GPU transiently. Pinned for faster H2D at render.
+        #
+        # Hook the WHOLE eligible enumeration -- not the render-narrowed
+        # ``experts_qnames``. Hooking is cheap (one CPU ``torch.rand`` per
+        # call), and hooking the full set is what keeps the shared priority
+        # stream identical across a force_format frontier build and an
+        # assignment-scoped export build (#145). Only STORE full activations
+        # for modules we still need to render.
         collector = _PackedExpertActivationCollector(
             model,
-            experts_qnames,
+            eligible_experts_qnames,
+            store_qnames=experts_qnames,
             module_token_budget=module_token_budget,
             store_device=torch.device("cpu"),
             store_dtype=torch.float32,
@@ -3302,7 +9383,8 @@ def fill_packed_expert_cache_entries(
     if work_remaining and gate_calib_ids is not None:
         gate_collector = _PackedExpertActivationCollector(
             model,
-            experts_qnames,
+            eligible_experts_qnames,
+            store_qnames=experts_qnames,
             module_token_budget=int(gate_token_budget or module_token_budget),
             store_device=torch.device("cpu"),
             store_dtype=torch.float32,
@@ -3350,11 +9432,39 @@ def fill_packed_expert_cache_entries(
         shard_exists = (key in weights) or (
             fname is not None and (cache_dir_path / fname).is_file()
         )
+        if (
+            shard_exists
+            and cache_dir_path is not None
+            and _is_cb_format_name(fmt)
+            and key not in admitted_packed_cb_pairs
+            and not isinstance(weights.get(key), torch.Tensor)
+        ):
+            raise RuntimeError(
+                "production packed-CB cache resume internal gate failure for "
+                f"{full}@{fmt}: shard was not identity-admitted; refusing "
+                "reuse or re-render"
+            )
         need_scale = cache.activation_max_abs.get(full) is None
-        # Fully done (shard + calibrated scale): just register the path.
-        if shard_exists and not need_scale:
+        score_key = _render_score_record_key(full, fmt)
+        gate_key = (full, str(fmt).upper())
+        need_score = not _has_render_score(full, fmt)
+        # Fully done (shard + calibrated scale + render score): register the
+        # path and re-stamp this entry's gate record, which the union counts
+        # per cache key on every rerun.
+        if shard_exists and not need_scale and not need_score:
             if key not in weights and fname is not None:
                 weights[key] = fname
+            packed_gate_records[gate_key] = _packed_expert_render_gate_record(
+                qname=full,
+                fmt=fmt,
+                render_format=fmt,
+                render_mode=render_mode,
+                batched=False,
+                resumed=True,
+                coverage_record=(
+                    coverage.get(full) or existing_coverage_records.get(full)
+                ),
+            )
             continue
 
         X = module_acts.get(experts_qname)
@@ -3423,11 +9533,49 @@ def fill_packed_expert_cache_entries(
             cache.activation_max_abs[full] = param_max_abs
             _persist_expert_sidecar()
 
-        # Resume with a missing scale: shard already on disk, we only needed to
-        # recompute + persist the calibrated scale. Don't re-render.
+        # Resume with a missing scale and/or a missing render score: the shard
+        # is already on disk, so score the bytes it holds. Never re-render.
         if shard_exists:
             if key not in weights and fname is not None:
                 weights[key] = fname
+            if need_score:
+                stored_value = weights.get(key)
+                resumed_render = (
+                    stored_value
+                    if isinstance(stored_value, torch.Tensor)
+                    else torch.load(
+                        cache._path_for_value(stored_value),
+                        map_location="cpu",
+                        weights_only=True,
+                    )
+                )
+                packed_score_records[score_key] = (
+                    _packed_expert_render_score_record(
+                        qname=full,
+                        fmt=fmt,
+                        render_format=fmt,
+                        reference=packed_param,
+                        rendered=resumed_render,
+                        per_expert_acts=per_expert_acts,
+                        activation_max_abs=cache.activation_max_abs.get(full),
+                        eval_rows=eval_rows_per_expert,
+                        device=device,
+                        score_rows_source="fit_corpus_tail",
+                        input_global_scale_policy=packed_score_policy,
+                    )
+                )
+                del resumed_render
+            packed_gate_records[gate_key] = _packed_expert_render_gate_record(
+                qname=full,
+                fmt=fmt,
+                render_format=fmt,
+                render_mode=render_mode,
+                batched=False,
+                resumed=True,
+                coverage_record=(
+                    coverage.get(full) or existing_coverage_records.get(full)
+                ),
+            )
             continue
 
         # Per-expert global: for split gate/up the joint is max over slices so
@@ -3454,6 +9602,12 @@ def fill_packed_expert_cache_entries(
         heldout_reverts = 0
         cross_gated = 0
         use_batched = (render_mode == "batched" and fmt == "NVFP4")
+        timed_cb_pair = (
+            cache_dir_path is not None and _is_cb_format_name(fmt)
+        )
+        if timed_cb_pair and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        encode_started = time.perf_counter()
         if use_batched:
             from prismaquant.export_batched_gptq import (
                 gptq_obs_rounding_nvfp4_batched,
@@ -3575,9 +9729,17 @@ def fill_packed_expert_cache_entries(
                     rtn_fallbacks += 1
                     if ev is not None:
                         heldout_reverts += 1
+            # Free the render-phase GPU transients before the CPU store copy
+            # below: `src` alone is 18G fp32 for a GLM-class gate_up stack and
+            # would otherwise survive into the NEXT param's render (peak
+            # doubling on the 118G unified pool).
+            if E > 0:
+                del w_rtn
+            del src, overrides, render_acts, eval_acts, eval_gw
         else:
             # Per-expert full-stack render (fmt != NVFP4, or the A/B mode).
             rendered = torch.empty_like(packed_param)
+            stack_cw = None if col_weights is None else col_weights.get(full)
             for e in range(E):
                 w_e = packed_param[e]  # [out, in]
                 acts_e = (
@@ -3592,21 +9754,21 @@ def fill_packed_expert_cache_entries(
                     ),
                     levers=levers,
                     joint_global_real=per_expert_global[e],
+                    col_weights=_expert_col_weights(stack_cw, e, int(E)),
+                    cb_serialization_context=cb_serialization_context,
                 )
                 rendered[e] = w_dq.to(rendered.dtype)
                 del w_dq
             rendered = rendered.to(getattr(mod, pn).dtype)
 
-        _store_rendered_weight_entry(
-            weights=weights,
-            cache_dir_path=cache_dir_path,
-            qname=full,
-            fmt=fmt,
-            tensor=rendered,
-            weight_dtype=getattr(mod, pn).dtype,
+        if timed_cb_pair and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        encode_seconds = (
+            time.perf_counter() - encode_started if timed_cb_pair else 0.0
         )
+
         pos_rows = sorted(r for r in row_counts if r > 0)
-        coverage[full] = {
+        coverage_record = {
             "fmt": fmt,
             "n_experts": int(E),
             "min_rows": int(pos_rows[0]) if pos_rows else 0,
@@ -3624,6 +9786,71 @@ def fill_packed_expert_cache_entries(
             "rendered": True,
             "had_activations": True,
         }
+        # Score every packed expert honestly, on the tensors already
+        # materialized here — the source param and the render that is about to
+        # be stored. No re-render, and the record covers the whole stack.
+        packed_score_records[score_key] = _packed_expert_render_score_record(
+            qname=full,
+            fmt=fmt,
+            render_format=fmt,
+            reference=packed_param,
+            rendered=rendered,
+            per_expert_acts=per_expert_acts,
+            activation_max_abs=cache.activation_max_abs.get(full),
+            eval_rows=eval_rows_per_expert,
+            device=device,
+            score_rows_source="fit_corpus_tail",
+            input_global_scale_policy=packed_score_policy,
+        )
+        packed_gate_records[gate_key] = _packed_expert_render_gate_record(
+            qname=full,
+            fmt=fmt,
+            render_format=fmt,
+            render_mode=render_mode,
+            batched=bool(use_batched),
+            resumed=False,
+            coverage_record=coverage_record,
+        )
+        if timed_cb_pair:
+            pair_identity = packed_cb_pair_identities.get(key)
+            if pair_identity is None:
+                raise RuntimeError(
+                    f"production packed-CB cache pair identity missing before "
+                    f"publishing {full}@{fmt}"
+                )
+            activation_scale = cache.activation_max_abs.get(full)
+            if (
+                not isinstance(activation_scale, (int, float))
+                or float(activation_scale) <= 0.0
+            ):
+                raise RuntimeError(
+                    f"production packed-CB cache has no positive calibrated "
+                    f"activation_max_abs before publishing {full}@{fmt}"
+                )
+            _write_cb_cache_pair_sidecar(
+                cache_dir_path=cache_dir_path,
+                qname=full,
+                fmt=fmt,
+                identity=pair_identity,
+                tensor=rendered,
+                encode_seconds=encode_seconds,
+                render_score=packed_score_records[score_key],
+                packed_state={
+                    "activation_max_abs": float(activation_scale),
+                    "coverage": coverage_record,
+                },
+            )
+
+        _store_rendered_weight_entry(
+            weights=weights,
+            cache_dir_path=cache_dir_path,
+            qname=full,
+            fmt=fmt,
+            tensor=rendered,
+            weight_dtype=getattr(mod, pn).dtype,
+            durable=_is_cb_format_name(fmt),
+        )
+        coverage[full] = coverage_record
         del rendered, packed_param, proj_split
         # Free this module's GPU-resident derived activations + captured X once
         # its last param is rendered (bounds peak to ~one module's working set).
@@ -3646,6 +9873,95 @@ def fill_packed_expert_cache_entries(
                 f"({_time.monotonic() - t0:.1f}s elapsed)",
                 flush=True,
             )
+
+    if packed_cb_pair_identities and cache_dir_path is not None:
+        if cache.metadata is None:
+            cache.metadata = {}
+        existing_artifact_set = cache.metadata.get("cb_cache_pair_artifacts")
+        existing_records = (
+            existing_artifact_set.get("records")
+            if isinstance(existing_artifact_set, Mapping)
+            else None
+        )
+        pair_artifact_records: dict[str, dict[str, object]] = {
+            str(key): copy.deepcopy(value)
+            for key, value in (existing_records or {}).items()
+            if isinstance(value, Mapping)
+        }
+        for (qname, fmt), pair_identity in sorted(
+            packed_cb_pair_identities.items()
+        ):
+            sidecar_path = (
+                cache_dir_path / _cache_pair_identity_filename(qname, fmt)
+            )
+            shard_path = cache_dir_path / _cache_weight_filename(qname, fmt)
+            if not sidecar_path.is_file() or not shard_path.is_file():
+                continue
+            sidecar = _read_cb_cache_pair_sidecar(
+                sidecar_path,
+                qname=qname,
+                fmt=fmt,
+            )
+            pair_artifact_records[f"{qname}|{fmt}"] = {
+                "identity": pair_identity,
+                "tensor": sidecar.get("tensor"),
+                "render_score": sidecar.get("render_score"),
+                "render_score_sha256": sidecar.get("render_score_sha256"),
+                "packed_state": sidecar.get("packed_state"),
+                "packed_state_sha256": sidecar.get("packed_state_sha256"),
+            }
+        pair_identities = {
+            key: record["identity"]
+            for key, record in sorted(pair_artifact_records.items())
+            if isinstance(record.get("identity"), Mapping)
+        }
+        cache.metadata["cb_cache_pair_artifacts"] = {
+            "schema": (
+                "prismaquant.production_weight_cache."
+                "cb_pair_artifact_set.v1"
+            ),
+            "records": pair_artifact_records,
+        }
+        cache.metadata["cb_cache_pair_identity"] = {
+            "schema": "prismaquant.production_weight_cache.cb_pair_set.v1",
+            "pair_schema": CB_CACHE_PAIR_IDENTITY_SCHEMA,
+            "entries": len(pair_identities),
+            "identity_sha256": _canonical_json_sha256(
+                pair_identities,
+                where="CB cache pair identity set",
+            ),
+            "published_entries": len(pair_artifact_records),
+            "artifact_sha256": _canonical_json_sha256(
+                pair_artifact_records,
+                where="CB cache pair artifact set",
+            ),
+            "codebook_bundle_sha256": sorted({
+                str(pair["codebook_bundle_sha256"])
+                for pair in pair_identities.values()
+                if pair.get("codebook_bundle_sha256") is not None
+            }),
+            "calibration_hashes": sorted({
+                str(pair["calibration_hash"])
+                for pair in pair_identities.values()
+            }),
+            "git_commits": sorted({
+                str(pair["git_commit"])
+                for pair in pair_identities.values()
+            }),
+            "producer_source_sha256": sorted({
+                str(pair["producer_source_sha256"])
+                for pair in pair_identities.values()
+            }),
+        }
+
+    _finalize_packed_expert_cache_metadata(
+        cache,
+        packed_scope_names=all_packed_fullnames,
+        score_records=packed_score_records,
+        gate_records=packed_gate_records,
+        coverage=coverage,
+        cache_dir_path=cache_dir_path,
+    )
 
     if progress:
         print(

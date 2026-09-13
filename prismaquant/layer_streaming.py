@@ -19,11 +19,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+from .autoscale import declared_expert_dtype_covers, declared_fp4_expert_dtype
+
 try:
     from accelerate.utils.modeling import set_module_tensor_to_device
 except ModuleNotFoundError:
@@ -80,6 +86,20 @@ except ModuleNotFoundError:
 from safetensors import safe_open
 
 
+def _source_safe_open(path, *, source_authentication=None, **kwargs):
+    """Use the existing reader, optionally through its complete-capture owner."""
+    if source_authentication is None:
+        return safe_open(path, **kwargs)
+    return source_authentication.safe_open(safe_open, path, **kwargs)
+
+
+def _source_json(path, source_authentication=None):
+    if source_authentication is not None:
+        return source_authentication.read_json(path)
+    with open(path) as handle:
+        return json.load(handle)
+
+
 # ---------------------------------------------------------------------------
 # v21 #5: opt-in direct-to-CUDA safetensors load. Default path opens the
 # safetensors file with framework="pt" (CPU mmap) and explicitly moves
@@ -120,7 +140,7 @@ def _safe_open_kwargs(device: torch.device) -> dict:
 
 
 def _build_weight_map(model_path: str, *,
-                      multimodal: bool = False
+                      multimodal: bool = False, source_authentication=None,
                       ) -> tuple[dict[str, str], dict[str, str]]:
     """Return ({model_key: shard_path}, {model_key: checkpoint_key}).
 
@@ -151,13 +171,12 @@ def _build_weight_map(model_path: str, *,
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_file):
-        with open(index_file) as f:
-            raw = json.load(f)["weight_map"]
+        raw = _source_json(index_file, source_authentication)["weight_map"]
     else:
         single = os.path.join(model_path, "model.safetensors")
         if not os.path.exists(single):
             raise FileNotFoundError(f"no safetensors under {model_path}")
-        with safe_open(single, framework="pt") as f:
+        with _source_safe_open(single, framework="pt", source_authentication=source_authentication) as f:
             raw = {k: single for k in f.keys()}
     model_to_shard: dict[str, str] = {}
     model_to_ckpt: dict[str, str] = {}
@@ -178,11 +197,21 @@ class Fp8ScaleInvMap(dict):
     so every existing caller is unchanged; the block size travels with
     the map so the dequant call sites never have to re-derive it — or
     worse, assume 128x128 for a checkpoint quantized at a different
-    granularity.  ``block`` is None only for empty maps."""
+    granularity.  ``block`` is None only for empty maps.
 
-    def __init__(self, data=None, block: tuple[int, int] | None = None):
+    ``mxfp4_names`` is the set of mapped weights the checkpoint config
+    *explicitly declares* as packed-FP4 experts — routed and shared alike
+    (DSv4-Flash `expert_dtype: "fp4"`, see `declared_fp4_expert_dtype` and
+    `declared_expert_dtype_covers`). Those decode on the MXFP4 nibble path
+    (step 3b of `_apply_fp8_dequant_inplace`) instead of the block-FP8
+    broadcast. Empty unless declared — never inferred from tensor
+    shapes."""
+
+    def __init__(self, data=None, block: tuple[int, int] | None = None,
+                 mxfp4_names: frozenset[str] = frozenset()):
         super().__init__(data or {})
         self.block = block
+        self.mxfp4_names = mxfp4_names
 
 
 def _declared_weight_block_size(model_path: str) -> tuple[int, int]:
@@ -251,7 +280,7 @@ def _fp8_dequant_block(
 
 
 def _build_fp8_scale_inv_map(model_path: str, *,
-                             multimodal: bool = False
+                             multimodal: bool = False, source_authentication=None,
                              ) -> "Fp8ScaleInvMap":
     """Return `{model_weight_key: (scale_shard_path, scale_ckpt_key)}`
     for every native-FP8 weight tensor (fp8_e4m3fn + paired
@@ -277,22 +306,27 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     # `.weight_scale_inv`-suffix scan.
     from .model_profiles import detect_profile
     profile = detect_profile(model_path)
-    explicit = profile.fp8_scale_pairs(model_path)
+    fp8_scale_pairs = getattr(profile, "fp8_scale_pairs", None)
+    explicit = (
+        fp8_scale_pairs(model_path)
+        if callable(fp8_scale_pairs)
+        else None
+    )
     if explicit is not None:
         return Fp8ScaleInvMap(
             explicit,
             _declared_weight_block_size(model_path) if explicit else None,
+            mxfp4_names=_declared_mxfp4_names(model_path, explicit),
         )
 
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.exists(index_file):
-        with open(index_file) as f:
-            raw = json.load(f)["weight_map"]
+        raw = _source_json(index_file, source_authentication)["weight_map"]
     else:
         single = os.path.join(model_path, "model.safetensors")
         if not os.path.exists(single):
             return Fp8ScaleInvMap()
-        with safe_open(single, framework="pt") as f:
+        with _source_safe_open(single, framework="pt", source_authentication=source_authentication) as f:
             raw = {k: single for k in f.keys()}
 
     out: dict[str, tuple[str, str]] = {}
@@ -313,7 +347,73 @@ def _build_fp8_scale_inv_map(model_path: str, *,
     return Fp8ScaleInvMap(
         out,
         _declared_weight_block_size(model_path) if out else None,
+        mxfp4_names=_declared_mxfp4_names(model_path, out),
     )
+
+
+def _declared_mxfp4_names(model_path: str, mapping: dict) -> frozenset[str]:
+    """Mapped weight names the checkpoint explicitly declares MXFP4.
+
+    Non-empty only when config.json declares packed-FP4 experts
+    (`declared_fp4_expert_dtype`); membership is every expert weight that
+    declaration covers — routed (`...experts.<id>....`) *and* shared
+    (`...shared_experts....`), see `declared_expert_dtype_covers`. Shared
+    experts carry no per-expert index, so the routed-only pattern used to
+    exclude them structurally and a declared-MXFP4 shared expert took the
+    block-FP8 path and died on its `_check_fp8_scale_grid` assertion
+    (issue #26).
+
+    The trigger is still only the declaration; the packed layout is
+    asserted per tensor by `_check_mxfp4_packed_grid` at decode time, so a
+    checkpoint whose shared experts are NOT packed-FP4 fails loudly with
+    the exact mismatch rather than being silently reinterpreted.
+    Non-expert tensors stay on the block-FP8 dequant path."""
+    if not mapping or not declared_fp4_expert_dtype(model_path):
+        return frozenset()
+    _check_declared_mxfp4_scale_fmt(model_path)
+    return frozenset(n for n in mapping if declared_expert_dtype_covers(n))
+
+
+# Checkpoint `quantization_config.scale_fmt` spellings that mean an E8M0
+# power-of-two exponent plane — the only scale encoding step 3b decodes.
+_E8M0_SCALE_FMTS = frozenset({"ue8m0", "e8m0"})
+
+
+def _check_declared_mxfp4_scale_fmt(model_path: str) -> None:
+    """Validate a declared-MXFP4 checkpoint's declared scale format.
+
+    Step 3b reads the scale sibling as a raw E8M0 exponent plane
+    (`exp2(byte - 127)`), so a checkpoint that declares a *different*
+    scale encoding must fail loudly instead of having its bytes silently
+    reinterpreted.
+
+    A missing declaration is deliberately NOT fatal: real DSv4-Flash
+    checkpoints ship `expert_dtype` with no per-expert scale-format field,
+    and the per-tensor dtype allow-list in `_check_mxfp4_packed_grid`
+    still guards the byte-plane reinterpretation."""
+    try:
+        with open(os.path.join(model_path, "config.json")) as f:
+            cfg = json.load(f)
+    except Exception:
+        return
+    if not isinstance(cfg, dict):
+        return
+    qc = cfg.get("quantization_config") or {}
+    fmt = qc.get("scale_fmt") or (
+        (cfg.get("text_config") or {}).get("quantization_config") or {}
+    ).get("scale_fmt")
+    if not fmt:
+        return
+    normalized = str(fmt).lower().replace("_", "").replace("-", "")
+    if normalized not in _E8M0_SCALE_FMTS:
+        raise ValueError(
+            f"checkpoint at {model_path!r} declares packed-FP4 routed "
+            f"experts (config expert_dtype) with "
+            f"quantization_config.scale_fmt={fmt!r}; the MXFP4 decode reads "
+            f"the scale sibling as an E8M0 exponent plane "
+            f"(exp2(byte - 127)) and would silently reinterpret any other "
+            f"encoding. Supported: {sorted(_E8M0_SCALE_FMTS)}."
+        )
 
 
 def _check_fp8_scale_grid(
@@ -339,6 +439,57 @@ def _check_fp8_scale_grid(
             f"numel-compatible and would reshape silently, mis-scaling "
             f"every block — check the checkpoint's scale layout and its "
             f"declared quantization_config.weight_block_size."
+        )
+
+
+# 1-byte scale planes step 3b may reinterpret as E8M0 exponents
+# (`view(torch.uint8)` + `exp2(byte - 127)`). An allow-list, not a width
+# check: float8_e4m3fn is also 1 byte, so a width check would let an e4m3
+# scale plane through and silently decode every block at a wrong
+# power-of-two scale.
+_E8M0_SCALE_DTYPES = frozenset(
+    dt for dt in (
+        torch.uint8, torch.int8, getattr(torch, "float8_e8m0fnu", None),
+    ) if dt is not None
+)
+_E8M0_SCALE_DTYPE_NAMES = "/".join(
+    sorted(str(dt).split(".")[-1] for dt in _E8M0_SCALE_DTYPES))
+
+
+def _check_mxfp4_packed_grid(
+    name: str,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> None:
+    """Hard shape/dtype assertion for a *declared* MXFP4 packed tensor.
+
+    The checkpoint config declared this tensor packed-FP4 (see
+    `_declared_mxfp4_names`), so it must be a 2-D int8/uint8 nibble-pack
+    with an E8M0 scale *plane* (`_E8M0_SCALE_DTYPES`) of one scale per 32
+    logical (= 16 packed) elements per row. Anything else means the
+    declaration and the tensor disagree — decode nothing, raise loudly
+    (the shape-heuristic alternative would silently decode mismatched
+    tensors as garbage nibbles, and a same-width non-E8M0 scale dtype
+    would silently decode at wrong power-of-two scales)."""
+    ok = (
+        weight.dim() == 2
+        and weight.dtype in (torch.int8, torch.uint8)
+        and scale.dim() == 2
+        and scale.dtype in _E8M0_SCALE_DTYPES
+        and scale.shape[0] == weight.shape[0]
+        and scale.shape[1] * 16 == weight.shape[1]
+    )
+    if not ok:
+        raise ValueError(
+            f"tensor {name!r} is declared MXFP4 (config expert_dtype) but "
+            f"does not match the packed layout: weight "
+            f"{tuple(weight.shape)} dtype={weight.dtype}, scale grid "
+            f"{tuple(scale.shape)} dtype={scale.dtype}; expected 2-D "
+            f"int8/uint8 nibble-pack with an E8M0 scale plane "
+            f"({_E8M0_SCALE_DTYPE_NAMES}) of shape "
+            f"(rows, packed_cols/16) = (rows, logical_cols/32). Check the "
+            f"checkpoint's expert tensors against its expert_dtype "
+            f"declaration."
         )
 
 
@@ -449,19 +600,33 @@ def _require_fp8_scale(
     )
 
 
+# Tensors per batched MXFP4 decode launch (step 3b below). The decode's
+# live set peaks at ~13 B per packed byte of the chunk (1 packed + 4 int32
+# gather index + 8 fp32 element plane, then 1 + 8 + 4 for the bf16
+# downcast), which this bounds while still collapsing DSv4's ~768
+# per-layer expert tensors into ~24 launches. NOTE: that peak is *not*
+# visible to `LayerCache.prepare_for_load`, which reserves only the
+# resident layer size — raise this only with the load-time high water in
+# mind.
+_MXFP4_DECODE_CHUNK = 32
+
+
 def _apply_fp8_dequant_inplace(
     out: dict[str, torch.Tensor],
     fp8_scale_inv_map: dict[str, tuple[str, str]],
     device: torch.device,
+    *, source_authentication=None,
 ) -> int:
     """For each tensor in `out` whose key matches a `fp8_scale_inv_map`
     entry, read the scale_inv, apply the checkpoint-declared block
     dequant (`fp8_scale_inv_map.block`, see `_fp8_dequant_block`), and
     replace the loaded tensor with the dequanted bf16 weight. MXFP4
     tensors (OCP MX FP4 E2M1 nibble pairs with per-32-element E8M0
-    scales, e.g. DSv4-Flash routed experts) are detected by signature
-    and dequanted on a dedicated path (step 3b) instead of the
-    block-FP8 broadcast.
+    scales, e.g. DSv4-Flash's routed and shared experts) are the map's
+    declared ``mxfp4_names`` — populated only from the checkpoint config's
+    explicit `expert_dtype` declaration, never inferred from shapes —
+    and dequant on a dedicated path (step 3b) instead of the block-FP8
+    broadcast, after a hard packed-grid assertion.
 
     Tensors and scales are both grouped by shape and multiplied in a
     single batched 5-D broadcast op per shape-group. On MiniMax-M2.7
@@ -487,7 +652,7 @@ def _apply_fp8_dequant_inplace(
     # Step 1: Read all scales from source safetensors once per shard.
     loaded_scales: dict[str, torch.Tensor] = {}  # name -> fp32 scale (cpu)
     for shard, reads in scale_reads.items():
-        with safe_open(shard, framework="pt") as f:
+        with _source_safe_open(shard, framework="pt", source_authentication=source_authentication) as f:
             for model_name, scale_key in reads:
                 loaded_scales[model_name] = f.get_tensor(scale_key)
 
@@ -500,16 +665,19 @@ def _apply_fp8_dequant_inplace(
     by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
     fallback: list[str] = []
     mxfp4_names: list[str] = []
+    declared_mxfp4 = getattr(fp8_scale_inv_map, "mxfp4_names", frozenset())
     for name in loaded_scales:
         w = out[name]
-        # DSv4-Flash routed experts are MXFP4, not block-FP8: E2M1 nibble
-        # pairs packed into int8 (low nibble = even element) with per-row
-        # E8M0 scales over 32 logical elements. Signature: int8 weight +
-        # scale grid (out, packed_in/16). Handled in step 3b below.
-        if (w.dim() == 2 and w.dtype == torch.int8
-                and loaded_scales[name].dim() == 2
-                and loaded_scales[name].shape[0] == w.shape[0]
-                and loaded_scales[name].shape[1] * 16 == w.shape[1]):
+        # MXFP4 experts (DSv4-Flash routed + shared): E2M1 nibble pairs
+        # packed into int8 (low nibble = even element) with per-row E8M0
+        # scales over 32 logical elements. Membership is the checkpoint's
+        # explicit declaration (config `expert_dtype`, carried on the
+        # map as `mxfp4_names`), NOT a shape heuristic — an INT8
+        # checkpoint with group-16 scales must never be silently decoded
+        # as nibble pairs. The packed-grid shape is asserted, not used
+        # as the trigger. Handled in step 3b below.
+        if name in declared_mxfp4:
+            _check_mxfp4_packed_grid(name, w, loaded_scales[name])
             mxfp4_names.append(name)
             continue
         if w.dim() != 2:
@@ -558,31 +726,68 @@ def _apply_fp8_dequant_inplace(
         dequanted += E
         del w_stack, s_stack, w4, s4, dequanted_stack
 
-    # Step 3b: MXFP4 tensors (DSv4-Flash routed experts). Vectorized
-    # nibble unpack + per-32-element E8M0 scale, per the OCP Microscaling
-    # Formats (MX) v1.0 spec: FP4 E2M1 element grid ({0, 0.5, 1, 1.5, 2,
-    # 3, 4, 6} with a sign bit), one shared E8M0 power-of-two scale per
-    # 32-element group.
+    # Step 3b: MXFP4 tensors (DSv4-Flash routed + shared experts).
+    # Shape-grouped, so a shared expert's distinct (rows, packed_in) simply
+    # forms its own group — no per-expert index is needed anywhere here.
+    # Vectorized nibble unpack + per-32-element E8M0 scale, per the OCP
+    # Microscaling Formats (MX) v1.0 spec: FP4 E2M1 element grid
+    # ({0, 0.5, 1, 1.5, 2, 3, 4, 6} with a sign bit), one shared E8M0
+    # power-of-two scale per 32-element group.
+    # Batched like step 3 — same-shape tensors stack
+    # and decode together (DSv4 loads ~768 expert tensors per layer;
+    # per-tensor kernel launches are exactly what this function's batched
+    # design exists to avoid) — but in chunks of _MXFP4_DECODE_CHUNK, since
+    # the byte->pair LUT gather materializes an index plane plus an fp32
+    # element plane (~13 B per packed byte, see below) that would dwarf the
+    # decoded output if the whole expert stack were gathered at once.
     if mxfp4_names:
         lut = torch.tensor(
             [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
              0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-            dtype=torch.bfloat16, device=device)
+            dtype=torch.float32, device=device)
+        # (256, 2) byte LUT: byte -> (low-nibble, high-nibble) element
+        # pair; low nibble is the even logical element, so flattening the
+        # trailing pair dim lands elements in logical order. Built in fp32
+        # — the scale multiply dtype — so the gather lands straight in it:
+        # every E2M1 code is exact in bf16 *and* fp32, so this is
+        # bit-identical to gathering bf16 then widening, minus one
+        # full-size intermediate.
+        codes = torch.arange(256, device=device)
+        pair_lut = torch.stack([lut[codes & 0x0F], lut[codes >> 4]], dim=-1)
+        mx_by_shape: dict[tuple[int, int], list[str]] = defaultdict(list)
         for name in mxfp4_names:
-            wp = out[name].to(device=device).view(torch.uint8)
-            rows, packed_in = wp.shape
+            mx_by_shape[tuple(out[name].shape)].append(name)
+        for (rows, packed_in), names in mx_by_shape.items():
             logical_in = packed_in * 2
-            deq = torch.empty(rows, logical_in, dtype=torch.bfloat16,
-                              device=device)
-            deq[:, 0::2] = lut[(wp & 0x0F).to(torch.long)]
-            deq[:, 1::2] = lut[(wp >> 4).to(torch.long)]
-            sb = loaded_scales[name].to(device=device).view(torch.uint8)
-            scale = torch.exp2((sb.to(torch.float32) - 127.0))
-            deq = (deq.reshape(rows, logical_in // 32, 32).to(torch.float32)
-                   * scale.unsqueeze(-1)).to(torch.bfloat16)
-            out[name] = deq.reshape(rows, logical_in).contiguous()
-            dequanted += 1
-            del wp, deq, sb, scale
+            for i0 in range(0, len(names), _MXFP4_DECODE_CHUNK):
+                chunk = names[i0:i0 + _MXFP4_DECODE_CHUNK]
+                E = len(chunk)
+                wp = torch.stack([out[n] for n in chunk], dim=0).to(
+                    device=device).view(torch.uint8)
+                # int32 gather indices: the index *values* are byte codes
+                # (0..255), so int32 is exact here and halves the index
+                # transient vs long (8 -> 4 B per packed byte).
+                deq = pair_lut[wp.to(torch.int32)].reshape(
+                    E, rows, logical_in // 32, 32)
+                sb = torch.stack(
+                    [loaded_scales[n] for n in chunk], dim=0
+                ).to(device=device).view(torch.uint8)
+                scale = torch.exp2((sb.to(torch.float32) - 127.0))
+                # E8M0 0xFF is NaN per the OCP MX v1.0 spec, not 2^128:
+                # exp2(128) yields +inf, which turned a 0xFF block into a
+                # mix of ±inf (nonzero elements) and NaN (zero elements,
+                # 0*inf) instead of 32 NaNs.
+                scale = torch.where(
+                    sb == 0xFF, torch.full_like(scale, float("nan")), scale)
+                # Scale in place: `deq` is already fp32, so this needs no
+                # widened copy and no separate product buffer (chunk peak
+                # 21 -> 13 B per packed byte).
+                deq.mul_(scale.unsqueeze(-1))
+                deq = deq.to(torch.bfloat16).reshape(E, rows, logical_in)
+                for i, n in enumerate(chunk):
+                    out[n] = deq[i].contiguous()
+                dequanted += E
+                del wp, deq, sb, scale
 
     # Step 4: Fallback path for any shapes we didn't batch.
     for name in fallback:
@@ -595,14 +800,47 @@ def _apply_fp8_dequant_inplace(
     return dequanted
 
 
+def _model_tensor_dtypes(model: nn.Module, dtype: torch.dtype) -> dict[str, torch.dtype]:
+    """Use the checkpoint loader's dtype policy for live source slots.
+
+    Constructor-declared buffers retain their precision. HF's own dtype plan
+    additionally retains strict FP32 parameters, including architecture-specific
+    convolution, recurrence and routing state. Match it with the same glob
+    helper used by HF after checkpoint conversion, rather than guessing names.
+    """
+    result = {name: value.dtype for name, value in
+              model.named_buffers(remove_duplicate=False)}
+    get_plan = getattr(model, '_get_dtype_plan', None)
+    plan = get_plan(dtype) if callable(get_plan) else {}
+    if plan:
+        from transformers.core_model_loading import build_glob_alternation
+        pattern, by_group, _ = build_glob_alternation(list(plan))
+        for name, _value in [*model.named_parameters(remove_duplicate=False),
+                             *model.named_buffers(remove_duplicate=False)]:
+            match = pattern.search(name)
+            if match is not None:
+                result[name] = plan[by_group[match.lastgroup]]
+    return result
+
+
+def _source_tensor_dtypes(model: nn.Module, dtype: torch.dtype, concat_merger=None):
+    """Propagate the resolved live precision to explicitly split source slots."""
+    result = _model_tensor_dtypes(model, dtype)
+    for source, target in getattr(concat_merger, 'source_targets', {}).items():
+        if target in result:
+            result[source] = result[target]
+    return result
+
+
 def _materialize(model: nn.Module, prefixes: list[str],
                  model_to_shard: dict[str, str],
                  model_to_ckpt: dict[str, str],
                  device: torch.device, dtype: torch.dtype,
                  fp8_scale_inv_map: dict[str, tuple[str, str]] | None = None,
+                 *, source_authentication=None,
                  ) -> int:
     """Load all tensors whose model-side name starts with any prefix in
-    `prefixes` onto `device` as `dtype`. Uses the checkpoint-side key to
+    `prefixes` onto `device`, with parameters as `dtype` and buffers in their declared dtype. Uses the checkpoint-side key to
     read from safetensors but assigns to the model-side name.
 
     When `fp8_scale_inv_map` is provided, fp8-sourced weights get their
@@ -611,6 +849,7 @@ def _materialize(model: nn.Module, prefixes: list[str],
     cast to bf16. See `_dequant_fp8_block_weight`.
 
     Returns count of tensors loaded."""
+    buffer_dtypes = _model_tensor_dtypes(model, dtype)
     by_shard: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for model_name, shard in model_to_shard.items():
         if any(model_name.startswith(p) for p in prefixes):
@@ -620,11 +859,11 @@ def _materialize(model: nn.Module, prefixes: list[str],
     open_kwargs = _safe_open_kwargs(device)
     for shard, pairs in by_shard.items():
         try:
-            f_ctx = safe_open(shard, **open_kwargs)
+            f_ctx = _source_safe_open(shard, source_authentication=source_authentication, **open_kwargs)
         except (TypeError, RuntimeError):
             # Older safetensors / unsupported device combos: drop the
             # device kwarg and fall back to the host-stage path.
-            f_ctx = safe_open(shard, framework="pt")
+            f_ctx = _source_safe_open(shard, framework="pt", source_authentication=source_authentication)
         with f_ctx as f:
             for model_name, ckpt_name in pairs:
                 t = f.get_tensor(ckpt_name)
@@ -632,10 +871,11 @@ def _materialize(model: nn.Module, prefixes: list[str],
                 if (t.is_floating_point()
                         and not _is_fp8_scaled_tensor(
                             model_name, fp8_scale_inv_map)):
-                    t = t.to(dtype)
+                    t = t.to(buffer_dtypes.get(model_name, dtype))
                 out[model_name] = t
     if fp8_scale_inv_map:
-        _apply_fp8_dequant_inplace(out, fp8_scale_inv_map, device)
+        _apply_fp8_dequant_inplace(out, fp8_scale_inv_map, device,
+            **({'source_authentication': source_authentication} if source_authentication is not None else {}))
     loaded = 0
     for model_name, t in out.items():
         install_dtype = t.dtype if t.is_floating_point() else None
@@ -653,7 +893,7 @@ def _pack_per_expert_into_packed(
     projection_names_for,
     live_param_shape,
 ) -> int:
-    """Stack per-expert checkpoint tensors into packed 3D live params.
+    """Copy per-expert checkpoint tensors into their final packed 3D params.
 
     Some MoE checkpoints store each routed expert's projections separately
     on disk (``…experts.{i}.{proj}.weight``) while the live module exposes a
@@ -672,15 +912,14 @@ def _pack_per_expert_into_packed(
     Mutates ``out`` in place: removes consumed per-expert keys and inserts
     the packed keys. Returns the number of packed params produced (0 = the
     checkpoint isn't per-expert, or the live module isn't packed)."""
-    # packed_full_name -> {expert_idx -> {projection -> tensor}}
-    groups: dict[str, dict[int, dict[str, torch.Tensor]]] = defaultdict(
-        lambda: defaultdict(dict))
-    consumed: list[str] = []
-    for key, t in out.items():
+    # Keep names, not tensor references: each source can be released as soon
+    # as its bytes have reached their final slice in the packed parameter.
+    groups: dict[str, dict[int, dict[str, str]]] = defaultdict(lambda: defaultdict(dict))
+    for key in out:
         name = key[:-len(".weight")] if key.endswith(".weight") else key
         if not is_per_expert(name):
             continue
-        head, proj = name.rsplit(".", 1)           # head = …experts.{idx}
+        head, proj = name.rsplit(".", 1)
         experts_path, idx_str = head.rsplit(".", 1)
         if not idx_str.isdigit():
             continue
@@ -689,39 +928,242 @@ def _pack_per_expert_into_packed(
             continue
         packed_full = f"{experts_path}.{parent}"
         if live_param_shape(packed_full) is None:
-            continue  # live module isn't packed for this group — leave as-is
-        groups[packed_full][int(idx_str)][proj] = t
-        consumed.append(key)
-    produced = 0
+            continue
+        by_projection = groups[packed_full][int(idx_str)]
+        if proj in by_projection:
+            raise ValueError(f"per-expert pack: duplicate source for {packed_full} expert {idx_str} {proj}")
+        by_projection[proj] = key
+
+    # Validate the full layout before consuming any source. Copying into a
+    # correctly typed final allocation cannot silently promote mixed dtypes.
+    plans = []
     for packed_full, by_expert in groups.items():
-        parent = packed_full.rsplit(".", 1)[1]
-        order = tuple(projection_names_for(parent))
-        n_experts = max(by_expert) + 1
-        slabs: list[torch.Tensor] = []
-        for i in range(n_experts):
-            projs = by_expert.get(i)
-            if projs is None or any(p not in projs for p in order):
-                raise ValueError(
-                    f"per-expert pack: {packed_full} missing expert {i} "
-                    f"projection(s) {order}")
-            if len(order) == 1:
-                slabs.append(projs[order[0]])
-            else:
-                # Fuse projections along the output axis (the transformers
-                # packed-FusedMoE convention), then stack experts on a new
-                # leading axis. The shape check below is the safety net.
-                slabs.append(torch.cat([projs[p] for p in order], dim=0))
-        packed = torch.stack(slabs, dim=0).contiguous()
-        target = live_param_shape(packed_full)
-        if tuple(packed.shape) != tuple(target):
-            raise ValueError(
-                f"per-expert pack: assembled {packed_full} shape "
-                f"{tuple(packed.shape)} != live param {tuple(target)}")
+        order = tuple(projection_names_for(packed_full.rsplit(".", 1)[1]))
+        target = tuple(live_param_shape(packed_full))
+        if not order or len(target) != 3 or set(by_expert) != set(range(target[0])):
+            raise ValueError(f"per-expert pack: {packed_full} missing expert or invalid live shape {target}")
+        first = None
+        for i in range(target[0]):
+            projs = by_expert[i]
+            if set(projs) != set(order):
+                raise ValueError(f"per-expert pack: {packed_full} missing expert {i} projection(s) {order}")
+            rows = 0
+            for proj in order:
+                tensor = out[projs[proj]]
+                if tensor.ndim != 2 or tensor.shape[1] != target[2]:
+                    raise ValueError(f"per-expert pack: {packed_full} source shape {tuple(tensor.shape)} != live param {target}")
+                rows += tensor.shape[0]
+                precision = (tensor.dtype, tensor.device)
+                if first is None:
+                    first = precision
+                if precision != first:
+                    raise ValueError(f"per-expert pack: {packed_full} source dtype/device differs")
+            if rows != target[1]:
+                raise ValueError(f"per-expert pack: {packed_full} assembled shape rows {rows} != live param {target}")
+        plans.append((packed_full, by_expert, order, target))
+    # The validation loop's last tensor must not keep a consumed allocation.
+    if groups:
+        del tensor
+    for packed_full, by_expert, order, target in plans:
+        first_key = by_expert[0][order[0]]
+        packed = out[first_key].new_empty(target)
+        for i in range(target[0]):
+            offset = 0
+            for proj in order:
+                tensor = out.pop(by_expert[i][proj])
+                rows = tensor.shape[0]
+                packed[i].narrow(0, offset, rows).copy_(tensor)
+                offset += rows
+                del tensor
         out[packed_full] = packed
-        produced += 1
-    for key in consumed:
-        out.pop(key, None)
+    return len(plans)
+
+
+def _merge_concat_sources(
+    out: dict[str, torch.Tensor],
+    *,
+    groups,
+    live_param_shape,
+) -> int:
+    """Concatenate N source tensors into the single live param they form.
+
+    Sibling of :func:`_pack_per_expert_into_packed`, for the other layout gap
+    a 1:1 checkpoint->live name map cannot express: a checkpoint that stores
+    one live parameter as several separate tensors which the modelling code
+    concatenates on load (transformers' ``Concatenate(dim=...)`` merges — e.g.
+    a depthwise short convolution stored as ``{q,k,v}_conv1d.weight`` while the
+    live module holds one fused ``conv1d.weight``). Left unbridged those source
+    keys are dropped and the live parameter loads uninitialised.
+
+    Every structural decision — which suffixes merge into which target, in what
+    order, along which dim — comes from ``groups``, which the caller wires from
+    the model profile's ``concat_merges`` declaration. No architecture names
+    appear here.
+
+    ``groups`` is ``((target_suffix, (source_suffix, ...), dim), ...)``. Source
+    order is the concatenation order and is load-bearing.
+
+    The merge is **cast-free**: every source of a group must already share one
+    dtype (``torch.cat`` type-promotes silently, which would change the bytes
+    the rest of the pipeline prices), and the assembled shape is checked
+    against the live parameter, so a layout or ordering mismatch fails loud
+    instead of mis-packing.
+
+    Mutates ``out`` in place: removes the consumed source keys and inserts the
+    merged key. Returns the number of merged params produced."""
+    produced = 0
+    for target_suffix, source_suffixes, dim in groups:
+        # target_full -> {source_suffix: (key, tensor)}
+        found: dict[str, dict[str, tuple[str, torch.Tensor]]] = defaultdict(dict)
+        # Longest suffix wins, so a declaration whose suffixes nest (one is a
+        # tail of another) attributes each key to the more specific one rather
+        # than to whichever happened to be declared first.
+        by_length = sorted(source_suffixes, key=len, reverse=True)
+        for key, t in out.items():
+            for suffix in by_length:
+                if key.endswith(suffix):
+                    stem = key[: len(key) - len(suffix)]
+                    found[stem + target_suffix][suffix] = (key, t)
+                    break
+        for target_full, by_source in found.items():
+            target_shape = live_param_shape(target_full)
+            if target_shape is None:
+                # The live module has no such parameter — nothing to merge
+                # into. Leave the source keys alone rather than guessing.
+                continue
+            missing = [s for s in source_suffixes if s not in by_source]
+            if missing:
+                raise ValueError(
+                    f"concat merge: {target_full} is missing source "
+                    f"tensor(s) {missing} (have "
+                    f"{sorted(by_source)}); the merge is all-or-nothing"
+                )
+            parts = [by_source[s][1] for s in source_suffixes]
+            dtypes = {p.dtype for p in parts}
+            if len(dtypes) != 1:
+                raise ValueError(
+                    f"concat merge: {target_full} sources carry mixed dtypes "
+                    f"{sorted(str(d) for d in dtypes)}; refusing to let "
+                    f"torch.cat pick a promotion"
+                )
+            merged = torch.cat(parts, dim=dim).contiguous()
+            if tuple(merged.shape) != tuple(target_shape):
+                raise ValueError(
+                    f"concat merge: assembled {target_full} shape "
+                    f"{tuple(merged.shape)} != live param "
+                    f"{tuple(target_shape)} (sources {list(source_suffixes)} "
+                    f"along dim {dim})"
+                )
+            for suffix in source_suffixes:
+                out.pop(by_source[suffix][0], None)
+            out[target_full] = merged
+            produced += 1
     return produced
+
+
+def selected_weight_source_keys(unit_names, profile, source_keys):
+    """Resolve selected Linears to the existing reader's source dependencies.
+
+    A projected expert still needs its complete packed parent, including all
+    siblings required by the profile's packer. A concat target needs every
+    declared source. The same metadata closure sizes and executes snapshots;
+    it does not change packing, dequantization, or source authentication.
+    """
+    keys = set(source_keys)
+    names = tuple(unit_names)
+    if not names or len(names) != len(set(names)):
+        raise ValueError('selected source requires unique nonempty units')
+    regex = profile.per_expert_moe_regex()
+    pattern = re.compile(regex.removeprefix('re:')) if regex else None
+
+    def packed_parent(name):
+        if pattern is None or not (pattern.match(name) or
+                pattern.match(profile.to_vllm_internal_name(name))):
+            return None
+        owner, projection = name.rsplit('.', 1)
+        path, expert = owner.rsplit('.', 1)
+        parent = profile.packed_expert_parent_for_projection(projection)
+        return path+'.'+parent if expert.isdigit() and parent is not None else None
+
+    groups = tuple(profile.concat_merge_groups())
+    dependencies = {}
+    for key in sorted(keys):
+        target = packed_parent(key.removesuffix('.weight')) or key
+        for output, inputs, _dim in groups:
+            for suffix in inputs:
+                if key.endswith(suffix):
+                    target = key[:-len(suffix)]+output
+        dependencies.setdefault(target, set()).add(key)
+    selected = set()
+    for name in names:
+        target = packed_parent(name) or name+'.weight'
+        required = dependencies.get(target)
+        if not required:
+            raise RuntimeError(f'selected source has no checkpoint dependency for {name}')
+        if target in keys and required != {target}:
+            raise RuntimeError(f'selected source has ambiguous packed/merged inputs for {name}')
+        for output, inputs, _dim in groups:
+            if target.endswith(output) and target not in keys:
+                expected = {target[:-len(output)]+suffix for suffix in inputs}
+                if required != expected:
+                    raise RuntimeError(f'selected source has incomplete concat inputs for {name}')
+        selected.update(required)
+    return tuple(sorted(selected))
+
+
+def _build_concat_merger(model: nn.Module, weight_ckpt: dict[str, str]):
+    """Return a callable that merges N->1 concat source tensors, or None.
+
+    Returns None (loader unchanged) unless ALL of:
+      * the model profile declares `concat_merges`,
+      * the checkpoint actually ships the sources separately, and
+      * the live module exposes the merge target (so there is a gap to
+        bridge).
+
+    Everything model-specific comes from the profile spec; the returned
+    closure carries no architecture names. Used on every path that reads
+    source shards into live-named tensors, so a split-source checkpoint loads
+    identically for the probe, the cost stages and the exporter."""
+    from .model_profiles import DeadVendoredOverrideError, profile_from_model
+    try:
+        prof = profile_from_model(model)
+    except DeadVendoredOverrideError:
+        # `None` means "no merge needed" and the loader runs unchanged. That
+        # is right when no profile declares `concat_merges`; on a dead
+        # override it means a split-source checkpoint loads with its merge
+        # target unfilled, which is missing weights, not a missing hint (#202).
+        raise
+    except Exception:
+        return None
+    groups = tuple(getattr(prof, "concat_merge_groups", lambda: ())())
+    if not groups:
+        return None
+    live_shapes = {n: tuple(p.shape) for n, p in model.named_parameters()}
+    active = []
+    for target_suffix, source_suffixes, dim in groups:
+        has_sources = any(
+            k.endswith(source_suffixes[0]) for k in weight_ckpt
+        )
+        has_target = any(n.endswith(target_suffix) for n in live_shapes)
+        if has_sources and has_target:
+            active.append((target_suffix, tuple(source_suffixes), int(dim)))
+    if not active:
+        return None
+    active = tuple(active)
+
+    def _merger(out):
+        _merge_concat_sources(
+            out, groups=active, live_param_shape=live_shapes.get)
+
+    # The shared reader must preserve the final parameter's declared dtype
+    # while loading its split sources, before any lossy cast can occur.
+    _merger.source_targets = {
+        name: name[:-len(source)]+target
+        for name in weight_ckpt
+        for target, sources, _dim in active
+        for source in sources if name.endswith(source)
+    }
+    return _merger
 
 
 def _build_expert_packer(model: nn.Module, weight_ckpt: dict[str, str]):
@@ -739,9 +1181,13 @@ def _build_expert_packer(model: nn.Module, weight_ckpt: dict[str, str]):
     probe/cost context and the compressed-tensors exporter so a raw
     per-expert checkpoint loads identically on every path — no out-of-band
     pre-pack."""
+    from .model_profiles import DeadVendoredOverrideError, profile_from_model
     try:
-        from .model_profiles import profile_from_model
         prof = profile_from_model(model)
+    except DeadVendoredOverrideError:
+        # As above (#202): `None` leaves a per-expert-on-disk checkpoint
+        # unpacked against packed live params, so the experts never load.
+        raise
     except Exception:
         return None
     packed_names = prof.packed_expert_param_names()
@@ -821,9 +1267,20 @@ def fill_packed_experts_from_source(
     Returns the number of packed params filled. Call right after
     ``from_pretrained`` on the calibration model.
     """
+    from .model_profiles import DeadVendoredOverrideError, profile_from_model
     try:
-        from .model_profiles import profile_from_model
         prof = profile or profile_from_model(model)
+    except DeadVendoredOverrideError:
+        # #202 flagged this one as a candidate to keep swallowing, because it
+        # returns a COUNT and every other `return 0` here means "nothing to
+        # do". It is the opposite: this function exists precisely because the
+        # packed params would otherwise stay zero-initialized and "silently
+        # break every activation-scale calibration that depends on the
+        # routed-expert output" (the docstring above). Returning 0 on a dead
+        # override IS that silent break, reported as a clean no-op. The count
+        # is only a legitimate 0 when the profile could be consulted and had
+        # nothing to say.
+        raise
     except Exception:
         return 0
     # Local import: sensitivity_probe imports from this module, so import the
@@ -909,6 +1366,120 @@ def fill_packed_experts_from_source(
     return filled
 
 
+# --------------------------------------------------------------------------
+# Intra-layer parallel gather.
+#
+# A large MoE layer can contain thousands of small source tensors. The
+# bounded gather overlaps source reads and copy submission across reader
+# chunks while the existing layer prefetch path owns residency.
+#
+# The gather below is the ONLY change to the read: the same tensors, the
+# same dtype cast, the same contiguity fix, the same post-gather FP8
+# dequant / expert packing / concat merge, in the same deterministic key
+# order. Only the order in which the *pages* are faulted in changes.
+_LAYER_READ_POOL: ThreadPoolExecutor | None = None
+_LAYER_READ_POOL_THREADS = 0
+_LAYER_READ_POOL_LOCK = threading.Lock()
+
+# Below this many tensors a layer is a handful of big reads and the pool
+# only adds latency; dense models land here and keep the serial path.
+_LAYER_READ_MIN_TENSORS = 16
+
+
+def layer_read_threads() -> int:
+    """Worker count for the intra-layer gather.
+
+    ``PRISMAQUANT_LAYER_READ_THREADS`` overrides; 1 restores the
+    byte-identical serial read.
+    """
+    raw = str(os.environ.get("PRISMAQUANT_LAYER_READ_THREADS", "")).strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    cpu = os.cpu_count() or 4
+    return max(1, min(8, cpu // 2))
+
+
+def _layer_read_pool(threads: int) -> ThreadPoolExecutor:
+    """One shared, bounded pool for every streamed layer read.
+
+    Shared on purpose: the layer prefetcher already runs several layer
+    reads concurrently, and a per-call pool would multiply
+    (prefetch workers x gather threads) into disk thrash.
+    """
+    global _LAYER_READ_POOL, _LAYER_READ_POOL_THREADS
+    with _LAYER_READ_POOL_LOCK:
+        if _LAYER_READ_POOL is None or _LAYER_READ_POOL_THREADS != threads:
+            if _LAYER_READ_POOL is not None:
+                _LAYER_READ_POOL.shutdown(wait=False)
+            _LAYER_READ_POOL = ThreadPoolExecutor(
+                max_workers=threads, thread_name_prefix="layerread")
+            _LAYER_READ_POOL_THREADS = threads
+        return _LAYER_READ_POOL
+
+
+def _split_pairs(pairs: list[tuple[str, str]],
+                 chunks: int) -> list[list[tuple[str, str]]]:
+    """Contiguous split — keeps each worker on a contiguous byte range of
+    the shard so kernel readahead still helps inside a worker."""
+    if chunks <= 1 or len(pairs) <= 1:
+        return [pairs]
+    size = (len(pairs) + chunks - 1) // chunks
+    return [pairs[i:i + size] for i in range(0, len(pairs), size)]
+
+
+def _advise_consumed_safetensors_pages(shard: str, keys: list[str],
+                                     expected_stat=None) -> None:
+    """Release complete consumed payload pages; caller owns copy/map lifetime.
+
+    This is best-effort kernel advice, not a cache or an admission allowance.
+    Never include the header, unread tensors, or shared partial edge pages.
+    """
+    if not hasattr(os, 'posix_fadvise') or not hasattr(os, 'POSIX_FADV_DONTNEED'):
+        return
+    fd = os.open(shard, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        source_stat = os.fstat(fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            return
+        if expected_stat is not None:
+            fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+            if any(getattr(source_stat, k) != getattr(expected_stat, k) for k in fields):
+                raise RuntimeError('source changed before consumed-page release')
+        raw_size = os.pread(fd, 8, 0)
+        header_size = int.from_bytes(raw_size, 'little')
+        if len(raw_size) != 8 or not 0 < header_size <= min(100_000_000, source_stat.st_size - 8):
+            raise ValueError('invalid safetensors header for consumed-page release')
+        header = json.loads(os.pread(fd, header_size, 8))
+        base = 8 + header_size
+        page = os.sysconf('SC_PAGE_SIZE')
+        spans = []
+        for key in sorted(set(keys)):
+            begin, end = header[key]['data_offsets']
+            if (type(begin) is not int or type(end) is not int
+                    or not 0 <= begin <= end <= source_stat.st_size - base):
+                raise ValueError('invalid tensor span for consumed-page release')
+            spans.append((base + begin, base + end))
+        # Merge bytes before page alignment: a page shared by two consumed
+        # tensors is consumed in full. Per-tensor alignment would retain each
+        # boundary page (and potentially its entire large file-cache folio).
+        merged = []
+        for begin, end in sorted(spans):
+            if merged and begin <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((begin, end))
+        for begin, end in merged:
+            first = ((begin + page - 1) // page) * page
+            last = (end // page) * page
+            if first < last:
+                os.posix_fadvise(fd, first, last - first, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
 def _read_layer_to_device(prefix: str,
                           model_to_shard: dict[str, str],
                           model_to_ckpt: dict[str, str],
@@ -917,15 +1488,32 @@ def _read_layer_to_device(prefix: str,
                           fp8_scale_inv_map: dict[str, tuple[str, str]]
                               | None = None,
                           pack_experts=None,
+                          merge_concat=None,
+                          buffer_dtypes: dict[str, torch.dtype] | None = None,
+                          source_authentication=None,
                           ) -> dict[str, torch.Tensor]:
     """Read all tensors under `prefix` from safetensors and place them
     on `device`. Returns {model_name: device_tensor}.
+
+    `buffer_dtypes` carries resolved model-declared tensor precision independently
+    of the requested dtype (including buffers and strict FP32 parameters).
 
     When `fp8_scale_inv_map` is provided, native-FP8 block-scaled
     weights are kept compressed through the host-side read and moved to
     `device` before the 128x128 block dequant. That avoids CPU-side
     FP8→BF16 expansion and cuts the transfer/cache traffic for those
-    tensors to the source checkpoint size until the final GPU multiply."""
+    tensors to the source checkpoint size until the final GPU multiply.
+
+    The per-tensor gather runs on the shared intra-layer read pool when
+    the layer has enough tensors to be worth it (see
+    ``layer_read_threads``); the result is assembled in deterministic
+    shard/key order either way.
+
+    ``PRISMAQUANT_RELEASE_SOURCE_PAGES=1`` opts CUDA reads into advising
+    consumed source payload pages after each existing reader chunk completes
+    its copies and releases its mappings.
+    CPU-backed outputs retain their mappings and never request page release.
+    """
     by_shard: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for model_name, shard in model_to_shard.items():
         if model_name.startswith(prefix):
@@ -933,33 +1521,129 @@ def _read_layer_to_device(prefix: str,
     out: dict[str, torch.Tensor] = {}
     open_kwargs = _safe_open_kwargs(device)
     direct = "device" in open_kwargs
-    for shard, pairs in by_shard.items():
+    release_pages = (os.environ.get('PRISMAQUANT_RELEASE_SOURCE_PAGES') == '1'
+                     and device.type == 'cuda')
+    source_stats = {shard: (os.stat(shard) if source_authentication is None else
+        source_authentication.file_stat(shard)) for shard in by_shard} if release_pages else {}
+    def _read_chunk(shard: str,
+                    pairs: list[tuple[str, str]]) -> dict[str, torch.Tensor]:
+        local: dict[str, torch.Tensor] = {}
+        if not pairs:
+            return local
         try:
-            f_ctx = safe_open(shard, **open_kwargs)
+            f_ctx = _source_safe_open(shard, source_authentication=source_authentication, **open_kwargs)
             used_direct = direct
         except (TypeError, RuntimeError):
-            f_ctx = safe_open(shard, framework="pt")
+            f_ctx = _source_safe_open(shard, framework="pt", source_authentication=source_authentication)
             used_direct = False
-        with f_ctx as f:
-            for model_name, ckpt_name in pairs:
-                t = f.get_tensor(ckpt_name)
-                _require_fp8_scale(model_name, t, fp8_scale_inv_map)
-                if (t.is_floating_point()
-                        and not _is_fp8_scaled_tensor(
-                            model_name, fp8_scale_inv_map)):
-                    t = t.to(dtype)
-                if not used_direct:
-                    t = t.to(device, non_blocking=True)
-                if not t.is_contiguous():
-                    t = t.contiguous()
-                out[model_name] = t
+        # This existing read chunk owns its mmap-backed/converted staging
+        # through one stream event, rather than retaining it for the layer.
+        host_staging = []
+        cuda_copied = False
+        try:
+            with f_ctx as f:
+                for model_name, ckpt_name in pairs:
+                    t = f.get_tensor(ckpt_name)
+                    cuda_copied |= t.device.type == 'cuda'
+                    if release_pages and t.device.type == 'cpu':
+                        host_staging.append(t)
+                    _require_fp8_scale(model_name, t, fp8_scale_inv_map)
+                    if (t.is_floating_point()
+                            and not _is_fp8_scaled_tensor(
+                                model_name, fp8_scale_inv_map)):
+                        t = t.to((buffer_dtypes or {}).get(model_name, dtype))
+                    if not used_direct:
+                        if release_pages and t.device.type == 'cpu':
+                            host_staging.append(t)
+                        t = t.to(device, non_blocking=True)
+                        cuda_copied |= t.device.type == 'cuda'
+                    if not t.is_contiguous():
+                        t = t.contiguous()
+                    local[model_name] = t
+        finally:
+            if release_pages and cuda_copied:
+                # Fence this chunk's stream through its final transfer, even
+                # when a later source read fails. Do not fence the device or
+                # wait for unrelated work queued after this event.
+                # If record/sync fails, the propagated traceback retains
+                # this chunk's staging; completion has not been proven.
+                event = torch.cuda.Event()
+                event.record(torch.cuda.current_stream(device))
+                event.synchronize()
+            host_staging.clear()
+        if release_pages and local and all(t.device.type == 'cuda' for t in local.values()):
+            # Reached only on a successful chunk: its map is closed, copies
+            # completed and CPU views released. Other readers may still run.
+            _advise_consumed_safetensors_pages(
+                shard if source_authentication is None else source_authentication.descriptor_path(shard),
+                [key for _, key in pairs], source_stats[shard])
+        return local
+
+    total_tensors = sum(len(pairs) for pairs in by_shard.values())
+    threads = layer_read_threads()
+    if threads > 1 and total_tensors >= _LAYER_READ_MIN_TENSORS:
+        pool = _layer_read_pool(threads)
+        jobs = []  # (shard, pairs) in deterministic order
+        for shard, pairs in by_shard.items():
+            for chunk in _split_pairs(pairs, threads):
+                jobs.append((shard, chunk))
+        futures = [pool.submit(_read_chunk, shard, chunk)
+                   for shard, chunk in jobs]
+        if release_pages or source_authentication is not None:
+            # Drain every launched reader before propagating an error;
+            # each chunk fences its own copies, including on read failure.
+            # An authenticated owner must outlive every reader on CPU too.
+            wait_futures(futures)
+        # `.result()` re-raises any worker exception: a partially gathered
+        # layer must never be installed as if it were complete.
+        for fut in futures:
+            out.update(fut.result())
+        # Future results own the original source tensors too. Drop that
+        # ownership before packing so consumed source members can be released.
+        futures.clear()
+        del fut
+    else:
+        for shard, pairs in by_shard.items():
+            out.update(_read_chunk(shard, pairs))
+    if len(out) != total_tensors:
+        missing = total_tensors - len(out)
+        raise RuntimeError(
+            f"streamed layer read for prefix {prefix!r} gathered "
+            f"{len(out)} of {total_tensors} tensors ({missing} missing); "
+            "refusing to install a partial layer"
+        )
     if fp8_scale_inv_map:
-        _apply_fp8_dequant_inplace(out, fp8_scale_inv_map, device)
+        _apply_fp8_dequant_inplace(out, fp8_scale_inv_map, device,
+            **({'source_authentication': source_authentication} if source_authentication is not None else {}))
     if pack_experts is not None:
         # Generic per-expert -> packed-3D bridge for checkpoints that ship
         # MoE experts unfused while the live module is packed. No-op (None)
         # for every other checkpoint/model. Driven by the model profile.
         pack_experts(out)
+    if merge_concat is not None:
+        # Generic N->1 concat bridge for checkpoints that ship one live
+        # parameter as several source tensors (transformers'
+        # `Concatenate(dim=...)` merges). No-op (None) for every other
+        # checkpoint/model. Driven by the model profile's `concat_merges`.
+        merge_concat(out)
+    # Compact surviving views: the batched fp8 dequant hands out views of
+    # one batch buffer per shape bucket, and the expert packer COPIES the
+    # per-expert views into packed stacks and pops them — but any tensor
+    # that shares a bucket with the routed experts and survives (GLM-5.3's
+    # shared-expert Linears, 0.02G each) pins the ENTIRE batch buffer
+    # (9G/4.5G) for the layer's lifetime. That doubled resident memory per
+    # MoE layer (13.8G dict holding 27.3G of storage) and OOM-killed the
+    # first 306B export. Clone only the offenders — the packed majority
+    # already owns fresh storage.
+    for name, t in out.items():
+        if not isinstance(t, torch.Tensor) or t.is_meta:
+            continue
+        try:
+            storage_bytes = t.untyped_storage().nbytes()
+        except Exception:
+            continue
+        if storage_bytes > 2 * t.numel() * t.element_size():
+            out[name] = t.detach().clone().contiguous()
     return out
 
 
@@ -1053,14 +1737,33 @@ def _fast_install(resolver: dict[str, tuple],
 
 
 def _unload(model: nn.Module, prefixes: list[str]) -> int:
-    """Move all params/buffers under `prefixes` back to meta."""
+    """Move params/buffers under `prefixes` back to meta.
+
+    Non-persistent buffers are SKIPPED, symmetric with the install side
+    (`_fast_install` never restores them): they are derived at skeleton
+    build (rotary `inv_freq` caches), absent from the checkpoint, and
+    therefore impossible to re-materialize on re-install. Meta-izing
+    them breaks any layer that is evicted and installed again — DSv4's
+    faithful forward keeps compressor/indexer rotaries INSIDE the
+    layers, and phase-3's reverse sweep died on exactly this
+    ("Cannot copy out of meta tensor", probe attempt 5). They are a few
+    KB per layer; keeping them resident is free.
+    """
     n = 0
     for name, _ in list(model.named_parameters()):
         if any(name.startswith(p) for p in prefixes):
             set_module_tensor_to_device(model, name, "meta")
             n += 1
+    non_persistent: set[str] = set()
+    for mod_name, mod in model.named_modules():
+        for buf_name in getattr(mod, "_non_persistent_buffers_set", ()):
+            non_persistent.add(
+                f"{mod_name}.{buf_name}" if mod_name else buf_name
+            )
     for name, _ in list(model.named_buffers()):
         if any(name.startswith(p) for p in prefixes):
+            if name in non_persistent:
+                continue
             set_module_tensor_to_device(model, name, "meta")
             n += 1
     return n
@@ -1072,17 +1775,24 @@ class LayerCache:
     Values are dicts `{model_name: tensor}` returned by the layer-read
     helper. In the current streaming path those tensors live on the
     execution device, not on a detached CPU-only cache. Cache size is
-    bounded by bytes, not entries, so the same path degenerates to
-    "keep everything resident" when enough memory is available.
+    bounded by bytes and, when ``max_entries`` is supplied, by entries.
+    Without an entry cap the same path degenerates to "keep everything
+    resident" when enough memory is available.
     Eviction is LRU, which matches the forward-then-reverse access
     pattern used by the streaming probe.
     """
 
-    def __init__(self, max_bytes: int):
+    def __init__(self, max_bytes: int, max_entries: int | None = None):
         from collections import OrderedDict as _OD
+        if max_entries is not None:
+            if isinstance(max_entries, bool) or not isinstance(max_entries, int):
+                raise ValueError("LayerCache max_entries must be an integer or None")
+            if max_entries < 1:
+                raise ValueError("LayerCache max_entries must be >= 1")
         self._cache: "_OD[int, dict[str, torch.Tensor]]" = _OD()
         self._bytes: dict[int, int] = {}
         self.max_bytes = max_bytes
+        self.max_entries = max_entries
         self.total_bytes = 0
         self.hits = 0
         self.misses = 0
@@ -1113,6 +1823,16 @@ class LayerCache:
         #   3. Implicit at chunk teardown via clear_done().
         self._done_layers: set[int] = set()
         self.refused_puts = 0
+        # Prefetched-but-not-yet-read entries. These are the highest-
+        # value entries in the cache (known future use within the
+        # lookahead window), yet under plain LRU they are the OLDEST
+        # untouched items — so every new insert evicted exactly the
+        # layer the consumer needed next, and the prefetcher's reads
+        # were thrown away moments before use (measured: 40/48 cold
+        # loads per phase-3 sweep on Laguna-117B). Eviction skips them
+        # until first get(); evicting one is a last resort and counted.
+        self._pinned_until_read: set[int] = set()
+        self.evicted_pinned = 0
         # Dynamic budget reserve (v20 step 3+4): when > 0, put()
         # recomputes the effective max as
         #   min(max_bytes, MemAvailable + total_bytes - reserve)
@@ -1135,6 +1855,9 @@ class LayerCache:
     def get(self, layer_idx: int):
         if layer_idx in self._cache:
             self._cache.move_to_end(layer_idx)
+            # First read consumes the prefetch pin — from here on the
+            # entry competes in plain LRU order like any other.
+            self._pinned_until_read.discard(layer_idx)
             self.hits += 1
             return self._cache[layer_idx]
         self.misses += 1
@@ -1146,7 +1869,7 @@ class LayerCache:
         return layer_idx in self._cache
 
     def put(self, layer_idx: int, tensors: dict[str, torch.Tensor],
-            force: bool = True) -> bool:
+            force: bool = True, pinned_until_read: bool = False) -> bool:
         """Insert tensors into the cache. Returns True on success.
 
         force=True (default): always insert, even if the layer is
@@ -1192,17 +1915,28 @@ class LayerCache:
         # In-scope priority eviction (Task #4): when full, prefer evicting
         # out-of-scope (non-priority) entries before in-scope ones. Falls
         # back to LRU order if all candidates are in-scope.
-        while (self.total_bytes + size > effective_max
-               and len(self._cache) > 0):
+        while (
+            len(self._cache) > 0
+            and (
+                self.total_bytes + size > effective_max
+                or (
+                    self.max_entries is not None
+                    and len(self._cache) >= self.max_entries
+                )
+            )
+        ):
             evict_idx = self._pick_evict_candidate()
             if evict_idx is None:
                 break  # only priority entries left, can't evict any
             self._cache.pop(evict_idx, None)
+            self._pinned_until_read.discard(evict_idx)
             self.total_bytes -= self._bytes.pop(evict_idx, 0)
             evicted = True
         self._cache[layer_idx] = tensors
         self._bytes[layer_idx] = size
         self.total_bytes += size
+        if pinned_until_read:
+            self._pinned_until_read.add(layer_idx)
         # On UMA the cuda caching allocator won't return freed blocks to
         # the OS on its own, so every eviction would otherwise leak into
         # the shared LPDDR5X pool. Force a release after each eviction.
@@ -1211,14 +1945,20 @@ class LayerCache:
         return True
 
     def _pick_evict_candidate(self) -> int | None:
-        """Return the layer_idx of the LRU non-priority entry, or the
-        LRU priority entry if no non-priority ones exist, or None if
-        the cache is empty."""
+        """Return the eviction victim: LRU entry that is neither
+        priority nor pinned-until-read; then LRU pinned non-priority
+        (last resort, counted); then LRU priority; None if empty."""
         if not self._cache:
             return None
         # OrderedDict iteration is in insertion order; LRU is at front.
         for idx in self._cache:
+            if (idx not in self._priority_layers
+                    and idx not in self._pinned_until_read):
+                return idx
+        for idx in self._cache:
             if idx not in self._priority_layers:
+                self.evicted_pinned += 1
+                self._pinned_until_read.discard(idx)
                 return idx
         # All entries are priority — fall back to LRU
         return next(iter(self._cache))
@@ -1243,19 +1983,44 @@ class LayerCache:
         needed = max(0, self._pressure_threshold_bytes - avail)
         freed = 0
 
-        # Phase 1: non-priority LRU, no priority fallback.
+        def _drop(idx: int) -> int:
+            size = self._bytes.get(idx, 0)
+            self._cache.pop(idx, None)
+            # Without this discard the pin set kept indices that are no
+            # longer cached, so `pinned=` under-reported and a re-put of the
+            # same layer inherited a stale pin.
+            if idx in self._pinned_until_read:
+                self._pinned_until_read.discard(idx)
+                self.evicted_pinned += 1
+            self.total_bytes -= self._bytes.pop(idx, 0)
+            self.pressure_evictions += 1
+            return size
+
+        # Phase 1: non-priority, not-yet-read-prefetch LRU. A
+        # `pinned_until_read` entry is a layer the walk is about to ask for;
+        # dropping it here is what turned 17 prefetched layers into cold
+        # re-reads on the GLM-5.3-Flash sweep, because this loop popped
+        # straight out of `_cache` in LRU order and never consulted the pin
+        # set that `_pick_evict_candidate` honours.
         for idx in list(self._cache.keys()):
             if freed >= needed:
                 break
-            if idx in self._priority_layers:
+            if idx in self._priority_layers or idx in self._pinned_until_read:
                 continue
-            size = self._bytes.get(idx, 0)
-            self._cache.pop(idx, None)
-            self.total_bytes -= self._bytes.pop(idx, 0)
-            freed += size
-            self.pressure_evictions += 1
+            freed += _drop(idx)
 
-        # Phase 2: re-check pressure; if still tight, drop priority
+        # Phase 2: still tight — spend the prefetch pins next. They cost one
+        # re-read each, where a priority entry costs a re-read inside the
+        # hook-heavy in-scope set.
+        if freed < needed:
+            for idx in list(self._cache.keys()):
+                if freed >= needed:
+                    break
+                if idx in self._priority_layers:
+                    continue
+                freed += _drop(idx)
+
+        # Phase 3: re-check pressure; if still tight, drop priority
         # entries in LRU order. Priority is a preference, not a hard
         # contract — when host memory is genuinely scarce, holding
         # cached weights is worse than re-loading them.
@@ -1263,11 +2028,7 @@ class LayerCache:
             for idx in list(self._cache.keys()):
                 if freed >= needed:
                     break
-                size = self._bytes.get(idx, 0)
-                self._cache.pop(idx, None)
-                self.total_bytes -= self._bytes.pop(idx, 0)
-                freed += size
-                self.pressure_evictions += 1
+                freed += _drop(idx)
 
         if freed and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1333,13 +2094,23 @@ class LayerCache:
         self._maybe_pressure_shrink()
         effective_max = self._effective_max()
         target_total = max(0, effective_max - max(0, size_hint))
+        target_entries = (
+            self.max_entries - 1 if self.max_entries is not None else None
+        )
         freed = 0
-        while self.total_bytes > target_total and self._cache:
+        while self._cache and (
+            self.total_bytes > target_total
+            or (
+                target_entries is not None
+                and len(self._cache) > target_entries
+            )
+        ):
             evict_idx = self._pick_evict_candidate()
             if evict_idx is None:
                 break
             size = self._bytes.get(evict_idx, 0)
             self._cache.pop(evict_idx, None)
+            self._pinned_until_read.discard(evict_idx)
             self.total_bytes -= self._bytes.pop(evict_idx, 0)
             freed += size
         if freed and torch.cuda.is_available():
@@ -1382,6 +2153,7 @@ class LayerCache:
         layer as MRU and evicting the next layer that prefetch prepared.
         """
         tensors = self._cache.pop(layer_idx, None)
+        self._pinned_until_read.discard(layer_idx)
         if tensors is None:
             return
         self.total_bytes -= self._bytes.pop(layer_idx, 0)
@@ -1428,9 +2200,13 @@ class LayerCache:
         return (f"LayerCache: {len(self._cache)} layers, "
                 f"{self.total_bytes / (1024**3):.1f} GB / "
                 f"{self.max_bytes / (1024**3):.1f} GB, "
+                f"max_entries={self.max_entries} "
                 f"residency={self.residency_summary()} "
                 f"hits={self.hits} misses={self.misses} "
-                f"hit_rate={(self.hits/tot*100 if tot else 0):.0f}%")
+                f"hit_rate={(self.hits/tot*100 if tot else 0):.0f}% "
+                f"refused={self.refused_puts} "
+                f"pinned={len(self._pinned_until_read)} "
+                f"evicted_pinned={self.evicted_pinned}")
 
 
 def _get_layer_list(model: nn.Module):
@@ -1485,17 +2261,86 @@ def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
     return f"{full_path}.embed_tokens." if full_path else "embed_tokens."
 
 
+#: Names a hybrid decoder layer gives its mixer child. The mixer is where a
+#: layer that carries no ``layer_type`` of its own keeps the two facts that
+#: name it: its ``layer_idx`` and the ``config`` whose ``layer_types`` the
+#: index reads. ``linear_attn`` is Qwen3.5/3.6's DeltaNet child; ``conv`` is
+#: LFM2.5's ``Lfm2MoeShortConv``, whose layers expose no attention module at
+#: all -- omitting it left every LFM conv layer unnamed, and
+#: ``_call_layer`` failing closed on a mask dict that already held its entry
+#: (RobTand/prismaquant#276).
+_MIXER_CHILD_NAMES = ("self_attn", "attention", "linear_attn", "conv")
+
+
 def _layer_attention_type(layer: nn.Module):
-    return (
-        getattr(layer, "layer_type", None)
-        or getattr(getattr(layer, "self_attn", None), "layer_type", None)
-        or getattr(getattr(layer, "attention", None), "layer_type", None)
-    )
+    # `.block_type` is the transformers>=5.13 name for what `.layer_type`
+    # was on hybrid decoder layers up to 5.12; the mixer children above
+    # carry their own `layer_type`/`layer_idx` on architectures whose outer
+    # layer has none (Qwen3.5/3.6 DeltaNet, LFM2.5 short-conv).
+    lt = getattr(layer, "layer_type", None) or getattr(layer, "block_type", None)
+    for child_name in _MIXER_CHILD_NAMES:
+        if lt is not None:
+            break
+        lt = getattr(getattr(layer, child_name, None), "layer_type", None)
+    if lt is not None:
+        return lt
+    # Laguna/Gemma2/Cohere2 convention: the attention module carries a
+    # boolean ``is_sliding`` instead of a layer_type string.
+    for attn_name in ("self_attn", "attention"):
+        attn = getattr(layer, attn_name, None)
+        if attn is not None and hasattr(attn, "is_sliding"):
+            return ("sliding_attention" if attn.is_sliding
+                    else "full_attention")
+    # Generic fallback: config.layer_types[layer_idx] when both exist.
+    idx = getattr(layer, "layer_idx", None)
+    cfg = getattr(layer, "config", None)
+    for child_name in _MIXER_CHILD_NAMES:
+        if idx is not None and cfg is not None:
+            break
+        child = getattr(layer, child_name, None)
+        if child is None:
+            continue
+        if idx is None:
+            idx = getattr(child, "layer_idx", None)
+        if cfg is None:
+            cfg = getattr(child, "config", None)
+    lts = getattr(cfg, "layer_types", None) if cfg is not None else None
+    if idx is not None and lts is not None and 0 <= int(idx) < len(lts):
+        return lts[int(idx)]
+    # No guessing beyond this point: an unresolved layer type stays None so
+    # `_call_layer` fails closed instead of silently assuming semantics.
+    return None
+
+
+def merge_pass_state_kwargs(extra: dict, pass_state: dict | None, *,
+                            context: str) -> dict:
+    """Merge per-pass SHARED layer kwargs into per-layer `extra` kwargs.
+
+    The one place the merge rule lives, for every manual layer loop:
+
+    - shallow, so the mutable containers inside `pass_state` (Gemma4's
+      `shared_kv_states` dict) stay shared BY REFERENCE across the layers of
+      one pass — layer N's writes must be visible to layer N+1;
+    - an empty/None `pass_state` adds no kwarg at all, so architectures that
+      declare no shared state produce byte-for-byte the same layer call;
+    - a key present in both is a profile bug (a per-layer kwarg silently
+      overriding per-pass state, or vice versa) — raise, don't pick a winner.
+    """
+    if not pass_state:
+        return extra
+    collide = sorted(set(pass_state) & set(extra))
+    if collide:
+        raise RuntimeError(
+            "per-pass shared kwargs collide with per-layer "
+            f"extra_layer_kwargs on {collide} for {context}"
+        )
+    return {**extra, **pass_state}
 
 
 def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
                 position_embeddings, attention_mask, position_ids,
-                past_key_values=None, **extra) -> torch.Tensor:
+                past_key_values=None, pass_state: dict | None = None,
+                **extra) -> torch.Tensor:
     """Call a decoder layer with the common transformers v5 signature.
     Returns hidden output tensor.
 
@@ -1503,6 +2348,24 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     profile's `extra_layer_kwargs(...)` (e.g. DSv4-Flash hash-routing
     layers consume `input_ids` for the `tid2eid` lookup). Layers that
     don't consume those kwargs ignore them via `**kwargs` absorption.
+
+    `pass_state` carries the profile's PER-FORWARD-PASS shared kwargs
+    (`ModelProfile.new_forward_pass_state()`), e.g. Gemma4's
+    `shared_kv_states` dict: the model's own forward creates it once per
+    pass and threads the SAME object through every layer, so the layer
+    that stores K/V is visible to the layers that borrow it. Semantics
+    the caller must honour (differs from `extra_layer_kwargs`, which is
+    re-evaluated per layer):
+
+    - construct it ONCE at the outermost scope of a pass over the layer
+      stack, and
+    - never reuse it across passes — a fresh dict per pass, or one
+      calibration batch's K/V contaminates the next.
+
+    The merge itself is `merge_pass_state_kwargs` (shallow, no-op for an
+    empty state, raises on a key collision with `extra`) — shared with the
+    loops that resolve their profile kwargs through a local helper, so the
+    rule has exactly one definition.
 
     When `position_embeddings` is a `{layer_type: (cos, sin)}` dict (produced
     by `_compute_position_embeddings` for multi-layer-type-rope models like
@@ -1513,19 +2376,26 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
     layer type. This mirrors Gemma3/Gemma4 HF forwards, where sliding-window
     and full-attention layers receive different masks.
     """
+    extra = merge_pass_state_kwargs(extra, pass_state,
+                                    context=layer.__class__.__name__)
     lt = None
     pe = position_embeddings
     if isinstance(pe, dict):
         lt = _layer_attention_type(layer)
         pe = pe.get(lt)
         if pe is None:
-            if "main" in position_embeddings:
-                # DSv4: rotary.layer_types are rope AXES ("main"/"compress"),
-                # not attention-schedule types — the vendored probe forward
-                # feeds layer_type="main" rope to every decoder layer (the
-                # compress branch is stubbed out in probe mode).
-                pe = position_embeddings["main"]
-            elif len(position_embeddings) == 1:
+            # There used to be a `position_embeddings["main"]` default here,
+            # justified by "the compress branch is stubbed out in probe mode".
+            # `probe_mode` defaults False and is never set True in this tree,
+            # so the compress branch always ran — and every DSv4-Flash layer
+            # whose type was not literally a rope-axis name silently got the
+            # WRONG rope. Substituting a plausible table for the right one is
+            # precisely the band-aid that hid a perplexity-262 teacher behind
+            # a passing pipeline; the namespace mismatch it was papering over
+            # is now bridged in `_compute_position_embeddings` via the
+            # profile, and anything still unresolved here is a real defect
+            # that must be loud.
+            if len(position_embeddings) == 1:
                 pe = next(iter(position_embeddings.values()))
             else:
                 raise RuntimeError(
@@ -1558,7 +2428,8 @@ def _call_layer(layer: nn.Module, hidden: torch.Tensor, *,
 
 def _compute_position_embeddings(base_model: nn.Module,
                                  hidden: torch.Tensor,
-                                 position_ids: torch.Tensor):
+                                 position_ids: torch.Tensor,
+                                 profile=None):
     """Call the rotary module to get position embeddings.
 
     Single-rope models return a `(cos, sin)` tuple. Multi-layer-type-rope
@@ -1566,10 +2437,25 @@ def _compute_position_embeddings(base_model: nn.Module,
     sliding vs full with different `rope_theta`) expose `rotary.layer_types`
     and a `forward(x, position_ids, layer_type=...)`; for those we return a
     `{layer_type: (cos, sin)}` dict and `_call_layer` selects the right entry
-    per layer. Returns None if the model exposes no standalone rotary."""
+    per layer. Returns None if the model exposes no standalone rotary.
+
+    The returned dict is always keyed by **attention layer type**, because
+    that is what `_call_layer` can observe on a layer. On Gemma3/Gemma4 the
+    rotary's own keys already are attention layer types, so the two coincide.
+    On DSv4-Flash they do not: the rotary is keyed by rope AXIS
+    (`main`/`compress`) while a layer reports an attention schedule
+    (`sliding_attention`/`compressed_sparse_attention`/
+    `heavily_compressed_attention`). `ModelProfile.rope_axis_for_layer_type`
+    bridges the two namespaces, and re-keying here rather than at the lookup
+    keeps every `_call_layer` caller correct without any of them having to
+    know a rope exists. Getting this wrong is not hypothetical — see that
+    hook's docstring for the perplexity-262 teacher it produced."""
     rotary = _get_rotary(base_model)
     if rotary is None:
         return None
+    prepare_positions = getattr(profile, "rotary_position_ids", None)
+    if prepare_positions is not None:
+        position_ids = prepare_positions(position_ids)
     layer_types = getattr(rotary, "layer_types", None)
     with torch.no_grad():
         if layer_types:
@@ -1579,12 +2465,41 @@ def _compute_position_embeddings(base_model: nn.Module,
                     per_type[lt] = tuple(rotary(hidden, position_ids,
                                                 layer_type=lt))
                 except TypeError:
-                    # Rotary forward doesn't take layer_type (e.g. DSv4 uses
-                    # one rope for all layers) — same embeddings for each.
+                    # Rotary forward doesn't take layer_type — one rope for
+                    # every layer, so the entries are deliberately identical.
                     per_type[lt] = tuple(rotary(hidden, position_ids))
-            return per_type
+            return _rekey_rope_by_attention_type(per_type, base_model, profile)
         cos, sin = rotary(hidden, position_ids)
     return (cos, sin)
+
+
+def _rekey_rope_by_attention_type(per_axis: dict, base_model: nn.Module,
+                                  profile) -> dict:
+    """Re-key a rope-axis dict by attention layer type, via the profile.
+
+    A no-op unless the profile implements `rope_axis_for_layer_type` AND the
+    config lists per-layer attention types — so Gemma3/Gemma4, whose rotary
+    keys already are attention types, pass through untouched."""
+    axis_of = getattr(profile, "rope_axis_for_layer_type", None)
+    if axis_of is None:
+        return per_axis
+    attention_types = getattr(getattr(base_model, "config", None),
+                              "layer_types", None)
+    if not attention_types:
+        return per_axis
+    by_attention_type: dict = {}
+    for attention_type in dict.fromkeys(attention_types):
+        axis = axis_of(attention_type)
+        if axis is None:
+            return per_axis
+        if axis not in per_axis:
+            raise RuntimeError(
+                f"profile mapped attention layer type {attention_type!r} to "
+                f"rope axis {axis!r}, which the rotary does not expose "
+                f"(has {sorted(per_axis)})"
+            )
+        by_attention_type[attention_type] = per_axis[axis]
+    return by_attention_type or per_axis
 
 
 def _make_causal_mask(seqlen: int, device: torch.device, dtype: torch.dtype):
@@ -1593,6 +2508,58 @@ def _make_causal_mask(seqlen: int, device: torch.device, dtype: torch.dtype):
     mask = torch.full((seqlen, seqlen), float("-inf"), device=device, dtype=dtype)
     mask = torch.triu(mask, diagonal=1)
     return mask.unsqueeze(0).unsqueeze(0)
+
+
+def _recurrent_padding_mask(inputs_embeds: torch.Tensor,
+                            attention_mask: torch.Tensor | None):
+    """Recurrent-mask contract for linear-attention/conv hybrid layers.
+
+    Used on EVERY transformers version (deliberately not delegating to
+    ``masking_utils.create_recurrent_attention_mask``): the upstream helper
+    first appears in transformers 5.13, but 5.13.0-5.14.1 ship it with the
+    pre-fix contract — it returns ``None`` whenever
+    ``past_key_values.has_previous_state()``, including a padded multi-token
+    cached continuation (silently corrupting the recurrent state), and has
+    no single-token special case. Only 5.15/current trims-and-keeps the 2D
+    mask for a padded continuation. Helper *presence* is therefore not a
+    usable compatibility gate; implementing the current contract locally is.
+
+    Mirrors the current upstream contract exactly (source: transformers
+    v5.15.0 ``masking_utils.create_recurrent_attention_mask``):
+
+    - ``None`` when the incoming mask is missing or not a 2D padding mask
+      (a custom 4D mask carries no padding signal for the recurrence);
+    - ``None`` for a single-token decode step (a generated token is never
+      padding);
+    - ``None`` for an all-ones mask (un-padded batch — the masking multiply
+      would be a no-op), skipped only outside trace/compile;
+    - otherwise the mask trimmed to the trailing ``inputs_embeds.shape[1]``
+      positions — so a growing cache-continuation mask aligns with the
+      current forward's local sequence — made contiguous.
+    """
+    if attention_mask is None or attention_mask.ndim != 2:
+        return None
+    if inputs_embeds.shape[1] == 1:
+        return None
+    try:
+        from transformers.masking_utils import is_tracing
+        tracing = is_tracing(attention_mask)
+    except Exception:
+        tracing = torch.jit.is_tracing() or isinstance(
+            attention_mask, torch.fx.Proxy)
+    if not tracing and torch.all(attention_mask == 1):
+        return None
+    return attention_mask[:, -inputs_embeds.shape[1]:].contiguous()
+
+
+# Block types a hybrid schedule may declare that consume NO attention mask
+# at all (pure feed-forward blocks). Upstream dispatches masks via
+# ``causal_mask_mapping.get(block_type)``, so these receive ``None`` — e.g.
+# Nemotron-H declares ["linear_attention", "moe", "full_attention", "mlp"].
+# Deliberately an explicit allowlist rather than a "not *_attention"
+# heuristic: anything NOT listed here and not buildable stays absent from
+# the mask dict and fails closed in ``_call_layer``. Extend per family.
+_NON_ATTENTION_BLOCK_TYPES = frozenset({"moe", "mlp"})
 
 
 def _compute_attention_mask(
@@ -1604,14 +2571,54 @@ def _compute_attention_mask(
 ):
     """Return the streaming attention mask for a full forward pass.
 
-    Most models use one full causal mask. Gemma3/Gemma4-style hybrid models
-    declare ``config.layer_types`` with both ``full_attention`` and
-    ``sliding_attention``; those must receive the same per-type mask mapping
-    that HuggingFace's model.forward builds.
+    Most models use one full causal mask. Hybrid models declare
+    ``config.layer_types`` mixing ``full_attention`` with one of:
+
+    - ``sliding_attention`` (Gemma3/Gemma4-style windowed attention) — needs
+      the dense additive mask from HuggingFace's own ``masking_utils``
+      (``create_sliding_window_causal_mask``), same family as
+      ``full_attention``'s ``create_causal_mask``, just windowed.
+    - ``linear_attention`` (Qwen3.5/Qwen3.6 DeltaNet-style recurrent
+      hybrids) — NOT a variant of causal attention at all. The recurrence
+      is already causal by construction; what the layer needs is the
+      recurrent-mask contract of current HuggingFace
+      ``masking_utils.create_recurrent_attention_mask`` (>= 5.15): a 2D
+      ``[batch, local_seq]`` padding mask trimmed to the current forward's
+      sequence, or ``None`` whenever masking would be a no-op (non-2D
+      input, single-token decode, all-ones batch). We always apply the
+      local ``_recurrent_padding_mask`` shim implementing that contract —
+      see its docstring for why the upstream helper is not called even
+      when present (5.13/5.14 ship it with the broken pre-fix contract).
+      Feeding these layers the dense ``[1, 1, T, T]`` causal mask instead
+      — the bug this branch fixes — broadcasts wrongly against
+      ``hidden_states`` inside ``apply_mask_to_padding_states`` and, on
+      transformers >= 5.15 (which removed the padding-mask shape guard),
+      raises a tensor-size mismatch on the last dim (hidden_size vs.
+      seqlen); an un-trimmed growing cache-continuation mask can mismatch
+      the same way, which is why the raw incoming mask is not passed
+      through either.
+
+    Both hybrid kinds return the same ``{layer_type: mask}`` mapping shape;
+    ``_call_layer`` selects the right entry per layer via its
+    ``layer.layer_type``.
     """
     cfg = getattr(base_model, "config", None)
     layer_types = tuple(getattr(cfg, "layer_types", ()) or ())
-    if cfg is None or "sliding_attention" not in layer_types:
+    has_sliding = "sliding_attention" in layer_types
+    # "conv" shares the recurrent-mask contract upstream
+    # (LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING maps both to the recurrent
+    # helper), so both route through _recurrent_padding_mask here.
+    has_linear = "linear_attention" in layer_types
+    has_conv = "conv" in layer_types
+    has_dsa = "deepseek_sparse_attention" in layer_types
+    # A schedule declaring non-attention blocks needs the per-type dict
+    # path even without linear/sliding/conv layers — otherwise the single
+    # dense mask from the early return below would be fed to moe/mlp
+    # blocks too.
+    has_nonattn = any(lt in _NON_ATTENTION_BLOCK_TYPES
+                      for lt in layer_types)
+    if cfg is None or not (has_sliding or has_linear or has_conv
+                           or has_dsa or has_nonattn):
         return _make_causal_mask(hidden.size(1), hidden.device, hidden.dtype)
 
     try:
@@ -1621,7 +2628,8 @@ def _compute_attention_mask(
         )
     except Exception as exc:
         raise RuntimeError(
-            "sliding-window layer_types require transformers masking_utils"
+            "sliding-window/linear-attention layer_types require "
+            "transformers masking_utils"
         ) from exc
 
     mask_kwargs = {
@@ -1632,7 +2640,7 @@ def _compute_attention_mask(
         "position_ids": position_ids,
     }
     sliding_mask_kwargs = dict(mask_kwargs)
-    if getattr(cfg, "use_bidirectional_attention", False):
+    if has_sliding and getattr(cfg, "use_bidirectional_attention", False):
         try:
             from transformers.models.gemma3.modeling_gemma3 import (
                 _bidirectional_window_overlay,
@@ -1649,23 +2657,78 @@ def _compute_attention_mask(
             cfg.sliding_window
         )
 
-    masks = {
-        "full_attention": create_causal_mask(**mask_kwargs),
-        "sliding_attention": create_sliding_window_causal_mask(
+    masks = {"full_attention": create_causal_mask(**mask_kwargs)}
+
+    if has_sliding:
+        masks["sliding_attention"] = create_sliding_window_causal_mask(
             **sliding_mask_kwargs
-        ),
-    }
-    # DSv4-Flash: the compress-ratio ladder yields layer types beyond the
-    # Gemma pair — compressed_sparse_attention (ratio 4) and
-    # heavily_compressed_attention (ratio 128). In probe mode every
-    # compressed variant degrades to sliding-window-only attention (the
-    # vendored layer stubs out the compressor and skips the long-range
-    # branch), and the vendored root feeds one sliding-window mask to all
-    # layers. Alias exactly those two types to the sliding mask; any
-    # other unknown layer type still fails loudly downstream.
-    for lt in ("compressed_sparse_attention", "heavily_compressed_attention"):
-        if lt in layer_types and lt not in masks:
-            masks[lt] = masks["sliding_attention"]
+        )
+        # DSv4-Flash: the compress-ratio ladder yields layer types beyond
+        # the Gemma pair — compressed_sparse_attention (ratio 4) and
+        # heavily_compressed_attention (ratio 128). In probe mode every
+        # compressed variant degrades to sliding-window-only attention
+        # (the vendored layer stubs out the compressor and skips the
+        # long-range branch), and the vendored root feeds one
+        # sliding-window mask to all layers. Alias exactly those two types
+        # to the sliding mask; any other unknown layer type still fails
+        # loudly downstream.
+        for lt in ("compressed_sparse_attention", "heavily_compressed_attention"):
+            if lt in layer_types and lt not in masks:
+                masks[lt] = masks["sliding_attention"]
+
+    if has_linear or has_conv:
+        # DeltaNet/Mamba-style recurrent layers must never receive a dense
+        # additive mask — route them through the recurrent-mask contract
+        # (see _recurrent_padding_mask on why this is always the local
+        # shim, never the upstream helper).
+        recurrent = _recurrent_padding_mask(hidden, attention_mask)
+        if has_linear:
+            masks["linear_attention"] = recurrent
+        if has_conv:
+            masks["conv"] = recurrent
+
+    if has_dsa:
+        # DeepSeek-style sparse attention (glm5_next / GLM-5.3-Flash): the
+        # DSA indexer consumes a 2D BOOLEAN PADDING mask `[B, S]` and
+        # applies causality and padding exclusion itself — a dense additive
+        # `[1, 1, T, T]` causal mask is a semantic and shape error here, not
+        # a conservative default. Nor is the mask optional: the indexer
+        # dereferences it unconditionally, so upstream substitutes an
+        # all-ones bool mask whenever the recurrent helper yields None,
+        # explicitly to "Guarantee the mask to exist for the indexer".
+        #
+        # Source: transformers 5.16.1
+        # `models/glm5_next/modeling_glm5_next.py`
+        #   :1456-1474  create_recurrent_attention_mask(...), the all-ones
+        #               substitution, `.bool()`, and the mapping that hands
+        #               the SAME object to `deepseek_sparse_attention` and
+        #               `linear_attention`
+        #   Glm5NextTextIndexer.forward  "attention_mask: Local boolean
+        #               padding mask of shape `[B, S]`"
+        #   Glm5NextTextAttention.build_attention_mask_from_topk  "The
+        #               indexer already took care of also excluding padding
+        #               tokens and causality"
+        #
+        # `linear_attention` deliberately keeps the recurrent shim below
+        # rather than sharing this object: that layer type consumes the mask
+        # only through `apply_mask_to_padding_states`, for which an all-ones
+        # mask and None are the same multiply, and collapsing it to None is
+        # the contract every other hybrid family in this tree already gets.
+        dsa_mask = _recurrent_padding_mask(hidden, attention_mask)
+        if dsa_mask is None:
+            dsa_mask = torch.ones(
+                hidden.shape[0], hidden.shape[1],
+                dtype=torch.bool, device=hidden.device,
+            )
+        masks["deepseek_sparse_attention"] = dsa_mask.bool()
+
+    # Declared non-attention blocks (moe/mlp) receive None, mirroring
+    # upstream's `.get(block_type)` dispatch. Any OTHER declared type we
+    # cannot build stays absent and fails closed in _call_layer.
+    for lt in layer_types:
+        if lt in _NON_ATTENTION_BLOCK_TYPES and lt not in masks:
+            masks[lt] = None
+
     return masks
 
 
@@ -1696,12 +2759,19 @@ def _head_prefixes(root: nn.Module, base_prefix: str) -> list[str]:
     # Profile-driven extension (refactor #32). Default profile returns
     # an empty list; architecture-specific profiles append their own
     # head-resident prefixes here.
+    from .model_profiles import DeadVendoredOverrideError, profile_from_model
     try:
-        from .model_profiles import profile_from_model
         extra = profile_from_model(root).head_resident_extra_prefixes(root)
         for pref in extra:
             if pref not in prefixes:
                 prefixes.append(pref)
+    except DeadVendoredOverrideError:
+        # The legacy fallback below only knows `hc_head`. On a dead override
+        # it would silently drop the head-resident prefixes a live profile
+        # declares (LFM2.5's `embedding_norm`/`pos_emb`), leaving those
+        # modules streamed instead of resident -- a wrong residency plan
+        # derived from a hardcoded guess about one architecture (#202).
+        raise
     except Exception:
         # Defensive: fall back to the legacy hardcoded check if the
         # profile import path is unavailable for any reason.

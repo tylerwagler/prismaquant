@@ -1,0 +1,185 @@
+# PrismaQuant CI — run the test suite on every push and pull request.
+#
+# WHY THIS EXISTS: five substantial pull requests (#13-#17) sat open for eleven
+# days with nothing to run them, while `main` itself carried three failing
+# doc-staleness tests that the project had deliberately written to catch exactly
+# that kind of drift. Nobody was ignoring a red signal — there was no signal.
+#
+# WHAT IT CAN AND CANNOT COVER. Re-measured 2026-09-05 ON THE RUNNER, which is
+# the number that matters here: the suite is ~4840 tests (4698 passed, 136
+# skipped, 3 xfailed at `main` 8a77b0ad) and the `tests` JOB — install plus
+# suite, which is what `timeout-minutes` bounds — took 15 to 29.5 min across
+# the ten completed runs of 2026-09-05 (job 33973973959 finished at 29m30s
+# against the then 30 min limit; hosted-runner speed is the variable, not
+# the suite). The previous note here, measured 2026-08-03, said ~2762 tests
+# in 10.5-14 min with a ~2x margin and that a further doubling of the suite
+# "should raise `timeout-minutes` in the same PR"; the suite has since grown
+# 1.75x, so this is that PR: 60 min gives ~2x on the worst observed job. A
+# job that reaches the limit is a timeout, not a slow build — re-measure and
+# raise it here again rather than retrying. The skips are the CUDA-gated
+# tests. GitHub-hosted runners have no GPU, so
+# kernel numerics, real-checkpoint streaming and anything touching a served
+# artifact remain a manual gate on the Spark — this is a correctness net for
+# the allocator/solver/footprint/profile logic, which is where the PRs live and
+# where a silent regression is hardest to notice.
+#
+# Action pins are exact patch tags, not floating major refs: a re-pointable ref
+# is a supply-chain surface, and CI runs on every contributor's branch.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to a PR makes the first run's result irrelevant.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (py${{ matrix.python }}, cpu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 only. The reference box runs 3.12 and nothing else is
+        # exercised anywhere; requires-python is >=3.12 to match. Dropped 3.11
+        # on 2026-08-29 (Rob: "I don't care if we don't support python 3.11").
+        # NOTE: 3.11 was not failing on an interpreter incompatibility -- it
+        # stood in for heap/allocation order. The dsa_only NaN it exposed was a
+        # real latent defect (the transformers polyfill left from-config expert
+        # weights uninitialized) and was fixed on its own merits in #94 BEFORE
+        # this job was removed. 3.12 can surface that class of bug just as
+        # easily, so narrowing the matrix hides nothing.
+        # Widen only when a version is actually exercised somewhere.
+        python: ["3.12"]
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      # Resolve the compatibility pin without importing prismaquant: its
+      # package surface is exactly what this job has not installed yet.
+      - name: Resolve Tessera development pin
+        id: tessera-pin
+        run: |
+          tessera_commit="$(python tools/resolve_tessera_dev_pin.py)"
+          printf 'commit=%s\n' "$tessera_commit" >> "$GITHUB_OUTPUT"
+
+      # RobTand/tessera has been public since 2026-09-05, so the ordinary
+      # checkout credential fetches the pin here, for fork PRs as much as for
+      # branches (first receipt: run 33950707718 on main, both jobs green
+      # end-to-end; #175). No private credential is required or exposed by
+      # this workflow, and none should be added: a repository secret is a
+      # cross-repo credential the issue deliberately avoided, and it would not
+      # reach fork PRs anyway.
+      - name: Check out pinned Tessera
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: RobTand/tessera
+          ref: ${{ steps.tessera-pin.outputs.commit }}
+          persist-credentials: false
+          path: .ci/tessera
+
+      - name: Install pinned Tessera
+        run: python -m pip install --no-deps .ci/tessera
+
+      # CPU torch explicitly: the default PyPI wheel drags a full CUDA stack
+      # (~2.5 GB of runner disk and minutes of download) that no test here can
+      # use. Installed first so the project's own `torch>=2.6` is satisfied and
+      # pip does not go looking for the CUDA build.
+      - name: Install CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install prismaquant + test extras
+        run: python -m pip install -e '.[test]'
+
+      # CUDA_VISIBLE_DEVICES is belt-and-braces: hosted runners have no GPU, but
+      # this makes a local reproduction of a CI failure one env var away, and
+      # keeps the skip set identical between here and a developer's box.
+      - name: Run tests
+        env:
+          PYTHONPATH: .
+          CUDA_VISIBLE_DEVICES: ""
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          NUMEXPR_NUM_THREADS: "1"
+          TORCHINDUCTOR_COMPILE_THREADS: "1"
+          MAX_JOBS: "1"
+        run: |
+          # Keep one native thread per worker and leave 1 GiB for the runner.
+          # The 2 GiB worker budget bounds collection plus numerical fixtures.
+          workers="$(python - <<'PY'
+          import os
+          from pathlib import Path
+          memory = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+          available = int(memory["MemAvailable"].split()[0]) * 1024
+          budget = max(1, (available - 1024**3) // (2 * 1024**3))
+          print(min(len(os.sched_getaffinity(0)), budget))
+          PY
+          )"
+          echo "pytest workers=$workers (CPU affinity and available-memory bound)"
+          python -m pytest -c pytest.ini tests/ -q --timeout=300 \
+            -n "$workers" --dist worksteal --durations=30 -ra -p no:cacheprovider
+
+  # Import hygiene: catches a module that only imports because the reference box
+  # happens to have vLLM, a CUDA extension, or a stray sys.path entry. Cheap, and
+  # it fails in a way that names the offending module.
+  imports:
+    name: import surface
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Resolve Tessera development pin
+        id: tessera-pin
+        run: |
+          tessera_commit="$(python tools/resolve_tessera_dev_pin.py)"
+          printf 'commit=%s\n' "$tessera_commit" >> "$GITHUB_OUTPUT"
+      - name: Check out pinned Tessera
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: RobTand/tessera
+          ref: ${{ steps.tessera-pin.outputs.commit }}
+          persist-credentials: false
+          path: .ci/tessera
+      - name: Install pinned Tessera
+        run: python -m pip install --no-deps .ci/tessera
+      - name: Install CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install prismaquant
+        run: python -m pip install -e .
+      - name: Import the package entry points
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+        run: |
+          python -c "import prismaquant; print('prismaquant ok')"
+          python -m prismaquant.allocator --help > /dev/null && echo "allocator CLI ok"
+
+  # The pinned-Gridbook cross-project compatibility job lived here until
+  # 2026-09-02. It installed the external codebook runtime from its immutable
+  # pin and compared that runtime's packaged contract against PrismaQuant's
+  # independent producer layout. The lane is retired
+  # (archive/gridbook_lane_2026-09-02/) and the job went with it; the Tessera
+  # lane's equivalent is producer-side, against the installed `tessera`
+  # distribution's own runtime_contract.json.

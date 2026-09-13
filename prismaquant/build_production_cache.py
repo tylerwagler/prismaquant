@@ -49,11 +49,91 @@ from prismaquant.calibration_data import (
 )
 from prismaquant.gpu_guard import require_cuda_hot_path
 from prismaquant.model_profiles import detect_profile_with_warning
+from prismaquant.mtp_production_cache import (
+    fill_profile_mtp_production_cache,
+)
+from prismaquant.perturbed_x_cache import calibration_data_hash
 from prismaquant.production_recache import _load_assignment
 from prismaquant.production_weight_cache import (
     fill_production_weight_cache,
 )
 from prismaquant.sensitivity_probe import load_calibration
+
+
+def _load_col_weights(path, formats) -> dict | None:
+    """Load the imatrix pickle for a weighted-family render (re-vet R3).
+
+    Refuses the two ways this can silently produce a confounded cache: a menu
+    that contains a weighted-render family with no vector (the render would be
+    unweighted while the exporter ships weighted bytes), and a vector supplied
+    for a menu that has no weighted family at all (nothing would consume it, so
+    the operator's intent is not what happened).
+    """
+    import pickle
+
+    import torch
+
+    from prismaquant.production_weight_cache import _weighted_render_family
+
+    weighted = sorted({
+        fmt for fmt in formats if _weighted_render_family(fmt) is not None
+    })
+    if not path:
+        if weighted:
+            raise SystemExit(
+                "[build-prod-cache] ERROR: the format menu contains "
+                f"weighted-render formats {weighted} but no --col-weights was "
+                "supplied. Their exporters ALWAYS render imatrix-weighted, so "
+                "an unweighted cache render is not the bytes that ship (the "
+                "rendering confound). Pass --col-weights "
+                "<work>/artifacts/cb_col_weights.pkl."
+            )
+        return None
+    if not weighted:
+        raise SystemExit(
+            "[build-prod-cache] ERROR: --col-weights was supplied but the "
+            f"format menu {sorted(set(formats))} has no weighted-render "
+            "family (CB / GGUF); nothing would consume the vector and every "
+            "render would be byte-identical without it. Drop the flag."
+        )
+    with open(path, "rb") as fh:
+        raw = pickle.load(fh)
+    loaded = {str(k): torch.as_tensor(v) for k, v in raw.items()}
+    print(
+        f"[build-prod-cache] col-weights: {len(loaded)} entries from {path} "
+        f"(weighted-render formats in menu: {weighted})",
+        flush=True,
+    )
+    return loaded
+
+
+def _explicit_cb_render_context(formats):
+    """Resolve CB producer settings once, at the CLI boundary.
+
+    Library render/cache code receives the resulting object explicitly and
+    therefore cannot reinterpret a stored cache under a later environment.
+    """
+    from prismaquant.nvfp4_cb_footprint import (
+        cb_serialization_context_from_env,
+        is_cb_format,
+    )
+
+    cb_formats = sorted({str(fmt) for fmt in formats if is_cb_format(str(fmt))})
+    if not cb_formats:
+        return None
+    if "PRISMAQUANT_CB_MINCHAIN" not in os.environ:
+        raise SystemExit(
+            "[build-prod-cache] ERROR: ProductionWeightCache producer: "
+            "missing explicit CB producer setting "
+            "['PRISMAQUANT_CB_MINCHAIN']"
+        )
+    try:
+        return cb_serialization_context_from_env(
+            require_explicit=True,
+            where="ProductionWeightCache producer",
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[build-prod-cache] ERROR: {exc}") from exc
 
 
 def _model_has_packed_experts(model: nn.Module, profile) -> bool:
@@ -156,6 +236,21 @@ def validate_render_assignment_cache_coverage(cache, render_assignment) -> None:
         )
 
 
+def _filter_assignment_to_include_qnames(
+    render_assignment,
+    include_qnames: Sequence[str] | None,
+) -> dict[str, str]:
+    """Project assignment coverage onto the exact rendered stripe."""
+    if include_qnames is None:
+        return dict(render_assignment or {})
+    allowed = {str(qname) for qname in include_qnames}
+    return {
+        str(qname): fmt
+        for qname, fmt in (render_assignment or {}).items()
+        if str(qname) in allowed
+    }
+
+
 def _load_cache_calibration(tokenizer, args) -> torch.Tensor:
     if args.dataset:
         return load_calibration(
@@ -184,20 +279,17 @@ def _run_streaming(args, formats, levers, dtype) -> int:
     from prismaquant.streaming_production_cache import (
         fill_production_weight_cache_streaming,
     )
+    format_plan = None
+    if args.format_plan:
+        from prismaquant.source_class_format_plan import load_format_plan
 
-    if args.render_scope != "assignment":
-        print(
-            "[build-prod-cache] FAIL: --streaming requires "
-            "--render-scope assignment (streaming a full format menu is out "
-            "of scope)",
-            flush=True,
-        )
-        return 2
+        format_plan = load_format_plan(args.format_plan)
+
     layer_config = args.render_layer_config or args.recache_layer_config
-    if not layer_config:
+    if args.render_scope == "assignment" and not layer_config:
         print(
             "[build-prod-cache] FAIL: --streaming requires "
-            "--render-layer-config",
+            "--render-layer-config for --render-scope assignment",
             flush=True,
         )
         return 2
@@ -221,16 +313,63 @@ def _run_streaming(args, formats, levers, dtype) -> int:
     device = require_cuda_hot_path("build_production_cache")
     print(f"[build-prod-cache] streaming device={device}", flush=True)
 
-    render_assignment = _load_assignment(layer_config)
-    non_bf16 = sum(
-        1 for fmt in render_assignment.values()
-        if str(fmt).strip().upper() != "BF16"
+    render_assignment = (
+        _load_assignment(layer_config)
+        if args.render_scope == "assignment" else None
     )
-    print(
-        f"[build-prod-cache] streaming assignment render scope: "
-        f"{non_bf16} non-BF16 entries from {layer_config}",
-        flush=True,
+    if render_assignment is not None:
+        non_bf16 = sum(
+            1 for fmt in render_assignment.values()
+            if str(fmt).strip().upper() != "BF16"
+        )
+        print(
+            f"[build-prod-cache] streaming assignment render scope: "
+            f"{non_bf16} non-BF16 entries from {layer_config}",
+            flush=True,
+        )
+    else:
+        print(
+            "[build-prod-cache] streaming full format menu: every eligible "
+            f"Linear x {len(formats)} requested formats; renders are consumed "
+            "synchronously and discarded",
+            flush=True,
+        )
+    render_formats = list(formats)
+    if render_assignment is not None:
+        render_formats.extend(render_assignment.values())
+    col_weights = _load_col_weights(args.col_weights, render_formats)
+    cb_serialization_context = _explicit_cb_render_context(render_formats)
+
+    # Streaming consumes a probe activation cache instead of replaying the
+    # calibration forward, but its pair stamps still bind the exact token
+    # corpus. Tokenization is cheap and ensures selected-assignment rerender
+    # cannot silently use a different calibration contract.
+    from transformers import AutoTokenizer
+
+    local_only = Path(args.model).exists()
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        trust_remote_code=True,
+        local_files_only=local_only,
     )
+    calib_ids = _load_cache_calibration(tokenizer, args)
+    calib_hash = calibration_data_hash(calib_ids)
+
+    include_qnames = None
+    if args.include_qnames_file:
+        include_path = Path(args.include_qnames_file)
+        include_qnames = [
+            line.strip()
+            for line in include_path.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if not include_qnames:
+            print(
+                "[build-prod-cache] FAIL: --include-qnames-file contains no "
+                "qnames",
+                flush=True,
+            )
+            return 2
 
     skip_tokens = (
         list(args.skip_qnames) if args.skip_qnames is not None else None
@@ -249,11 +388,64 @@ def _run_streaming(args, formats, levers, dtype) -> int:
         expert_render_mode=args.expert_render_mode,
         expert_module_token_budget=args.expert_token_budget,
         h_detail_dir=args.h_detail_dir,
+        col_weights=col_weights,
+        cb_serialization_context=cb_serialization_context,
+        render_scope=args.render_scope,
+        retain_rendered=(args.render_scope == "assignment"),
+        calibration_hash=calib_hash,
+        resume=args.resume,
+        max_act_rows=args.max_act_rows,
+        include_qnames=include_qnames,
+        format_plan=(
+            format_plan.formats_by_qname()
+            if format_plan is not None else None
+        ),
+        format_plan_identity=(
+            format_plan.identity_sha256
+            if format_plan is not None else None
+        ),
     )
+    if render_assignment is not None:
+        profile = detect_profile_with_warning(
+            args.model,
+            entrypoint="build-prod-cache/mtp",
+        )
+        fill_profile_mtp_production_cache(
+            cache,
+            args.model,
+            profile=profile,
+            activation_cache_dir=args.activation_cache_dir,
+            formats=formats,
+            render_assignment=render_assignment,
+            cache_dir=args.cache_dir,
+            device=device,
+            dtype=dtype,
+            max_act_rows=args.max_act_rows,
+            h_detail_dir=args.h_detail_dir,
+            include_qnames=include_qnames,
+            col_weights=col_weights,
+            cb_serialization_context=cb_serialization_context,
+        )
     elapsed = time.monotonic() - t0
 
     try:
-        validate_render_assignment_cache_coverage(cache, render_assignment)
+        if render_assignment is not None:
+            coverage_assignment = _filter_assignment_to_include_qnames(
+                render_assignment, include_qnames,
+            )
+            validate_render_assignment_cache_coverage(
+                cache, coverage_assignment,
+            )
+        else:
+            artifacts = cache.metadata.get("transient_render_artifacts", {})
+            expected = int(cache.metadata.get("requested_entries", -1))
+            observed = int(artifacts.get("entries", -2))
+            if observed != expected or cache.failed:
+                raise RuntimeError(
+                    "streamed format-menu consumption coverage failure: "
+                    f"expected={expected} consumed={observed} "
+                    f"failed={len(cache.failed)}"
+                )
         print("[build-prod-cache] coverage check passed", flush=True)
     except RuntimeError as e:
         if args.allow_incomplete:
@@ -297,6 +489,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Comma-separated formats to render. FP8_DYNAMIC is accepted "
         "as an alias for FP8_E4M3 and uses GPTQ damp-sweep. MXFP8/E5M2 "
         "are explicit opt-in research/legacy formats.",
+    )
+    p.add_argument(
+        "--format-plan",
+        default=None,
+        help="Identity-bound source-class format plan. Streaming format-menu "
+        "renders intersect the requested family with each qname's exact "
+        "legal menu; assignment scope refuses an illegal planned cell.",
     )
     p.add_argument(
         "--render-scope",
@@ -481,19 +680,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Render one decoder layer at a time on top of the streaming "
         "model (no whole-model from_pretrained) so 100B+ / 295B checkpoints "
-        "fit on a 121 GB box. Requires --render-scope assignment, "
-        "--render-layer-config, --cache-dir, and --activation-cache-dir "
-        "(the probe's per-Linear activation cache; no calibration forward "
-        "runs in this mode).",
+        "fit on a 121 GB box. Assignment scope retains only the selected "
+        "weights. Format-menu scope is CB-only: it renders and synchronously "
+        "scores the complete menu, persists identity-bound scalar receipts, "
+        "and discards every rendered tensor. Requires --cache-dir and "
+        "--activation-cache-dir; assignment scope additionally requires "
+        "--render-layer-config.",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a streaming CB build only from exact per-pair identity "
+        "sidecars in --cache-dir. Transient menu receipts and retained "
+        "assignment shards are both validated fail-closed.",
     )
     p.add_argument(
         "--activation-cache-dir",
         default=None,
-        help="Probe activation cache directory (streaming mode). Supplies the "
-        "per-Linear and per-experts-module input rows that the render passes "
-        "consume in place of a fresh calibration forward.",
+        help="Probe activation cache directory. Streaming body renders consume "
+        "its per-Linear and per-experts-module rows in place of a fresh "
+        "calibration forward. Resident format-menu builds also use its MTP "
+        "rows to append profile-synthesized mtp.* Linears; an explicit "
+        "non-BF16 mtp.* assignment requires it.",
+    )
+    p.add_argument(
+        "--col-weights",
+        default=None,
+        help="Per-input-column imatrix pickle ({qname: tensor}, e.g. "
+        "artifacts/cb_col_weights.pkl) applied to the weighted-render "
+        "families ONLY (CB codebook rungs, GGUF k-quants) — re-vet R3 / CB "
+        "Milestone C. Their exporters always render weighted, so without this "
+        "a cached-menu render of those formats is unfaithful to the shipped "
+        "bytes (the rendering confound the lane gates were written to avoid). "
+        "NVFP4/FP8/MX/BF16 renders are bit-identical with or without it.",
     )
     args = p.parse_args(argv)
+    if args.format_plan and not args.streaming:
+        p.error("--format-plan requires --streaming")
 
     # Opt-in deterministic CUDA path. The default lever ablations on small
     # models show ~2-4% per-Linear weight variance across re-runs of the
@@ -608,6 +831,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{skipped if len(skipped) <= 5 else skipped[:5] + ['...']}",
                 flush=True,
             )
+        include_qnames = None
+        render_only: list[str] | None = None
         if args.include_qnames_file:
             include_path = Path(args.include_qnames_file)
             allowed = {
@@ -615,11 +840,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for line in include_path.read_text().splitlines()
                 if line.strip() and not line.lstrip().startswith("#")
             }
-            before = len(qnames)
-            qnames = [q for q in qnames if q in allowed]
+            # #130: this narrows the RENDER, never the enumeration handed to
+            # fill_production_weight_cache. That enumeration is the activation
+            # collector's hook set, and one shared priority generator feeds
+            # every hooked Linear's reservoir, so shortening it changes the
+            # rows -- and the GPTQ Hessian, and the bytes. A stripe rendered
+            # off a narrowed enumeration is a different artifact wearing the
+            # unstriped build's name.
+            render_only = [q for q in qnames if q in allowed]
+            include_qnames = sorted(allowed)
             print(
                 f"[build-prod-cache] include-qnames-file={include_path} "
-                f"kept {len(qnames)}/{before} qnames",
+                f"renders {len(render_only)}/{len(qnames)} qnames "
+                f"(all {len(qnames)} stay hooked for row identity)",
                 flush=True,
             )
 
@@ -647,11 +880,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{non_bf16} non-BF16 entries from {layer_config}",
                 flush=True,
             )
+        render_formats = list(formats) + list(
+            (render_assignment or {}).values()
+        ) + list(
+            (recache_assignment or {}).values()
+        )
+        col_weights = _load_col_weights(args.col_weights, render_formats)
+        cb_serialization_context = _explicit_cb_render_context(render_formats)
         t0 = time.monotonic()
         cache = fill_production_weight_cache(
             model, calib_ids, qnames,
             formats=formats,
             render_assignment=render_assignment,
+            render_qnames=render_only,
             levers=levers,
             max_act_rows=args.max_act_rows,
             cache_dir=args.cache_dir,
@@ -661,6 +902,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             recache_include_activation_quant=not args.no_recache_activation_quant,
             recache_microbatch_size=args.recache_microbatch_size,
             h_detail_dir=args.h_detail_dir,
+            col_weights=col_weights,
+            cb_serialization_context=cb_serialization_context,
+        )
+        # R14: stamp the calibration identity onto the cache so every artifact
+        # derived from it (production_render_cost's cost table) can be checked
+        # for disjointness against the selection split, instead of that
+        # guarantee resting on the driver passing the right flag.
+        if cache.metadata is None:
+            cache.metadata = {}
+        cache.metadata["calib_hash"] = calibration_data_hash(calib_ids)
+        # Transformers suppresses the Qwen MTP sidecar, so it is absent from
+        # the resident CausalLM graph above. Synthesize the profile module and
+        # append its exact production renders from the probe's existing MTP
+        # activation rows. Concrete non-BF16 MTP assignments fail closed when
+        # any module/source/row/cache pair is missing; body-only legacy menu
+        # builds remain unchanged when no activation cache was supplied.
+        fill_profile_mtp_production_cache(
+            cache,
+            args.model,
+            profile=profile,
+            activation_cache_dir=args.activation_cache_dir,
+            formats=formats,
+            render_assignment=(render_assignment or recache_assignment),
+            cache_dir=args.cache_dir,
+            device=device,
+            dtype=dtype,
+            max_act_rows=args.max_act_rows,
+            h_detail_dir=args.h_detail_dir,
+            include_qnames=include_qnames,
+            col_weights=col_weights,
+            cb_serialization_context=cb_serialization_context,
         )
         # Render packed-MoE experts through the SAME deliberate path. They are
         # 3-D packed tensors, not nn.Linear, so fill_production_weight_cache
@@ -692,6 +964,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 render_mode=args.expert_render_mode,
                 gate_calib_ids=gate_calib_ids,
                 gate_token_budget=args.expert_gate_token_budget,
+                col_weights=col_weights,
+                cb_serialization_context=cb_serialization_context,
             )
             if expert_coverage:
                 if cache.metadata is None:
@@ -723,10 +997,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         # through to RTN at hook time.
         try:
             if render_assignment is not None:
+                coverage_assignment = _filter_assignment_to_include_qnames(
+                    render_assignment, include_qnames,
+                )
                 validate_render_assignment_cache_coverage(
-                    cache, render_assignment)
+                    cache, coverage_assignment)
             else:
-                cache.validate_coverage(qnames, formats)
+                # #130: `qnames` is the hooked enumeration; coverage is owed
+                # only over what this call was asked to RENDER.
+                cache.validate_coverage(
+                    render_only if render_only is not None else qnames,
+                    formats,
+                )
             print("[build-prod-cache] coverage check passed", flush=True)
         except RuntimeError as e:
             if args.allow_incomplete:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -11,7 +12,6 @@ from prismaquant.model_profiles.gemma4 import Gemma4Profile
 from prismaquant.model_profiles.qwen3 import Qwen3Profile
 from prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
 from prismaquant.model_profiles.qwen3_5_dense import Qwen3_5DenseProfile
-from prismaquant.model_profiles.qwen3_moe import Qwen3MoeProfile
 from prismaquant.model_profiles.registry import profile_from_config
 from prismaquant.model_profiles.structure import (
     ModelStructureSpec,
@@ -154,9 +154,14 @@ def test_qwen_structure_spec_matches_profile_naming():
     assert spec.rewrite_recipe_to_vllm("mtp.layers.0.mlp.gate_proj") == (
         "mtp.layers.0.mlp.gate_proj"
     )
+    # Both source layouts are real for this family: a staged text-only
+    # checkpoint keeps its wrapper-named index (`language_model.model.`) even
+    # when its config declares the native causal class (`model.`), so the
+    # regex must match either. `specs/qwen3_5.json` `moe.per_expert_regex` is
+    # the declared form; this literal is the independent check on it.
     assert profile.per_expert_moe_regex() == (
-        r"re:^language_model[.]model[.]layers[.][0-9]+[.]mlp[.]experts"
-        r"[.][0-9]+[.](gate|up|down)_proj$"
+        r"re:^(?:model|language_model[.]model)[.]layers[.][0-9]+[.]mlp"
+        r"[.]experts[.][0-9]+[.](gate|up|down)_proj$"
     )
     assert profile.per_expert_mtp_regex() == (
         r"re:^mtp[.]layers[.][0-9]+[.]mlp[.]experts[.][0-9]+"
@@ -239,7 +244,7 @@ def test_qwen_graph_exposes_fused_sibling_optimization_units():
     assert down.scope == "tensor"
 
 
-def test_qwen3_dense_and_moe_profiles_are_config_backed():
+def test_qwen3_dense_and_moe_configs_share_contract_profile():
     dense = profile_from_config({
         "model_type": "qwen3",
         "architectures": ["Qwen3ForCausalLM"],
@@ -250,13 +255,17 @@ def test_qwen3_dense_and_moe_profiles_are_config_backed():
     })
 
     assert isinstance(dense, Qwen3Profile)
-    assert not isinstance(dense, Qwen3MoeProfile)
-    assert isinstance(moe, Qwen3MoeProfile)
+    assert isinstance(moe, Qwen3Profile)
     assert dense.structure_spec().id == "qwen3"
-    assert moe.structure_spec().id == "qwen3_moe"
+    assert moe.structure_spec().id == "qwen3"
     assert dense.serving_profile_id() == "vllm_packed_moe"
     assert moe.serving_profile_id() == "vllm_packed_moe"
-    assert dense.packed_expert_param_names() == frozenset()
+    # Family-wide declarations are inert on dense modules, which have no 3-D
+    # packed expert Parameters.
+    assert dense.packed_expert_param_names() == frozenset({
+        "gate_up_proj",
+        "down_proj",
+    })
     assert moe.packed_expert_param_names() == frozenset({
         "gate_up_proj",
         "down_proj",
@@ -309,7 +318,7 @@ def test_qwen3_dense_graph_marks_linears_and_fused_groups():
 
 
 def test_qwen3_moe_graph_marks_packed_experts_without_multimodal_rewrite():
-    graph = Qwen3MoeProfile().build_model_graph(_Qwen3MoeToy())
+    graph = Qwen3Profile().build_model_graph(_Qwen3MoeToy())
     by_recipe = graph.by_recipe_name()
 
     packed = by_recipe["model.layers.0.mlp.experts.gate_up_proj"]
@@ -340,13 +349,11 @@ def test_probe_packed_expert_detection_respects_profile_spec():
 
     experts = _PackedExperts()
 
-    assert _is_packed_experts_module(experts, Qwen3MoeProfile()) is True
-    assert _packed_experts_param_names(experts, Qwen3MoeProfile()) == [
+    assert _is_packed_experts_module(experts, Qwen3Profile()) is True
+    assert _packed_experts_param_names(experts, Qwen3Profile()) == [
         "down_proj",
         "gate_up_proj",
     ]
-    assert _is_packed_experts_module(experts, Qwen3Profile()) is False
-    assert _packed_experts_param_names(experts, Qwen3Profile()) == []
 
 
 def test_packed_expert_format_group_uses_declared_projection_splits():
@@ -397,19 +404,36 @@ def test_qwen35_dense_profile_uses_dense_structure_spec():
     assert profile.serving_profile_id() == "vllm_packed_moe"
     assert profile.packed_expert_param_names() == frozenset()
     assert profile.per_expert_moe_regex() is None
+    # `*ForCausalLM` is the TEXT-ONLY class, which vLLM builds under `model.`
+    # — this assertion used to read `language_model.model.…` because the spec
+    # had a single naming block written for the multimodal wrapper. The
+    # declared architecture decides; see tests/test_qwen3_5_text_only_namespace.py.
     assert profile.to_vllm_internal_name("model.layers.0.mlp.gate_proj") == (
+        "model.layers.0.mlp.gate_proj"
+    )
+
+    wrapper = profile_from_config({
+        "model_type": "qwen3_5",
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+    })
+    assert wrapper.structure_spec().id == "qwen3_5_dense"
+    assert wrapper.to_vllm_internal_name("model.layers.0.mlp.gate_proj") == (
         "language_model.model.layers.0.mlp.gate_proj"
     )
 
 
 def test_qwen36_model_type_aliases_route_dense_and_moe_profiles():
+    # The subject here is model_type alias routing, which is orthogonal to
+    # namespace selection -- so declare a real architecture. A *declared*
+    # config with no architecture is refused on purpose (it is not evidence
+    # for either namespace); that refusal is asserted separately below.
     dense = profile_from_config({
         "model_type": "qwen3_6",
-        "architectures": [],
+        "architectures": ["Qwen3_6ForCausalLM"],
     })
     moe = profile_from_config({
         "model_type": "qwen3_6_moe",
-        "architectures": [],
+        "architectures": ["Qwen3_6MoeForConditionalGeneration"],
     })
 
     assert isinstance(dense, Qwen3_5DenseProfile)
@@ -417,6 +441,16 @@ def test_qwen36_model_type_aliases_route_dense_and_moe_profiles():
     assert isinstance(moe, Qwen3_5Profile)
     assert not isinstance(moe, Qwen3_5DenseProfile)
     assert moe.structure_spec().id == "qwen3_5"
+
+    # Fail closed rather than inheriting the historical wrapper mapping: an
+    # alias-routed MoE config that declares no architecture cannot say whether
+    # its tensors are `model.` or `language_model.model.`.
+    ambiguous = profile_from_config({
+        "model_type": "qwen3_6_moe",
+        "architectures": [],
+    })
+    with pytest.raises(RuntimeError, match="declares no architecture"):
+        ambiguous.structure_spec()
 
 
 def test_gemma_structure_collapses_live_moe_and_injects_vllm_moe_prefix():

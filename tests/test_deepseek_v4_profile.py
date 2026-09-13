@@ -43,7 +43,13 @@ def test_packed_expert_param_names(profile):
 
 
 def test_source_passthrough_prefixes_are_spec_backed(profile):
+    # `mtp.` covers the nextn block. DSv4 takes the hy_v3 route until its
+    # MTP is actually quantized: `has_mtp() -> False` (so probe/cost/
+    # allocator never see it, and `checkpoint_to_live_name` drops the
+    # keys) + verbatim passthrough here so vLLM's nextn spec decode still
+    # loads. Audit R12, 2026-07-30.
     assert profile.source_passthrough_prefixes() == (
+        "mtp.",
         "attn_sink",
         "hc_",
         "compressor.ape",
@@ -54,18 +60,24 @@ def test_source_passthrough_prefixes_are_spec_backed(profile):
     )
 
 
-def test_probe_skip_linear_class_names_are_spec_backed(profile):
+def test_probe_skip_and_grouped_class_declarations_are_spec_backed(profile):
     DeepseekV4GroupedLinear = type(
         "DeepseekV4GroupedLinear",
         (nn.Linear,),
         {},
     )
 
-    assert profile.structure_spec().probe_skip_module_class_names == (
+    # The grouped-BMM class LEFT the skip list when the grouped Fisher
+    # accumulator landed: it is priced now, so holding it at source
+    # precision would be a choice, not a debt. The declaration moved to
+    # `grouped_module_class_names`, which routes the probe to the grouped
+    # accumulator instead of the dense one.
+    assert profile.structure_spec().probe_skip_module_class_names == ()
+    assert profile.structure_spec().probe_grouped_module_class_names == (
         "DeepseekV4GroupedLinear",
     )
     assert profile.should_probe_linear("model.layers.0.self_attn.wq_a", nn.Linear(4, 4))
-    assert not profile.should_probe_linear(
+    assert profile.should_probe_linear(
         "model.layers.0.self_attn.wo_a",
         DeepseekV4GroupedLinear(4, 4),
     )
@@ -169,8 +181,69 @@ def test_mtp_layer_count(profile):
     assert profile.mtp_layer_count({}) == 0
 
 
-def test_no_fused_siblings(profile):
-    """DSv4-Flash has no Q/K/V or gate/up fused siblings on the live side."""
+def test_gridbook_dense_role_composites_are_not_allocator_fused(profile):
+    """Gridbook may decode merged Linear roles from different formats.
+
+    The consumer constructs one semantic composite for a merged vLLM Linear,
+    decodes each role independently to the common FP8 execution type, and then
+    concatenates the outputs.  A global producer fused group would incorrectly
+    force the same codebook format onto those independent roles.
+    """
     assert profile.fused_sibling_group("model.layers.0.self_attn.wq_a") is None
     assert profile.fused_sibling_group("model.layers.0.self_attn.wkv") is None
-    assert profile.fused_sibling_group("model.layers.0.mlp.shared_experts.gate_proj") is None
+    for leaf in ("gate_proj", "up_proj", "down_proj"):
+        assert profile.fused_sibling_group(
+            f"model.layers.0.mlp.shared_experts.{leaf}"
+        ) is None
+
+
+def test_export_lane_declaration_is_native_only(profile):
+    """Renamed from `test_gridbook_cb_export_lane_is_declared` on 2026-09-02.
+
+    DeepSeek-V4 declared both the native lane and `nvfp4_cb`; the codebook
+    lane retired (archive/gridbook_lane_2026-09-02/) and the declaration went
+    with it. `preferred_export_lane` never changed -- it was always the native
+    lane -- which is why nothing about how DSv4 actually ships moves here.
+    """
+    assert profile.supported_export_lanes() == ("compressed-tensors",)
+    assert profile.preferred_export_lane() == "compressed-tensors"
+
+
+def test_rope_axis_mapping_matches_the_vendored_definition(profile):
+    """The profile must ANSWER from the model, not restate its rule.
+
+    `DeepseekV4Model.forward` picks a layer's rotary table by attention
+    schedule; PrismaQuant's streamed driver bypasses that forward and must
+    reach the same answer. When the streamed path had its own copy of the rule
+    it silently fed `main` rope to all 41 compressed V4-Flash layers -- base
+    10000 with YaRN off instead of 160000 with YaRN -- and the BF16 teacher
+    built that way scored perplexity 262. So this pins that there is exactly
+    one definition and both callers reach it.
+    """
+    import importlib
+    import inspect
+
+    # Import through the REGISTERED name -- the vendored package's `__init__`
+    # is Transformers-relative and only resolves after registration.
+    profile.register_vendored_modeling()
+    modeling = importlib.import_module(
+        "transformers.models.deepseek_v4.modeling_deepseek_v4")
+    DeepseekV4Model = modeling.DeepseekV4Model
+    DeepseekV4RotaryEmbedding = modeling.DeepseekV4RotaryEmbedding
+
+    axis_of = DeepseekV4RotaryEmbedding.rope_axis_for_layer_type
+    assert axis_of("sliding_attention") == "main"
+    assert axis_of("compressed_sparse_attention") == "compress"
+    assert axis_of("heavily_compressed_attention") == "compress"
+    # Every axis it can name must be a table the rotary actually builds.
+    for layer_type in ("sliding_attention", "compressed_sparse_attention",
+                       "heavily_compressed_attention"):
+        assert axis_of(layer_type) in DeepseekV4RotaryEmbedding.layer_types
+        assert profile.rope_axis_for_layer_type(layer_type) == axis_of(layer_type)
+
+    # The model's own forward resolves through the same staticmethod rather
+    # than an inline conditional, so the two cannot drift apart.
+    source = inspect.getsource(DeepseekV4Model.forward)
+    assert "rope_axis_for_layer_type" in source, (
+        "DeepseekV4Model.forward no longer resolves the rope axis through the "
+        "shared definition; the streamed driver can now silently disagree")

@@ -15,9 +15,19 @@ External architectures can register their own profile at runtime:
 
     register_profile(MyArchProfile)
 
-Registered profiles are consulted in registration order; the first one
-whose `.matches()` returns True wins. `DefaultProfile` is the terminal
-fallback when nothing matches.
+Registered profiles are consulted in `ModelProfile.priority` order (lower
+first, ties broken by registration order); the first one whose `.matches()`
+returns True wins. `DefaultProfile` is the terminal fallback when nothing
+matches.
+
+Two kinds of profile take part in detection:
+
+  - **Python profiles** in `_REGISTERED`, matched by `cls.matches()`.
+  - **Spec-only profiles** — a `SpecMatchProfile` per `specs/<id>.json` whose
+    `id` no registered Python profile claims, matched by its declarative
+    `match` block. This is the extension point that makes a pure-JSON
+    architecture possible; while a Python profile of the same name exists it
+    wins outright, so adding a spec never silently re-routes a shipped model.
 """
 from __future__ import annotations
 
@@ -31,37 +41,106 @@ from .lfm2_moe import Lfm2MoeProfile
 from .qwen3 import Qwen3Profile
 from .qwen3_5 import Qwen3_5Profile
 from .qwen3_5_dense import Qwen3_5DenseProfile
-from .qwen3_moe import Qwen3MoeProfile
 
 # MiniMaxM2Profile: re-imported from its live mirror after the 2026-04-24
 # session's Phase-3 archive move. The profile is still tracked under
-# archive/minimax_m2p7/ as its canonical home; this live import enables
+# archive/minimax_m2p7_2026-04-24/ as its canonical home; this live import enables
 # allocator Pareto runs without uprooting the archive commit.
 from .minimax_m2 import MiniMaxM2Profile
 from .deepseek_v4 import DeepseekV4Profile
 from .hy_v3 import HyV3Profile
+from .laguna import LagunaProfile
+from .qwen4_exp import Qwen4ExpProfile
+from .glm5_next import Glm5NextProfile
 
 
+# Detection order is load-bearing — subsets must precede supersets, and
+# getting it wrong silently re-routes a shipped model to another profile. It
+# used to be encoded in this list's *order* plus two comments; it is now
+# encoded in each profile's `priority` class attribute (lower = consulted
+# first), which survives being read from a spec file after the Python body is
+# deleted. The comments below record why each pair is ordered as it is; the
+# numbers are the contract, and `tests/test_spec_match_profile.py` asserts that
+# priority order still equals this list's literal order.
 _REGISTERED: list[type[ModelProfile]] = [
-    Qwen3_5DenseProfile,  # must precede Qwen3_5Profile (dense is a subset)
-    Qwen3_5Profile,
-    Qwen3MoeProfile,  # must precede Qwen3Profile (MoE model_type includes qwen3)
-    Qwen3Profile,  # original Qwen3 (dense, no MoE, no MTP) — after the 3.5 siblings
-    Gemma4Profile,
-    Lfm2MoeProfile,
-    MiniMaxM2Profile,
-    DeepseekV4Profile,
-    HyV3Profile,
+    Qwen3_5DenseProfile,  # 100 — must precede Qwen3_5Profile (dense is a subset)
+    Qwen3_5Profile,       # 110
+    Qwen3Profile,         # 120 — original Qwen3 dense + routed MoE
+    Gemma4Profile,        # 140
+    Lfm2MoeProfile,       # 150
+    MiniMaxM2Profile,     # 160
+    DeepseekV4Profile,    # 170
+    HyV3Profile,          # 180
+    LagunaProfile,        # 190
+    Qwen4ExpProfile,      # 200 — Qwen3.8-Flash-Next; no vLLM class yet
+    Glm5NextProfile,      # 210 — GLM-5.3-Flash; no vLLM class yet
 ]
+
+# Bumped whenever `_REGISTERED` changes, so the derived detection order (which
+# folds in spec-only profiles) can be cached without going stale.
+_REGISTRY_GENERATION = 0
+_DETECTION_ORDER_CACHE: tuple[int, tuple] | None = None
 
 
 def register_profile(cls: type[ModelProfile]) -> None:
     """Register a new ModelProfile subclass for auto-detection.
 
-    Profiles are consulted in registration order. Register earlier than
-    built-in profiles to override them."""
+    Profiles are consulted in `priority` order (lower first). A profile that
+    does not declare one inherits `ModelProfile.priority = 0`, which is ahead
+    of every built-in (100+) — so the historical "register earlier than
+    built-in profiles to override them" contract holds unchanged."""
+    global _REGISTRY_GENERATION
     if cls not in _REGISTERED:
         _REGISTERED.insert(0, cls)
+        _REGISTRY_GENERATION += 1
+
+
+class DeadVendoredOverrideError(RuntimeError):
+    """A profile matched, but its vendored-modelling override is known dead.
+
+    Its own class, not a bare `RuntimeError`, because the two failures a caller
+    can see out of detection are not the same failure and must not be handled
+    the same way:
+
+      - *nothing matched this checkpoint* — detection answers `DefaultProfile`,
+        which is a legitimate answer for a not-yet-registered architecture and
+        is guarded downstream (`allocator.validate_default_profile_format_menu`);
+      - *a profile matched and its vendored modelling path is dead* — there is
+        no legitimate answer. The run would load UPSTREAM modelling code under
+        a profile that promises the vendored copy, which is a wrong number with
+        no exception attached to it (issue #19).
+
+    A caller that legitimately tolerates the first can therefore refuse the
+    second without catching every `RuntimeError` detection might raise.
+    Subclasses `RuntimeError` so existing `except RuntimeError` handlers and
+    the gate's original contract are unchanged.
+    """
+
+
+def _refuse_dead_vendored_override(model_type: str) -> None:
+    """Fail if this model_type's vendored-modeling override is known dead.
+
+    `register_vendored_modeling()` is called inside a `try/except: pass` above,
+    because a vendoring failure must not break profile *detection*. But the
+    failure mode that swallow hides is not an exception — it is a registration
+    that silently no-ops (issue #19), after which the load succeeds against
+    UPSTREAM modelling code and nothing ever raises. `prismaquant.vendored`
+    verifies its own overrides and records the dead ones, so consult that
+    rather than trusting the absence of an exception: running a probe on the
+    wrong modelling path is exactly the silent-wrong-answer this project
+    refuses to ship.
+    """
+    try:
+        from prismaquant.vendored import OVERRIDE_ERRORS
+    except Exception:  # noqa: BLE001 - vendored package absent entirely
+        return
+    detail = OVERRIDE_ERRORS.get(str(model_type))
+    if detail:
+        raise DeadVendoredOverrideError(
+            f"vendored modelling override for model_type={model_type!r} did "
+            f"not take effect, so a load here would silently run UPSTREAM "
+            f"modelling code instead of the vendored copy:\n{detail}"
+        )
 
 
 def detect_profile(model_path: str) -> ModelProfile:
@@ -69,8 +148,24 @@ def detect_profile(model_path: str) -> ModelProfile:
 
     Reads `config.json`, walks registered profiles, returns the first
     whose `.matches()` returns True. Falls back to `DefaultProfile` if
-    nothing matches."""
-    cfg_path = Path(model_path) / "config.json"
+    nothing matches.
+
+    Raises if `model_path` is not an existing directory. The DefaultProfile
+    fallback is deliberate for a checkpoint whose architecture is not yet
+    registered, but a path that does not exist is not that case -- it is an
+    operator error, and answering it with a profile lets a typo'd MODEL_PATH
+    clear detection and continue on default structure assumptions. Every call
+    site in this tree passes a local staged checkpoint directory, and
+    `run-pipeline.sh` documents MODEL_PATH as "the source HF model directory",
+    so no caller legitimately names a path that is absent. Entrypoints that
+    intentionally tolerate anything go through `detect_profile_with_warning`,
+    which catches this and logs the fallback instead of hiding it."""
+    root = Path(model_path)
+    if not root.is_dir():
+        raise RuntimeError(
+            f"model path is not an existing directory: {model_path}"
+        )
+    cfg_path = root / "config.json"
     model_type = ""
     archs: list[str] = []
     if cfg_path.exists():
@@ -81,7 +176,14 @@ def detect_profile(model_path: str) -> ModelProfile:
             archs = list(cfg.get("architectures") or [])
         except (json.JSONDecodeError, OSError):
             pass
-    return _resolve(model_type, archs)
+    profile = _resolve(model_type, archs)
+    # Config-only resolution chooses the architecture family and serving
+    # entrypoint. Keep the concrete checkpoint root as separate private intake
+    # evidence: some staged text-only checkpoints intentionally retain their
+    # wrapper-named safetensors index, even though their config declares the
+    # native causal class. Profiles that do not need that evidence ignore it.
+    profile._declare_model_path(model_path)
+    return profile
 
 
 def detect_profile_with_warning(
@@ -95,10 +197,19 @@ def detect_profile_with_warning(
     that intentionally keep running on vanilla or not-yet-registered models,
     but it prevents architecture-specific fused/MoE checks from disappearing
     without any log signal.
+
+    What it tolerates is an architecture this build does not know. It does not
+    tolerate `DeadVendoredOverrideError`, which says the architecture IS known
+    and its modelling path is dead: there is no fallback to log there, because
+    continuing runs upstream modelling code under a profile that promises the
+    vendored copy. A printed warning is not a refusal, and this one would have
+    printed "architecture unregistered or config unreadable", which is false.
     """
     reason = ""
     try:
         profile = detect_profile(model_path)
+    except DeadVendoredOverrideError:
+        raise
     except Exception as exc:
         reason = f"detect_profile raised {type(exc).__name__}: {exc}"
         profile = DefaultProfile()
@@ -142,24 +253,115 @@ def profile_from_model(model) -> ModelProfile:
     return profile_from_config(getattr(model, "config", None))
 
 
-def _resolve(model_type: str, archs: list[str]) -> ModelProfile:
-    """Walk registered profile classes, instantiate the first match."""
+def _python_profile_names() -> set[str]:
+    """Names claimed by registered Python profiles (`specs/<name>.json` keys)."""
+    names: set[str] = set()
     for cls in _REGISTERED:
         try:
-            if cls.matches(model_type, archs):
-                inst = cls()
-                # Some profiles need to register vendored modeling code
-                # with transformers before the model loads. Defer to
-                # the profile method (refactor #32) so callers don't
-                # need to know the architecture-specific bootstrap.
-                try:
-                    inst.register_vendored_modeling()
-                except Exception:
-                    # Don't let a vendoring failure block profile
-                    # detection — surface via the eventual model load
-                    # error instead.
-                    pass
-                return inst
+            names.add(cls().name)
         except Exception:
             continue
+    return names
+
+
+def detection_order() -> tuple:
+    """Every detection candidate, ordered by priority (lower first).
+
+    Entries are either a `ModelProfile` subclass (matched via `cls.matches()`)
+    or a `SpecMatchProfile` instance (matched via its declarative `match`
+    block). Ties keep `_REGISTERED` order, and Python profiles precede
+    spec-only ones at equal priority: an executable claim is the more specific
+    statement, and this keeps a spec that copies its Python profile's priority
+    from reordering detection.
+    """
+    global _DETECTION_ORDER_CACHE
+    cached = _DETECTION_ORDER_CACHE
+    if cached is not None and cached[0] == _REGISTRY_GENERATION:
+        return cached[1]
+
+    from .spec_profile import SpecMatchProfile
+    from .structure import iter_structure_specs
+
+    entries: list[tuple[int, int, int, object]] = []
+    for index, cls in enumerate(_REGISTERED):
+        entries.append((int(getattr(cls, "priority", 0)), 0, index, cls))
+
+    claimed = _python_profile_names()
+    try:
+        specs = iter_structure_specs()
+    except Exception:
+        specs = ()
+    for index, spec in enumerate(specs):
+        if spec.id in claimed or not spec.match.declared:
+            continue
+        entries.append((int(spec.priority), 1, index, SpecMatchProfile(spec)))
+
+    entries.sort(key=lambda item: item[:3])
+    order = tuple(item[3] for item in entries)
+    _DETECTION_ORDER_CACHE = (_REGISTRY_GENERATION, order)
+    return order
+
+
+def _claims(candidate, model_type: str, archs: list[str]) -> bool:
+    if isinstance(candidate, type):
+        return bool(candidate.matches(model_type, archs))
+    return bool(candidate.claims(model_type, archs))
+
+
+def _new_instance(candidate) -> ModelProfile:
+    """Fresh profile instance per resolution (lazy caches are not shared)."""
+    if isinstance(candidate, type):
+        return candidate()
+    return type(candidate)(candidate.spec)
+
+
+def _resolve(model_type: str, archs: list[str]) -> ModelProfile:
+    """Walk detection candidates in priority order, build the first match.
+
+    The candidate walk is deliberately tolerant: a candidate that cannot be
+    asked (`matches()` raises) or cannot be built is not a match, so detection
+    keeps walking rather than failing a whole run over one broken profile.
+    That tolerance is scoped to *choosing* a candidate. It must not extend to
+    the dead-vendored-override refusal, which is a statement about the
+    candidate that WON — so that gate runs after the `except Exception`, not
+    inside it (issue #201). Inside it, the refusal was demoting the matched
+    profile and detection walked on to `DefaultProfile`, which is exactly the
+    silent substitution the gate exists to prevent.
+    """
+    for cls in detection_order():
+        try:
+            if not _claims(cls, model_type, archs):
+                continue
+            inst = _new_instance(cls)
+            # Hand the profile what the checkpoint declared. A family can
+            # cover several serving classes (a multimodal wrapper and its
+            # text-only carve-out) whose namespaces differ, and only the
+            # declaration distinguishes them. Profiles that ignore it are
+            # unaffected: the stash is inert unless read.
+            inst.declare_config(model_type, archs)
+            # Some profiles need to register vendored modeling code
+            # with transformers before the model loads. Defer to
+            # the profile method (refactor #32) so callers don't
+            # need to know the architecture-specific bootstrap.
+            try:
+                inst.register_vendored_modeling()
+            except Exception:
+                # Don't let a vendoring failure block profile
+                # DETECTION — but do not lose it either. The old
+                # comment here assumed "the eventual model load
+                # error" would surface it; that reasoning only holds
+                # for a failure that raises at load time. The failure
+                # mode this swallow actually hides is the opposite
+                # one (issue #19): a registration that silently
+                # no-ops, after which the load succeeds against the
+                # WRONG modelling code and nothing ever raises.
+                # `prismaquant.vendored` records those in
+                # OVERRIDE_ERRORS; the gate below refuses to hand
+                # back a profile whose vendored path is known dead.
+                pass
+        except Exception:
+            continue
+        # Outside the swallow, deliberately (see the docstring).
+        _refuse_dead_vendored_override(model_type)
+        return inst
     return DefaultProfile(architectures=archs)

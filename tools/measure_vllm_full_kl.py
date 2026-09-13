@@ -4,17 +4,118 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import random
+import sys
 import time
 from pathlib import Path
 
 import torch
 
+_TOOLS_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_TOOLS_ROOT))
+from prismaquant_source_bootstrap import activate_prismaquant_source
+
+activate_prismaquant_source()
+
+try:  # package mode (`python -m tools.measure_vllm_full_kl`)
+    from .gold_engine_options import add_gold_engine_arguments, gold_engine_kwargs, validate_gold_engine_arguments
+    from .full_kl_teacher_payload import (
+        TEACHER_PAYLOAD_V2_SCHEMA,
+        load_teacher_evidence,
+        safe_load_torch_payload,
+        tokenizer_identity,
+    )
+    from .serve_fingerprint import gold_producer_identity, self_manifest
+    from .spec_decode_guard import refuse_if_spec_decode
+except ImportError:  # script mode (`python /repo/tools/measure_vllm_full_kl.py`)
+    from gold_engine_options import add_gold_engine_arguments, gold_engine_kwargs, validate_gold_engine_arguments
+    from full_kl_teacher_payload import (  # type: ignore
+        TEACHER_PAYLOAD_V2_SCHEMA,
+        load_teacher_evidence,
+        safe_load_torch_payload,
+        tokenizer_identity,
+    )
+    from serve_fingerprint import (  # type: ignore
+        gold_producer_identity,
+        self_manifest,
+    )
+    from spec_decode_guard import refuse_if_spec_decode  # type: ignore
+
 # vLLM / datasets / transformers are imported lazily inside the functions
 # that need them so the position-KL math stays unit-testable in environments
 # without a serving stack.
+
+#: Set by `_load_llm` once the engine exists; stamped on every result dict.
+#: `None` means "could not inspect", which the shipcard refuses — an unverified
+#: negative is exactly what the draft-logprobs trap looked like.
+_SPEC_DECODE_DETECTED: bool | None = None
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while block := handle.read(16 << 20):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _strict_json_text(value: object) -> str:
+    """Serialize release evidence without JavaScript NaN/Infinity tokens."""
+    try:
+        return json.dumps(value, indent=2, allow_nan=False)
+    except ValueError as exc:
+        raise RuntimeError(
+            "refusing to serialize non-finite full-KL evidence"
+        ) from exc
+
+
+def _resolve_serve_image(args) -> str:
+    """The container image this measurement runs in -- never guessed.
+
+    The image used to come from the Gridbook lane's serving pin, retired
+    2026-09-02 (archive/gridbook_lane_2026-09-02/), so a caller could get one
+    without naming it. A wrong image tag is a
+    silent reproducibility confound (R15), so this now fails closed: the
+    caller states it with --serve-image or PQ_SERVE_IMAGE.
+    """
+    image = args.serve_image or os.environ.get("PQ_SERVE_IMAGE") or ""
+    image = image.strip()
+    if not image:
+        raise RuntimeError(
+            "the serving container image is unknown: pass --serve-image or "
+            "set PQ_SERVE_IMAGE. The serve fingerprint that makes two KL "
+            "numbers comparable is not evidence without it."
+        )
+    return image
+
+
+def _provenance(args) -> dict:
+    """Serving-stack + code provenance for a result dict (R15).
+
+    This tool builds its own in-process `LLM`, so the measuring process *is*
+    the server and `/proc/self/maps` is the authoritative residency read. Two
+    result JSONs whose `serve_fingerprint` differs are not comparable as a
+    delta (`tools/kl_ab.py` refuses them).
+    """
+    producer = gold_producer_identity("measure_vllm_full_kl")
+    manifest = self_manifest(
+        extra={
+            "measurement_tool": "measure_vllm_full_kl",
+            "producer_identity": producer,
+            "gold_engine_configuration": gold_engine_kwargs(args),
+        },
+        image=_resolve_serve_image(args),
+    )
+    return {
+        "git_commit": producer["git_commit"],
+        "serve_fingerprint": manifest["serve_fingerprint"],
+        "serve_manifest": manifest,
+        "spec_decode_detected": _SPEC_DECODE_DETECTED,
+    }
 
 
 def _load_wikitext_calibration(
@@ -24,16 +125,48 @@ def _load_wikitext_calibration(
     n_samples: int,
     seqlen: int,
     window_seed: int = 42,
-) -> tuple[list[list[int]], list[int], int]:
-    from datasets import load_dataset
+    text_file: str | None = None,
+) -> tuple[list[list[int]], list[int], int, dict]:
+    """Build the calibration windows, and attest which bytes they came from.
 
-    ds = load_dataset(
-        "wikitext",
-        "wikitext-2-raw-v1",
-        split="train",
-        cache_dir=cache_dir,
-    )
-    text = "\n\n".join(row["text"] for row in ds if row.get("text", "").strip())
+    `text_file` is the materialized corpus (tools/materialize_wikitext_corpus.py)
+    and is the preferred source: the measurement containers carry no `datasets`
+    / pyarrow / pandas, and installing them at measurement time would mutate the
+    very serving stack the number is fingerprinted against. Reading bytes also
+    lets teacher and student prove they scored the SAME corpus by sha256, rather
+    than each calling load_dataset and trusting two resolutions to agree.
+
+    The `datasets` path is kept for hosts that have it, and the join rule is
+    identical in both branches -- the materializer copies it verbatim.
+    """
+    if text_file:
+        raw = Path(text_file).read_bytes()
+        text = raw.decode("utf-8")
+        corpus = {
+            "source": "text_file",
+            "path": str(text_file),
+            "bytes": len(raw),
+            "corpus_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    else:
+        from datasets import load_dataset
+
+        ds = load_dataset(
+            "wikitext",
+            "wikitext-2-raw-v1",
+            split="train",
+            cache_dir=cache_dir,
+        )
+        text = "\n\n".join(
+            row["text"] for row in ds if row.get("text", "").strip()
+        )
+        corpus = {
+            "source": "datasets",
+            "cache_dir": str(cache_dir),
+            "bytes": len(text.encode("utf-8")),
+            "corpus_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "datasets_fingerprint": getattr(ds, "_fingerprint", None),
+        }
     ids = tokenizer(
         text,
         return_tensors="pt",
@@ -51,17 +184,16 @@ def _load_wikitext_calibration(
             for i in range(n_samples)
         ]
     calib = [ids[s : s + seqlen].tolist() for s in starts]
-    return calib, starts, int(ids.numel())
+    corpus["total_tokens"] = int(ids.numel())
+    return calib, starts, int(ids.numel()), corpus
 
 
 def _load_llm(args, *, max_model_len: int) -> "LLM":
-    from vllm import LLM
-
     kwargs = {
         "model": args.model,
         "trust_remote_code": True,
         "dtype": args.dtype,
-        "tensor_parallel_size": 1,
+        **gold_engine_kwargs(args),
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "max_model_len": max_model_len,
         "max_num_seqs": 1,
@@ -76,7 +208,17 @@ def _load_llm(args, *, max_model_len: int) -> "LLM":
         # max_num_batched_tokens >= their chunk-alignment floor (~2096);
         # the seqlen+16 max_model_len alone can drive it below that.
         kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
-    return LLM(**kwargs)
+    # Environment/bootstrap above must precede the first vLLM import.
+    from vllm import LLM
+
+    llm = LLM(**kwargs)
+    global _SPEC_DECODE_DETECTED
+    _SPEC_DECODE_DETECTED = refuse_if_spec_decode(
+        llm=llm,
+        allow=getattr(args, "allow_spec_decode", False),
+        context="kl",
+    )
+    return llm
 
 
 def _resolve_vocab_size(llm: LLM, tokenizer) -> int:
@@ -91,10 +233,20 @@ def _resolve_vocab_size(llm: LLM, tokenizer) -> int:
 
 def _logprob_vector(logprobs, *, vocab_size: int) -> torch.Tensor:
     vec = torch.full((vocab_size,), float("-inf"), dtype=torch.float32)
+    seen_token_ids: set[int] = set()
     for key, value in logprobs.items():
         token_id = int(key)
+        if token_id < 0:
+            raise RuntimeError(
+                f"vLLM returned negative token id {token_id} in full-vocab logprobs"
+            )
         if token_id >= vocab_size:
             continue
+        if token_id in seen_token_ids:
+            raise RuntimeError(
+                f"vLLM returned duplicate token id {token_id} in full-vocab logprobs"
+            )
+        seen_token_ids.add(token_id)
         logprob = getattr(value, "logprob", None)
         if logprob is None and isinstance(value, dict):
             logprob = value.get("logprob")
@@ -102,7 +254,16 @@ def _logprob_vector(logprobs, *, vocab_size: int) -> torch.Tensor:
             logprob = value[0]
         if logprob is None:
             logprob = value
-        vec[token_id] = float(logprob)
+        logprob = float(logprob)
+        if not math.isfinite(logprob):
+            raise RuntimeError(
+                f"vLLM returned non-finite logprob for token id {token_id}"
+            )
+        if logprob > 0.0:
+            raise RuntimeError(
+                f"vLLM returned positive logprob for token id {token_id}: {logprob}"
+            )
+        vec[token_id] = logprob
     missing = int(torch.isneginf(vec).sum().item())
     if missing:
         raise RuntimeError(
@@ -175,8 +336,10 @@ def _measure_prompt_topk(
     Returns (ids, lps) shaped [n_prompts, P-1, K] (position 0 has no
     prediction). Full-vocab dicts at every position are infeasible (~620M
     Python objects per pass), so K bounds the support; the tail is handled
-    as a single bucket by the caller. K=1024 covers ~all teacher mass at
-    nearly every position and the truncation floor is shared across arms.
+    as a single bucket by the caller. K is set by the teacher's measured
+    coverage, not by convention -- see PROMPT_TOP_K in full_kl_teacher_payload
+    for the sweep that fixes it -- and the truncation floor is shared across
+    arms.
     Positions with fewer than K entries are padded with ``(-1, -inf)``;
     ``_position_kl`` masks the pads back out.
     """
@@ -228,12 +391,13 @@ def _teacher(args) -> int:
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    prompts, starts, total_tokens = _load_wikitext_calibration(
+    prompts, starts, total_tokens, corpus = _load_wikitext_calibration(
         tokenizer,
         cache_dir=args.dataset_cache_dir,
         n_samples=args.n_samples,
         seqlen=args.seqlen,
         window_seed=args.window_seed,
+        text_file=args.corpus_text_file,
     )
     print(
         f"[kl] teacher model={args.model} n={args.n_samples} "
@@ -279,20 +443,24 @@ def _teacher(args) -> int:
             "seqlen": int(args.seqlen),
             "starts": starts,
             "total_tokens": total_tokens,
+        "corpus": corpus,
             "vocab_size": int(vocab_size),
             "teacher_shape": list(topk_lps.shape),
             "topk_coverage_mean": float(cov.mean()),
             "topk_coverage_min": float(cov.min()),
             "elapsed_s": time.monotonic() - started,
+            **_provenance(args),
         }
-        Path(args.meta_output).write_text(json.dumps(meta, indent=2))
-        print(json.dumps(meta, indent=2), flush=True)
+        meta_text = _strict_json_text(meta)
+        Path(args.meta_output).write_text(meta_text)
+        print(meta_text, flush=True)
         return 0
     logprobs = _measure_logprobs(llm, prompts, vocab_size=vocab_size)
     payload = {
         "teacher_logprobs": logprobs,
         "calib_ids": torch.tensor(prompts, dtype=torch.long),
         "starts": starts,
+        "corpus": corpus,
         "model": args.model,
         "n_samples": int(args.n_samples),
         "seqlen": int(args.seqlen),
@@ -307,13 +475,57 @@ def _teacher(args) -> int:
         "seqlen": int(args.seqlen),
         "starts": starts,
         "total_tokens": total_tokens,
+        "corpus": corpus,
         "vocab_size": int(vocab_size),
         "teacher_shape": list(logprobs.shape),
         "elapsed_s": time.monotonic() - started,
+        **_provenance(args),
     }
-    Path(args.meta_output).write_text(json.dumps(meta, indent=2))
-    print(json.dumps(meta, indent=2), flush=True)
+    meta_text = _strict_json_text(meta)
+    Path(args.meta_output).write_text(meta_text)
+    print(meta_text, flush=True)
     return 0
+
+
+def _validated_topk_entries(ids_row, lps_row, *, role: str) -> list[tuple[int, float]]:
+    """Return one strict top-K row, excluding only canonical pad entries."""
+    token_ids = ids_row.tolist()
+    logprobs = lps_row.tolist()
+    if len(token_ids) != len(logprobs):
+        raise RuntimeError(f"{role} top-K token/logprob lengths differ")
+
+    entries: list[tuple[int, float]] = []
+    seen: set[int] = set()
+    for raw_token_id, raw_logprob in zip(token_ids, logprobs):
+        token_id = int(raw_token_id)
+        logprob = float(raw_logprob)
+        if token_id == -1:
+            if not math.isinf(logprob) or logprob > 0.0:
+                raise RuntimeError(
+                    f"{role} top-K padding must be the canonical (-1, -inf) pair"
+                )
+            continue
+        if token_id < 0:
+            raise RuntimeError(f"{role} top-K token id {token_id} is invalid")
+        if token_id in seen:
+            raise RuntimeError(
+                f"{role} top-K row contains duplicate token id {token_id}"
+            )
+        seen.add(token_id)
+        if not math.isfinite(logprob):
+            raise RuntimeError(
+                f"{role} top-K row contains a non-finite logprob for token id "
+                f"{token_id}"
+            )
+        if logprob > 0.0:
+            raise RuntimeError(
+                f"{role} top-K row contains a positive logprob for token id "
+                f"{token_id}: {logprob}"
+            )
+        entries.append((token_id, logprob))
+    if not entries:
+        raise RuntimeError(f"{role} position carries no finite top-K entries")
+    return entries
 
 
 def _position_kl(t_ids_row, t_lps_row, s_ids_row, s_lps_row) -> tuple[float, float]:
@@ -331,21 +543,10 @@ def _position_kl(t_ids_row, t_lps_row, s_ids_row, s_lps_row) -> tuple[float, flo
     documented relative-compare-only convention (shared across arms); they
     are deliberately left as-is.
     """
-    smap = {
-        int(a): float(b)
-        for a, b in zip(s_ids_row.tolist(), s_lps_row.tolist())
-        if int(a) >= 0 and math.isfinite(float(b))
-    }
-    if not smap:
-        raise RuntimeError("student position carries no finite top-K entries")
+    student = _validated_topk_entries(s_ids_row, s_lps_row, role="student")
+    smap = dict(student)
     floor = min(smap.values())                        # kl_ab.py convention
-    valid = [
-        (int(t), float(lp))
-        for t, lp in zip(t_ids_row.tolist(), t_lps_row.tolist())
-        if int(t) >= 0 and math.isfinite(float(lp))
-    ]
-    if not valid:
-        raise RuntimeError("teacher position carries no finite top-K entries")
+    valid = _validated_topk_entries(t_ids_row, t_lps_row, role="teacher")
     tlp = torch.tensor([lp for _t, lp in valid], dtype=torch.float64)
     q = torch.tensor([smap.get(t, floor) for t, _lp in valid],
                      dtype=torch.float64)
@@ -355,10 +556,23 @@ def _position_kl(t_ids_row, t_lps_row, s_ids_row, s_lps_row) -> tuple[float, flo
     pt = max(1.0 - float(p.sum()), 1e-12)
     qt = max(1.0 - float(q.exp().sum()), 1e-12)
     kl += pt * (math.log(pt) - math.log(qt))
-    return kl, float(p.max())
+    top1 = float(p.max())
+    if not math.isfinite(kl) or not math.isfinite(top1):
+        raise RuntimeError(
+            f"non-finite KL output: kl={kl!r}, teacher_top1_prob={top1!r}"
+        )
+    return kl, top1
 
 
-def _student_all_positions(args, payload) -> int:
+# _assert_teacher_matches_candidate_source() bound the streamed BF16
+# teacher's source identity to the candidate's quant_config provenance.
+# Its whole body was gated on --dsv4-gridbook-contract, retired 2026-09-02
+# with its lane -- archive/gridbook_lane_2026-09-02/. Nothing else set it, so
+# the
+# check never ran on another lane.
+
+
+def _student_all_positions(args, payload, teacher_evidence=None) -> int:
     started = time.monotonic()
     prompts = payload["calib_ids"].tolist()
     vocab_size = int(payload["vocab_size"])
@@ -383,6 +597,8 @@ def _student_all_positions(args, payload) -> int:
             )
             kl_pos[i, j] = kl
             t_top1[i, j] = top1
+    if not torch.isfinite(kl_pos).all() or not torch.isfinite(t_top1).all():
+        raise RuntimeError("non-finite all-position KL output")
     confident = t_top1 > 0.5
     flat = kl_pos.flatten()
     result = {
@@ -392,6 +608,7 @@ def _student_all_positions(args, payload) -> int:
         "model": args.model,
         "teacher_model": payload.get("model"),
         "teacher_payload": str(args.teacher_payload),
+        "teacher_payload_sha256": args.teacher_payload_sha256,
         "quantization": args.quantization,
         "n_samples": len(prompts),
         "seqlen": int(payload["seqlen"]),
@@ -405,18 +622,54 @@ def _student_all_positions(args, payload) -> int:
         "n_confident": int(confident.sum()),
         "kl_per_sample": [float(x) for x in kl_pos.mean(dim=1).tolist()],
         "elapsed_s": time.monotonic() - started,
+        "teacher_evidence": teacher_evidence,
+        **_provenance(args),
     }
-    Path(args.output).write_text(json.dumps(result, indent=2))
-    print(json.dumps(result, indent=2), flush=True)
+    result_text = _strict_json_text(result)
+    Path(args.output).write_text(result_text)
+    print(result_text, flush=True)
     return 0
+
+
+def _require_v2_candidate_identity(args, payload) -> None:
+    """Pair model family/vocabulary and token IDs before a costly engine load."""
+    try:
+        from .dsv4_wikitext_inputs import wikitext_model_identity
+    except ImportError:
+        from dsv4_wikitext_inputs import wikitext_model_identity
+    tokenizer = tokenizer_identity(args.model)
+    if tokenizer["content_sha256"] != payload["calibration_contract"]["tokenizer"]["identity_sha256"]:
+        raise RuntimeError("candidate tokenizer identity differs from the authenticated teacher")
+    candidate = wikitext_model_identity(args.model)
+    source = payload["model_identity"]
+    if candidate != source or candidate["vocab_size"] != payload["vocab_size"]:
+        raise RuntimeError("candidate model family/vocabulary differs from the authenticated teacher")
 
 
 def _student(args) -> int:
     started = time.monotonic()
-    payload = torch.load(args.teacher_payload, map_location="cpu")
-    if payload.get("score_positions") == "all":
-        return _student_all_positions(args, payload)
-    teacher = payload["teacher_logprobs"].float()
+    teacher_payload_sha256 = _file_sha256(args.teacher_payload)
+    teacher_evidence = None
+    if args.teacher_meta:
+        payload, teacher_evidence = load_teacher_evidence(
+            args.teacher_payload, args.teacher_meta
+        )
+    else:
+        payload = safe_load_torch_payload(args.teacher_payload)
+    if _file_sha256(args.teacher_payload) != teacher_payload_sha256:
+        raise RuntimeError("teacher payload changed while the student loaded it")
+    args.teacher_payload_sha256 = teacher_payload_sha256
+    v2 = payload.get("schema") == TEACHER_PAYLOAD_V2_SCHEMA
+    if v2 and not args.teacher_meta:
+        raise RuntimeError("v2 teacher requires authenticated --teacher-meta before engine loading")
+    if v2:
+        _require_v2_candidate_identity(args, payload)
+    final_companion = v2 and args.score_positions == "final"
+    if final_companion and payload.get("final_logprobs") is None:
+        raise RuntimeError("final scoring requires a full-vocabulary teacher companion")
+    if payload.get("score_positions") == "all" and not final_companion:
+        return _student_all_positions(args, payload, teacher_evidence)
+    teacher = payload["final_logprobs" if final_companion else "teacher_logprobs"].float()
     prompts = payload["calib_ids"].tolist()
     vocab_size = int(payload["vocab_size"])
     print(
@@ -435,6 +688,7 @@ def _student(args) -> int:
         "model": args.model,
         "teacher_model": payload.get("model"),
         "teacher_payload": str(args.teacher_payload),
+        "teacher_payload_sha256": teacher_payload_sha256,
         "quantization": args.quantization,
         "n_samples": len(prompts),
         "seqlen": int(payload["seqlen"]),
@@ -444,20 +698,37 @@ def _student(args) -> int:
         "kl_max": float(per_sample.max().item()),
         "kl_per_sample": [float(x) for x in per_sample.tolist()],
         "elapsed_s": time.monotonic() - started,
+        **({"score_positions": "final", "n_positions": len(prompts),
+            "teacher_evidence": teacher_evidence} if final_companion else {}),
+        **_provenance(args),
     }
-    Path(args.output).write_text(json.dumps(result, indent=2))
-    print(json.dumps(result, indent=2), flush=True)
+    result_text = _strict_json_text(result)
+    Path(args.output).write_text(result_text)
+    print(result_text, flush=True)
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    add_gold_engine_arguments(parser)
     parser.add_argument("--mode", choices=["teacher", "student"], required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--meta-output", default="teacher_meta.json")
     parser.add_argument("--teacher-payload")
+    parser.add_argument(
+        "--teacher-meta",
+        help="metadata JSON emitted beside the streamed teacher payload",
+    )
     parser.add_argument("--dataset-cache-dir", default="/hfcache/datasets")
+    parser.add_argument("--corpus-text-file", default=None,
+                        help="Materialized corpus text (see "
+                             "tools/materialize_wikitext_corpus.py). Preferred "
+                             "over --dataset-cache-dir: the measurement "
+                             "containers carry no `datasets`/pyarrow/pandas, "
+                             "and installing them at measurement time would "
+                             "mutate the serving stack the number is "
+                             "fingerprinted against.")
     parser.add_argument("--n-samples", type=int, default=8)
     parser.add_argument("--seqlen", type=int, default=512)
     parser.add_argument("--dtype", default="bfloat16")
@@ -471,12 +742,34 @@ def main() -> int:
         "position (n_positions = n_samples*(seqlen-1)).")
     parser.add_argument("--prompt-top-k", type=int, default=1024)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--allow-spec-decode", action="store_true",
+        help="proceed even when the engine has a speculative config. The "
+        "numbers are then the DRAFT model's, not the artifact's; the shipcard "
+        "refuses such a record (see tools/spec_decode_guard.py).")
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    # --dsv4-gridbook-contract forced the one-Spark DSv4 gold-measurement
+    # runtime contract; retired 2026-09-02 with its lane, see
+    # archive/gridbook_lane_2026-09-02/.
+    parser.add_argument(
+        "--serve-image",
+        default=None,
+        help="container image tag this measurement runs in. Required (or "
+        "PQ_SERVE_IMAGE): the serve fingerprint is not evidence without it.",
+    )
     parser.add_argument(
         "--window-seed", type=int, default=42,
         help="RNG seed for the WikiText window draw (teacher mode only; "
         "students replay the windows stored in the teacher payload)")
     args = parser.parse_args()
+    validate_gold_engine_arguments(parser, args)
+    # Resolve the image before anything loads a model: an unnamed image is a
+    # reproducibility hole (R15), and discovering it only when the provenance
+    # block is written would waste the whole measurement.
+    try:
+        _resolve_serve_image(args)
+    except RuntimeError as exc:
+        parser.error(str(exc))
     if args.mode == "student" and not args.teacher_payload:
         parser.error("--teacher-payload is required in student mode")
     if args.mode == "teacher":

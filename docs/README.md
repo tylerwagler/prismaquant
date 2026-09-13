@@ -1,22 +1,176 @@
-# Documentation Map
+# docs/ — index
 
-Current docs in this directory describe the live PrismaQuant implementation:
+**`docs/ARCHITECTURE.md` is the master document — start there.** Everything below
+is either a rule set it points at, a lane record, or history.
 
-- `design_guidelines.md`: mandatory design rules for new functionality,
-  including GPU-first execution, cache reuse, vLLM gates, and measurement
-  discipline.
-- `runtime_flags.md`: environment controls used by production runs.
-- `v1_milestone_validation.md`: pre-tag V1 validation checklist with exact
-  commands and required log artifacts.
-- `progressive_render_pipeline.md`: shared local render scoring, mechanism
-  ordering, and extension contract for new numerical methods.
-- `calibration_diverse_v1.md`: fixed mixed-domain calibration recipe.
-- `validation_harness.md`: validation harness behavior and CLI notes.
-- `v20_memory_and_scheduling.md`: memory scheduling notes.
-- `vectorization_refactor.md`: vectorization implementation notes.
+**Maintenance rule:** a claim is true only if current code or a served measurement
+backs it; every normative statement carries a `file:line` or commit hash, and when a
+doc and the code disagree the doc is wrong — fix it or flag it, never propagate it.
 
-Historical frontier experiments, cross-layer allocators, ReSpinQuant residual
-basis work, archived render methods, handovers, and Block-CLADO result logs live in
-`archive/legacy_frontiers_2026-05-06/`,
-`archive/cross_layer_2026-05-09/`, and
-`archive/respinquant_2026-05-13/`.
+As of 2026-08-25 (tree reorganised in `87c749e`). Status tags: **CURRENT** =
+describes the live system · **HISTORICAL** = dated record, true when written, not
+guidance · **ARCHIVED** = superseded narrative, kept for provenance.
+
+Three things older docs get wrong and this index does not:
+`COST_MODE` defaults to `aura`; `production-render-score` is the
+explicit/legacy spelling (`docs/ARCHITECTURE.md` §3.3–§4.3);
+`SELECTION_MODE` defaults to `surrogate` (`:250`);
+`run-pipeline.sh` lives at `prismaquant/run-pipeline.sh`, not the repo root.
+
+---
+
+## design/ — current normative
+
+| Path | What it is | Status |
+|---|---|---|
+| `design/tessera_campaign_sampling.md` | How the Tessera cost campaign is made feasible at GLM-5.3 Flash scale: the contract-readable menu (#284), the packed stack as the priced unit with an `h_trace`-weighted expert sample, two anchors bracketing the artifact's rate band instead of one anchor plus a universal slope (measured to fail over 1–8 bits), the batched multi-unit LDLQ encoder (Tessera #385), the GLM time projection from campaign-01's per-row costs, and the regret + served-KL validation that gates it. | CURRENT design — inputs measured on campaign-01 (LFM2.5, 2026-09-06); the sampled design is not yet implemented or validated |
+| `design/prismasnap.md` | Normative contract for the optional, purely additive PrismaSnap BF16 source-preparation lane: canonical measured-fast `stage,polish` semantics, exact dense seams, content-bound lifecycle and two-Spark campaign collation, served fold-fidelity admission, native-only lane boundary, and ordered dense-then-MoE promotion gates. | CURRENT candidate contract — implementation and contract tests exist, but the Qwen3.8-27B text-only strict-20-GB served A/B is still running; no 27B, MoE, 20% improvement, or Qwen3.8-125B release claim yet |
+| `design/artifact_collections.md` | Content-addressed, format-agnostic control plane for probe-once/export-many collections: explicit candidate and target records, immutable stage receipts, shared-resource accounting, and a legacy Qwen artifact census. | CURRENT foundation — schemas and tests ship offline; ModelSnapshot/Probe/Cost/Solve/Export/Qualification adapters and pipeline wiring remain open |
+| `design/sample_parallel_probe.md` | Exact opt-in sample-axis map/reduce for the incremental probe: immutable calibration/run identity, the two-stage global-CE barrier, complete-model raw sufficient-stat reduction, and deterministic dense-body activation-cache union. It reuses the streamed model and existing activation-cache path and changes no serving runtime. | CURRENT implementation contract; CPU-tested producer lane, not yet GPU-launched or release-qualified |
+| `design/model_coverage_ledgers.md` | Requirement discovery by traversal: one walk over the loaded model tree plus a traced forward discovers every parameter->op edge; each node is claimed at discovery (decide / pin+reason / exclude+reason) and an unclaimed node fails the walk. All consumers (probe, cost, footprint, read-bytes, routes) derive from the one enumeration; four stamped views reconcile against the checkpoint header. Adopted after the `wo_a` finding. The walker landed 2026-08-21 (`prismaquant/model_walk.py` + `ModelProfile.walk_claim_rules()`, ARCHITECTURE.md §8.8); intake walks are usable, but export-gate wiring and consumer migration onto the edge list are still open. | CURRENT |
+| `design/design_guidelines.md` | The terse rule set: non-negotiables, measurement discipline, promotion ladder, rotation-transform rule, exception rule. Makes almost no code-line claims, so nothing has gone stale. | CURRENT |
+| `design/constrained_pareto_allocation.md` | Serving SLOs as the allocator’s second hard axis (ultraplan P5c): the measured dispatch-table schema and its mandatory per-row provenance, the additive layer-time aggregation model and its eight named assumptions, why the filter sits in the byte-budget ratchet rather than in `solve_allocation`'s DP, the shipped example table's row list and sources, and the D0.3 exact-rate harness (P5d). | CURRENT as a mechanism, ORPHANED as policy — the normative policy it deferred to (`lanes/nvfp4-cb/format-speed-policy.md` §1) went with the Gridbook lane on 2026-09-02 (`archive/gridbook_lane_2026-09-02/docs/lanes/nvfp4-cb/`). The axis still produces proposal data; no lane currently declares the served NATIVE-PARITY protocol that would promote it |
+| `design/runtime_flags.md` | The `PRISMAQUANT_*` / `COST_MODE` / `SELECTION_MODE` / lever vocabulary and defaults; the most accurate defaults record in the tree. | CURRENT — re-verified 2026-08-02. The old drift note here was itself the stale claim: `PRISMAQUANT_CB_LADDER_INTERP` is **not** described as unwired — §5 documents it as live in both cost paths, and it is read at `measure_quant_cost.py:1737` (dense) and `expert_empirical_cost.py:1212` (expert). Same pass retired the L2/L3 knobs the 2026-07-30 wall orphaned (§9.1) and re-anchored every `file.py:NNN` that pointed past its file's EOF. Residual: it is a curated policy index, not an exhaustive inventory — §10 gives the mechanical sweep (re-run 2026-08-09: **166** distinct `PRISMAQUANT_*` tokens in live source under §10's own `rg` recipe, vs **126** carrying a table row here — 140 are mentioned anywhere in the file; the gap is refusals, ABI checks, constants and research switches) — and the CB lane's shell vars are prose in §5 rather than a table |
+| `design/progressive_render_pipeline.md` | The local render-mechanism contract: baseline/candidate/score/accept loop, declared ordering, per-format mechanism matrix (`render_score.py`, `production_weight_cache._format_supports_render_mechanism`). | CURRENT — omits the `weighted_vq` mechanism, which since 2026-07-30 (re-vet R3) is a **registered** mechanism covering BOTH the CB families and gguf: those families' deliberate render is the imatrix-weighted search, driven by `col_weights` on `render_production_weight` |
+| `design/pluggable_refactor.md` | The plugin contract — model-structure JSON, serving-profile JSON, pipeline spec, decision units; "a new architecture = three registries". | CURRENT — predates the `nvfp4_cb.json` and `gguf.json` serving profiles |
+| `design/validation_harness.md` | CLI manual for `prismaquant.validation_harness` (validate-and-register / compare / list) and its registry gate (`artifact_registry.py:17,182`). | CURRENT — describes the registry validator, not the numeric ship gate (`validate_quantized_model.py:116-120`) |
+| `design/mtp_rung_selection.md` | Throughput-optimal draft-rung selector for MTP/spec-decode: cost and acceptance curves, the 7-step selector, calibration procedure. Matches `prismaquant/mtp_rung_selection.py` section-for-section. | CURRENT — canon for the CB lane; the compressed-tensors pipeline still stamps `MTP_FORMAT=BF16` (`run-pipeline.sh:161`) |
+| `design/calibration_diverse_v1.md` | The `diverse-v1.jsonl` calibration recipe (256 rows, 40/20/20/20 prose/code/math/multilingual) and its builder; pipeline default at `run-pipeline.sh:82`. | CURRENT — silent on the sibling cross-domain gate corpus `xdom-gate-v1.jsonl` (`run-pipeline.sh:88`), which has no doc at all |
+| `design/unified_render_theory.md` | Theory paper treating every per-Linear render decision as one shrinkage question; derives a closed-form damp law and runs the V0→V1b validation ladder. | HISTORICAL — the ladder cleared and the thread closed 2026-06-22 (`a7500f5`): sweep OFF, fixed damp 1.0 (`export_native_compressed.py:1857,1860`). The header and §6.4 still say the sweep stays default; §8 and line 575 record the closure |
+| `design/v20_memory_and_scheduling.md` | The v20 streaming cache/scheduling design note: mark-done eviction, pressure shrink, value-aware retention, predeclared shard schedule. | HISTORICAL — self-labelled "pre-implementation"; steps 1–5 shipped (`layer_streaming.py:1370,1206`, `incremental_probe.py:498-501`), the cheap-Gantt instrumentation and per-channel Fisher summaries never did. Its numbers are v19-era MiniMax |
+| `design/tessera_quality_prefill_experiment.md` | The full-domain Tessera quality-prefill experiment: the legal rate domain closed from the producer grammar and the packaged reader contract, support recorded as five independent facts per candidate rather than one Boolean, the deterministic hash-ranked mandatory set and per-stratum interior draw (`coverage_first_v1`), the phase/plan state machine and its refusals, and the PrismaBuild decomposition adapter. | CURRENT design — milestone 1 (inventory, schemas, dependency report) ships with tests; `measurements/quality-prefill-milestone-1-2026-09-12.md` records the dry-run counts and the four open blockers. No encode, serve or GPU measurement has been made, and milestones 2-6 are gated on prismaquant #420, PR #503 and prismabuild PR #518 |
+| `design/joint_aura_runtime_allocation.md` | Joint allocation over quality and runtime: the complete local perturbation `dY = X dW^T + dX W^T + dX dW^T` projected through downstream KL cotangents, `joint_aura_predicted_dloss` as a currency distinct from the scalar `output_mse_under_route_activation_contract`, why the two may never share one allocation table, and the runtime price partition the second axis needs. | CURRENT research, opt-in (#237). The **producer half ships**: `joint_aura.py` plus `aura_cost.py`'s `joint_activation=True` (CLI `--joint-activation`), with the currency guard in `cost_currency.py:179-191`. The **runtime half does not**: `runtime_provenance.admit_fixed_resources` recomputes the full-engine partition and admits only on agreement, and at the producer's current schema version every v2 partition still refuses -- the report carries no timing partition (prismaquant #420 open), so there is no runtime price to allocate against yet |
+
+---
+
+Two `design/` documents left this index on 2026-09-02 with the Gridbook lane:
+`gridbook_lane_eligibility_contract.md` (the `lane_eligibility` table asked of
+Gridbook) and `rtx4090_fp8_gridbook_policy.md` (that lane's RTX 4090 producer
+policy). Both are at `archive/gridbook_lane_2026-09-02/docs/design/`.
+
+## lanes/ — per-container serving lanes
+
+### lanes/nvfp4-cb/ — RETIRED 2026-09-02
+
+The Gridbook codebook lane (NVFP4-CB / FP8-CB, served by the separately
+released [`gridbook`](https://github.com/RobTand/gridbook) vLLM plugin) was
+retired on 2026-09-02 by Robert's decision: *"put Tessera in PrismaQuant and
+remove Gridbook."* The producer-side lane, its pins, its exporter, its serving
+profiles, its ship gates and its 27 lane documents are archived whole at
+`archive/gridbook_lane_2026-09-02/` — including every served measurement the
+lane produced (`prod_27b_results.md`, `prod_35b_results.md`,
+`prod_hy3_results.md`, the Phase-0 exp1/1b/1c series and the RD ceiling
+study), which stay readable there as history. Read
+`archive/gridbook_lane_2026-09-02/README.md` first: it records what the lane
+was, what replaced it, and what capability went with it.
+
+The sanctioned containers are now three: `compressed-tensors` on vanilla vLLM,
+GGUF, and the **Tessera** wire on Tessera's own vLLM plugin.
+
+
+| Path | What it is | Status |
+|---|---|---|
+| `lanes/gguf.md` | The GGUF lane: second export container, per-Linear k-quant/IQ menu, llama.cpp and vllm-gguf-plugin runtimes, five design invariants, measured 0.6B/4B tables. The `EXPORT_CONTAINER=gguf` gate (`run-pipeline.sh:97-110`) and its rendering-confound reason are accurately stated. | CURRENT — its "known limitations / open work" section is overtaken: the GPTQ-into-k-quant rounder exists (`gguf_gptq.py`, wired at `export_gguf.py:322`), MoE expert stacking exists (`export_gguf_direct.py`), imatrix weighting of packed experts exists (`moe_imatrix.py`). Invariant 5 (llama.cpp owns the container) now holds only for `export_gguf.py` |
+
+---
+
+## results/ — dated historical records
+
+None of these is guidance. Numbers are point-in-time; check the superseded-by note
+before citing anything.
+
+| Path | What it is | Status / superseded by |
+|---|---|---|
+| `results/qwen38_prismasnap_20gb_ab_2026-08-25.md` | Frozen running ledger for the first apples-to-apples PrismaSnap production gate: Qwen3.8-27B text-only/no-vision, strict decimal 20 GB, control identities/metrics, exact two-Spark protocol, and evidence paths. | RUNNING — protocol and thresholds only; result section is pending and makes no promotion or 20% improvement claim |
+| `results/gridbook_0p8p5_w8a16_gate_2026-08-12.md` | Exact Gridbook 0.8.5 installed-wheel GB10/sm121 gate: immutable commit, wheel, image, command, 91-pass/0-skip JUnit, and raw evidence paths for block-FP8 W8A16. | CURRENT route-existence, residency, and operator evidence; not full-artifact serving, performance, KL, or PPL evidence |
+| `results/qwen3_30b_a3b_profile_census_2026-08-03.md` | Contract/vLLM-qualified Qwen3-30B-A3B selection, complete safetensors census, unified `qwen3` producer bridge, and verified probe capture points. | CURRENT profile-onboarding evidence; not a quantization or serving result |
+| `results/aura_4b_dense_frontier_2026-06-05.md` | Dense 4.5→8.0 bpp AURA RD sweep on Qwen3-4B, fp32 vs bf16; frontier clean and log-linear, kneedle unstable (fp32 5.00 in 454/1000 bootstraps). | HISTORICAL — its conclusion won: selection moved off kneedle to a byte-budget + saturation-B* rule |
+| `results/fp8_gptq_mx_scale_27b_results_2026-05-21.md` | 27B tail A/B, FP8_E4M3 GPTQ vs MXFP8 with E8M0 joint-scale search: FP8 won all 149 tail Linears and all 90 fused units; the allocator then selected zero MXFP8. Explicit "do not ship". | HISTORICAL — the primary 27B evidence for de-menuing MXFP8; the joint-scale search it used has since been removed (self-bannered) |
+| `results/production_render_staged_27b_results_2026-05-21.md` | Staged production-render allocator on 27B: improved the last-token-KL screen (0.0232 vs 0.0280) and regressed direct WikiText PPL (10.83 vs 8.33). "Do not ship". | HISTORICAL — the canonical citation for "a narrow KL screen can invert against direct PPL", and the measurement carried by the `COST_MODE=production-render-staged` `exit 2` gate (walled 2026-07-30, `archive/production_render_staged_2026-07-30/`, re-vet R17) |
+| `results/milestone_qwen36_27b_fp8menu_2026-05-15.md` | Mid-flight snapshot of the 27B FP8-menu 5.05 run (allocator done, cache 25/487). Self-limiting: "not a completed shipping artifact". | HISTORICAL — superseded by the 5.31 PrismaSCOUT ship and then by the 2026-06-24 AURA regen |
+| `results/qwen36_27b_current_vs_shipped_2026-05-25.md` | Served-vLLM A/B of then-current 27B allocator output vs the shipped 5.5/5.31 artifacts (KL 0.0344 vs 0.0475/0.0551). Carries the bpp-accounting caveat: the public "5.31" body bpp is ~4.76 under current accounting. | HISTORICAL |
+| `results/qwen36_35b_mse_promotion_phase1_2026-05-25.md` | Phase-1 local-output-MSE promotion on 35B: removed 86% of stored local MSE, landed KL 0.0898 / PPL 9.81 — beat the strategic baseline, lost to both the shipped 4.75 and the 5.16 kneedle. | HISTORICAL — superseded by AURA-on-MoE; `MSE_PROMOTION` was **walled 2026-07-30** (`archive/mse_promotion_2026-07-30/`, re-vet R18) and now `exit 2`s. Ledger check before the wall: no shipped run carries `layer_config_before_mse_promotion.json` |
+| `results/qwen36_35b_propagated_group_sensitivity_2026-05-25.md` | Paired propagated-KL over 75 promotion groups on 35B; `linear_attn.layer_9` ranks local-MSE 72 but propagated 4. The direct ancestor of AURA's KL-adjoint cost. | HISTORICAL — its selection role is superseded by AURA |
+| `results/qwen36_35b_propagated_4p75_eval_2026-05-25.md` | Equal-budget test: propagated allocation vs the shipped 35B 4.75 — 0.0769 vs 0.0671 served KL. Honest negative. | HISTORICAL — superseded by AURA-on-MoE (served KL 0.0292 at 4.75 bpp) |
+| `results/qwen36_35b_propagated_5p15_eval_2026-05-25.md` | The same signal at 5.15 bpp: KL 0.0488 / PPL 9.371, beating the shipped 4.75 but spending ~0.40 extra bpp. | HISTORICAL — dominated on both axes by AURA-on-MoE |
+| `results/qwen36_35b_serving_unit_propagated_4p75_eval_2026-05-25.md` | Regrouping propagated sensitivity by **serving unit**: KL 0.0362 vs 0.0671 at equal bpp. Also the extrapolation A/B where `current_only` won the hook screen and lost full-vocab KL. | HISTORICAL — the serving-unit granularity conclusion survived into the shipped allocator (`run-pipeline.sh:216`) |
+| `results/qwen36_35b_serving_unit_pareto_2026-05-25.md` | Full Pareto re-run on the serving-unit report; the hook kneedle picked 4.70 bpp, the best materialized artifact was 5.53 (KL 0.0327). Its operational notes (`TRITON_CACHE_DIR`, `FLASHINFER_DISABLE_VERSION_CHECK`, dataset cache dir) are still live landmines. | HISTORICAL — superseded by AURA-on-MoE at 4.66–4.75 bpp |
+| `results/qwen35_0p8b_s_rung_headtohead_2026-07-22.md` | Reproducible product-K versus signed-S matched-rung screen: K won 609/776 weight-MSE comparisons; only six signed units survived the 2.6-bpp solve. | CURRENT evidence for keeping S13–S16 codec-compatible but out of production menus; not served KL/PPL |
+| `results/qwen3_4b_low_bpp_results.md` | Four-term Block-CLADO + polish at 4B in the low-bpp regime; the surrogate kneedle over-estimated 2.3×. Earliest record of cross-process KL drift, later root-caused as extension-residency address shift. | HISTORICAL — Block-CLADO lane rejected; see `archive/block_clado/` |
+| `results/union_cache_smoke_0p8b.md` | "Smart union cache": NVFP4 for every eligible Linear, FP8/MXFP8 fallbacks only above p50/p75 of the NVFP4 `output_mse` distribution — 258 vs 438 renders on Qwen3.5-0.8B. | HISTORICAL — the `PRODUCTION_CACHE_UNION` lever it proposed was **walled 2026-07-30** (`archive/union_cache_2026-07-30/`, re-vet R18): a render-budget percentile deciding which Linears may be offered an FP8 rung is a constraint on the allocator (principle 1). Now `exit 2` |
+| `results/v1_milestone_validation.md` | The V1-era pre-tag release checklist: CPU suite, full pipeline from a fresh work dir, expected artifacts, eager + graph vLLM smokes, provenance to record at tag time. | HISTORICAL — **do not follow its env block**: it puts `MXFP8_E4M3` in `FORMATS`, omits `static_act_order` from the levers, names no `COST_MODE`, and expects an artifact (`format_applicability.json`) that nothing writes. The *shape* of the gate is still right |
+
+---
+
+## audits/ — the audit series
+
+| Path | What it is | Status |
+|---|---|---|
+| `audits/cbl_export_diagnosis_2026-08-10.md` | Why learned codebooks could not reach a production artifact: the allocator's hard block, the absence of a value-bearing learned-book input to cost/cache, and a routed-MoE blocker where pinned Gridbook resolves one LUT for the fused `w13`/`w2` stacks while CBL learns distinct gate/up/down books. Establishes the safe producer scope — dense FP8-CB learned, NVFP4 lattice by default, fail closed on routed learned. | PARTLY SUPERSEDED — the allocator block it cites (`allocator.py:1980`) was lifted by the scoped-bundle stack in 0.11.0; the routed-MoE LUT-ABI blocker still stands |
+| `audits/serve_env_census_setproctitle_2026-08-14.md` | Why the serve environment census refused every correct server: it reads `/proc/<pid>/environ`, and vLLM's EngineCore renames itself via `setproctitle`, which on Linux overwrites the argv+envp block and destroys that file while `os.environ` stays intact. Structural on every lane at every commit, and never once green. Fixed with `SPT_NOENV=1` in both runtime Docker vectors. | CURRENT — fix VERIFIED end-to-end on a live server (§7, `consistent: true` with EngineCore renamed). Read §5 before assuming it unblocks the DSv4-Flash 0731 bytes; it does not |
+| `audits/math_reunderwrite_2026-08-21.md` | Full mathematical re-underwrite of the cost chain, encoders, selection and accounting: first-principles derivations cross-checked against implementations with independent numeric verification; verdicts per artifact plus two fixed defects (`solve_allocation` contract bound documented — overshoot ≤ `bit_precision·(n+3)/2`, proven; MTP Lambert-W overflow silently disabling scipy on ~41% of plausible range — log-space rescale + Newton continuation + loud solver status) and new proofs (two-tier scale-code 2-to-1 structure with empty exception set; rearrangement envelope for the ½·H·MSE collapse; charged-bin backtrack sufficiency). Paper consistency edits applied to `paper/main.tex` under the claims-test constraints. Gridbook-side companion on that repository's branch. | CURRENT
+| `audits/serving_wheel_cache_poisoning_2026-08-14.md` | A wheel that failed the pinned-digest check was still moved into the digest-named cache, which the fast path then trusts forever — one `pip download` bricked the DSpark serving lane. Root cause: Bash disables `errexit` inside a command substitution in a `\|\|` list, so the pre-`mv` verify never aborted. Also records that the PyPI and served-image 0.8.6 wheels are content-identical but different archives. | CURRENT — fixed in v0.12.3; §5 has the operational prerequisite for any serve run |
+| `audits/numerical_audit_2026-07-02.md` | Seven-domain line-by-line numerical audit: 2 criticals (NVFP4 `input_global_scale` 448× convention; `block_output_match` scale blow-up on negative max), majors M1–M19, plus a same-day fix-status addendum. It annotates its own closure and marks its own superseded section — the template for maintaining a results doc. | HISTORICAL — all findings closed; keep unedited as the reference for the residual open knobs |
+| `audits/audit_findings_2026-05-22.md` | Five-finding quantization-correctness audit (MXFP4 E8M0 encoding, MXFP8 activation semantics, missing registry↔served-metadata reconciliation gate, missing cost-surrogate anchor fixture, duplicated codec math), all fixed in-patch with pinning tests that still exist. | HISTORICAL |
+| `audits/audit_questions_2026-05-22.md` | The five product/serving decisions deliberately *not* filed as findings. Q1 — research-only registry entries need an explicit exportability predicate, not a test-side allowlist — is still open (`format_registry.py:666,693,742,751`). | HISTORICAL |
+| `audits/codebase_audit_2026-05-10.md` | Post-cross-layer-archive surface reduction: what moved to `archive/tiny_bakeoff_2026-05-10/`, what consolidated, what stayed live. Its method — import graph + AST duplicate scan + reference search, tests before consolidating helpers — is the standing recipe. | HISTORICAL |
+| `audits/kl_validation_inplace_replay_2026-05-12.md` | Infra smoke for in-place assignment materialization in `validate_assignments_kl` — destructive copy into the live CUDA model instead of preloading the whole cache; 27B n=16 replay, swap flat at ~240 MiB. | HISTORICAL — its KL numbers are last-token screen values; never quote them as quality results |
+
+---
+
+## research/ — literature surveys
+
+External-evidence surveys: what the published literature and shipped open-source
+practice actually establish, kept separate from this project's own measurements
+so a citation is never mistaken for a result of ours.
+
+| Path | What it is | Status |
+|---|---|---|
+| `research/nvidia_ampere_int8_gridbook_feasibility_2026-08-24.md` | Native INT8 Gridbook feasibility on RTX 30-series/SM86: instruction and resource facts, numeric/wire-format implications, and the minimum graph/physical qualification sequence if the lane is ever reopened. | CURRENT decision note — technically feasible, but explicit NO-GO for implementation, a dedicated prototype, registry/runtime work, or a hardware campaign under the present demand signal |
+| `research/calibration-data/SURVEY.md` | Calibration data for PTQ, with emphasis on sparse MoE: where the ~0.25M-token dense convention comes from (GPTQ 128×2048, AutoAWQ 128×512, SmoothQuant 512×512) and why it is a convention rather than a measured optimum; what the controlled size and composition studies do and do not establish. Every claim carries a source link and an evidence grade. | CURRENT — evidence checked through 2026-08-03; the MoE-specific gap it identifies (none of the dense size results transfer to rare experts) is still open |
+| `research/rotation-codebooks/SURVEY.md` | Rotations, learned codebooks and second-order compensation: why a change of basis and a codebook solve different problems, and how much of incoherence a flexible per-tensor codebook can absorb. Mechanistic inference from QuIP / QuIP# / QTIP / AQLM, labelled as inference. | CURRENT — evidence checked through 2026-08-03; records an explicit NEGATIVE finding: no measured evidence was found that holds a per-tensor learned, FP-grid-constrained product codebook fixed in capacity and ablates rotation on/off at 2–3 bits, which is exactly the comparison the CB formats would need |
+
+Each survey ships its `bibliography.json` beside it; the survey cites by key and
+the bibliography is what those keys resolve to.
+
+---
+
+## archive/ — superseded narratives
+
+| Path | What it is | Status |
+|---|---|---|
+| `archive/prismaquant_design.md` | The 58 KB master design doc (last touched 2026-06-12). Superseded wholesale by `ARCHITECTURE.md`. | ARCHIVED — never mentions AURA, the CB lane, or the GGUF lane; roughly half its `file:line` citations have drifted; §3.5 cites four modules that do not exist; §6.3/§12.2 contradict §10/§13.4 inside the same file. §11 (rejected alternatives) is the part worth reading |
+| `archive/prismascout_overview.md` | One-page statement of PrismaSCOUT as "the current selection layer in PrismaQuant". | ARCHIVED — the spine was retired 2026-06-08 in favour of AURA; two of its five pipeline steps name symbols absent from the tree. Its contract sentence — surrogate scores may rank and prune, but nothing ships without a real KL gate — is the durable line |
+| `archive/prismascout_handover_2026-05-03.md` | Codex-to-Codex handover on PrismaSCOUT/SMRF; origin of the 5.3117 bpp / KL 0.0151 point that became the shipped 27B flagship, against a surrogate-only knee of 5.857/0.0557. | ARCHIVED — self-bannered; its "new feature" section documents removed code |
+| `archive/propagated_cost.md` | Tombstone for the L3 propagated-cost polish path. Correct about intent: the `kl_measurement.py` functions still exist, the allocation entry point does not. | ARCHIVED |
+| `archive/vectorization_refactor.md` | 2026-04 plan to de-Python-ify the pipeline for MoE-heavy checkpoints. | ARCHIVED — a dated intent list, partly unexecuted: per-layer activation bundles were never built and inner-loop `empty_cache()` calls remain (`incremental_measure_quant_cost.py:531,672,694`) |
+| `archive/block_clado/` (6 files) | The Block-CLADO lane: the pipeline design plus five results docs (smoke, iterate, output-Fisher, full-OF, final). Three contain runnable-looking "Recommended pipeline" blocks for modules absent from the tree. | ARCHIVED — lane rejected; the rejection record is `archive/cross_layer_2026-05-09/README.md:20-25`. Durable content: pair terms get the frontier *shape* right while ranking at ρ=0.23, and modelled pairwise interaction Ω_ij is uncorrelated with the four-term truth (ρ=−0.10) |
+| `archive/codex-process/` (3 files) | The closed 2026-06-09 exhaustive review: `CODEX_QUEUE.md` (dispatch order), `CODEX_QUEUE_FINDINGS.md` (all 82 findings with evidence), `CODEX_PROGRESS.md` (per-finding disposition). | ARCHIVED — closed 2026-06-22; moved off the repo root because as root files they read as active instructions. Line references inside are pinned to June code. One entry is now inverted: MAJOR-M10's "no `COST_MODE=aura` in run-pipeline" is false on HEAD |
+
+---
+
+## Local-only, unpublished
+
+Absent from a fresh clone. Do not cite outward; treat every claim in them as a lead.
+
+| Path | What it holds | Why unpublished |
+|---|---|---|
+| `docs/handovers/` (17 files + `README.md`) | Dated session-handover records, 2026-04-29 → 2026-07-19. Narrative arc only; their "open items" sections are frequently superseded. | Gitignored (`.gitignore:22-23`, README excepted) — session history is local working state, not documentation |
+| `.claude/codex-*`, `.claude/aura-review-brief-*` (30 files) | The Codex/Gemini multi-model deliberation archive: briefs, adversarial reviews, raw CLI transcripts, signoffs. Includes the AURA red-team blockers and the MoE cost-gate failure that produced the shipped empirical-expert hybrid. | Process history, not documentation; several positions were later inverted by production evidence |
+| `scratch/deliberation/`, `scratch/review-2026-06-09/`, `scratch/doc-consolidation-2026-07-30/`, `scratch/hf_readmes/`, `scratch/gridbook-launch-post.md` | Working notes, the per-file doc censuses behind this index, HF card drafts, draft launch copy, one-off analysis scripts. | Gitignored (`.gitignore:15`) — working state; the launch post is marketing copy, not documentation |
+| `references/` | Third-party prior art: ~12 PDFs (CLADO, HAWQ-V3, AMQ, ImPQ, ParoQuant, CoopQ), the vendored HTQ clone, and the low-bit-kernel conference thread. | Gitignored (`.gitignore:14`) — vendored third-party material, not ours to redistribute |
+
+---
+
+## Satellite docs
+
+| Path | What it is |
+|---|---|
+| `paper/main.tex` | The canonical AURA narrative — *"AURA: Production-Faithful KL–Fisher Allocation"*. The derivations live here and nowhere else: `sec:additivity` (why cross-layer modelling was retired), `sec:aura` (the cost), `sec:rd` (frontier geometry), `sec:limits` (honest accounting). Built PDF alongside. **CURRENT** |
+| `paper/archive/` | The retired PrismaSCOUT paper (source + PDF), an earlier legacy build, the explainer animation, and 13 retired figure sources. **ARCHIVED**, already walled |
+| [Tessera repository](https://github.com/RobTand/tessera) | Canonical wire, encoder, serving plugin (`tessera.serving`), tests, packaging and releases. PrismaQuant consumes one immutable pin plus the packaged runtime contract; no source copy lives here. (The Gridbook repository held this row until 2026-09-02; that lane is retired and PrismaQuant no longer pins it.) |
+| `prismaquant/README.md` | 17-line package note listing six `python -m` entrypoints. **STALE** — omits the AURA, GGUF and CB stage modules, and never says that `prismaquant/run-pipeline.sh` is the orchestrator, so a `pip install` reader has no route to the entry point that matters |
+| `README.md` (repo root) | Public README: AURA framing, served results, quickstarts, format/architecture/artifact tables, and the external pinned serving-runtime boundary. **CURRENT** — container-specific kernel ownership is stated explicitly; its Gridbook lane section was replaced with a dated retirement note on 2026-09-02 |
+| `AGENTS.md` | Normative agent rules: 10 core principles plus a before-editing / before-finishing checklist. **CURRENT** — three container-specific ship gates, GPU-bound resident-prefetched production paths, exact quantizable-parameter bpp accounting, and same-commit architecture maintenance are explicit |
+| `CLAUDE.md` | The working agreement and project brain: how Robert works, the methodological spine, the graveyard, the operational landmines. **CURRENT** as intent; its snapshot sections (§6 file map, §8 current state) drift and are subordinate to code |
+| `archive/` (repo root, 17 walls) | The graveyard: one dated directory per rejected method, each with a `README.md` banner stating why it lost. **Load-bearing — never move.** Four walls are cited by path in `run-pipeline.sh` `exit 2` messages (`grouped_kl_2026-05-28`, `hdq_2026-05-14`, `fisher_2026-05-15`, `multi_shot_2026-05-19`). Convention is dated directory name + top-level banner, and as of 2026-07-30 every wall satisfies both |

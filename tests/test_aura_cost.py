@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from prismaquant.aura_cost import compute_aura_cost
+from prismaquant.aura_cost import _delta_w, compute_aura_cost
 from prismaquant.kl_fisher import fisher_quadratic_form
 
 
@@ -55,6 +55,70 @@ class _FakeCache:
 def _ids(batch=2, seqlen=8, vocab=64, seed=0):
     g = torch.Generator().manual_seed(seed)
     return torch.randint(0, vocab, (batch, seqlen), generator=g)
+
+
+def test_aura_cb_delta_refuses_unweighted_direct_fallback():
+    with pytest.raises(RuntimeError, match="requires a production-cache render"):
+        _delta_w(
+            "layer.q_proj",
+            "NVFP4_CB_K16",
+            torch.randn(2, 256),
+            cache=None,
+        )
+
+
+def test_aura_cb_provenance_comes_from_cache_not_current_env(monkeypatch):
+    from prismaquant.nvfp4_cb_footprint import (
+        CBSerializationContext,
+        cb_serialization_context_stamp,
+    )
+    from prismaquant.production_weight_cache import (
+        ProductionWeightCache,
+        bind_cb_render_identity_source_weights,
+        build_production_cache_cb_render_identity,
+    )
+
+    torch.manual_seed(9)
+    model = TinyLM().eval()
+    fmt = "NVFP4_CB_K16"
+    context = CBSerializationContext.legacy_v1()
+    col_weights = {"body": torch.ones(model.body.in_features)}
+    identity = build_production_cache_cb_render_identity(
+        {"body": (fmt,)},
+        cb_serialization_context=context,
+        col_weights=col_weights,
+        render_levers={"weighted_vq": True},
+        render_mechanism_plan=[],
+    )
+    identity = bind_cb_render_identity_source_weights(
+        identity,
+        {"body": model.body.weight.detach()},
+    )
+    cache = ProductionWeightCache(
+        weights={
+            ("body", fmt): model.body.weight.detach().clone() + 0.03125,
+        },
+        levers={"weighted_vq": True},
+        metadata={"cb_render_identity": identity},
+    )
+    monkeypatch.setenv("CB_SCALE_CODING", "two_tier")
+    monkeypatch.setenv("CB_CODEBOOK_SOURCE", "lattice")
+
+    payload = compute_aura_cost(
+        model,
+        _ids(batch=1, seqlen=4),
+        [fmt],
+        n_probes=1,
+        n_linear_chunks=1,
+        production_cache=cache,
+        require_production_cache=True,
+        min_free_gib=0.0,
+    )
+
+    assert payload["provenance"]["cb_serialized_payload"] == (
+        identity["cb_serialized_payload"]
+    )
+    assert payload["provenance"]["cb_render_identity"] == identity
 
 
 def test_estimator_matches_exact_fisher_quadratic():
@@ -188,7 +252,7 @@ def test_per_probe_samples_align_and_reproduce_mean():
         assert abs(0.5 * sum(xs) / 6 - row["predicted_dloss"]) < 1e-12
 
 
-def test_additivity_gate_exact_correlated_stderr():
+def test_additivity_gate_legacy_correlated_stderr_has_unverified_alignment():
     import math
     from prismaquant.aura_additivity_gate import additivity_gate
 
@@ -198,7 +262,7 @@ def test_additivity_gate_exact_correlated_stderr():
         n_probes=8, min_free_gib=0.0, n_linear_chunks=1,
     )
     assignment = {n: "NVFP4" for n in payload["costs"]}
-    # Exact stderr must equal the std-of-per-probe-sums computed by hand.
+    # Preserve the legacy arithmetic, but array lengths are not probe identity.
     K = 8
     sums = [0.0] * K
     for n in payload["costs"]:
@@ -210,7 +274,8 @@ def test_additivity_gate_exact_correlated_stderr():
     expected_sum = 0.5 * mean_s
 
     out = additivity_gate(payload, assignment, measured_kl=expected_sum * 1.1)
-    assert out["stderr_method"] == "per_probe_exact"
+    assert out["stderr_method"] == "per_probe_unverified"
+    assert out["probe_alignment_verified"] is False
     assert abs(out["predicted_sum"] - expected_sum) < 1e-12
     assert abs(out["predicted_stderr"] - expected_stderr) < 1e-12
     assert abs(out["residual"] - 0.1 * expected_sum) < 1e-9
@@ -406,6 +471,30 @@ class _PackedModel(nn.Module):
         self.model.layers[0].mlp.experts = _PackedExperts()
 
 
+class _Dsv4UnpackedExpert(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_proj = nn.Linear(32, 32, bias=False)
+        self.up_proj = nn.Linear(32, 32, bias=False)
+        self.down_proj = nn.Linear(32, 32, bias=False)
+
+
+class _Dsv4UnpackedModel(nn.Module):
+    """DSv4 live/probe shape: routed experts are per-expert Linears."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Module()])
+        layer = self.model.layers[0]
+        layer.self_attn = nn.Module()
+        layer.self_attn.q_proj = nn.Linear(32, 32, bias=False)
+        layer.mlp = nn.Module()
+        layer.mlp.experts = nn.ModuleList(
+            [_Dsv4UnpackedExpert(), _Dsv4UnpackedExpert()]
+        )
+
+
 def test_aura_guard_rejects_packed_experts_by_default():
     with pytest.raises(RuntimeError, match="packed-MoE expert costs"):
         _guard_packed_expert_coverage(_PackedModel())
@@ -429,3 +518,43 @@ def test_aura_guard_allows_dense_only_models():
     assert _guard_packed_expert_coverage(model) == []
 
 
+def test_aura_guard_rejects_profile_declared_dsv4_unpacked_experts():
+    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+
+    with pytest.raises(RuntimeError, match="expert costs"):
+        _guard_packed_expert_coverage(
+            _Dsv4UnpackedModel(),
+            DeepseekV4Profile(),
+        )
+
+
+def test_aura_smooth_targets_exclude_dsv4_unpacked_experts():
+    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+
+    model = _Dsv4UnpackedModel()
+    profile = DeepseekV4Profile()
+    omitted = _guard_packed_expert_coverage(
+        model,
+        profile,
+        allow_omission=True,
+    )
+
+    assert omitted == [
+        f"model.layers.0.mlp.experts.{expert_id}.{projection}"
+        for expert_id in range(2)
+        for projection in ("down_proj", "gate_proj", "up_proj")
+    ]
+    assert list(_target_linears(model, profile=profile)) == [
+        "model.layers.0.self_attn.q_proj"
+    ]
+
+
+def test_aura_guard_fails_closed_when_profile_cannot_classify_experts():
+    from prismaquant.model_profiles.deepseek_v4 import DeepseekV4Profile
+
+    class BrokenProfile(DeepseekV4Profile):
+        def packed_expert_format_group(self, qname: str):
+            raise LookupError(f"classification unavailable for {qname}")
+
+    with pytest.raises(RuntimeError, match="could not determine routed-expert"):
+        _guard_packed_expert_coverage(_Dsv4UnpackedModel(), BrokenProfile())

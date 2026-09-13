@@ -13,16 +13,26 @@ Checks, in order:
 
   1. **Serve check** — vLLM actually starts the model (load, MTP
      wrapper, CUDA graph capture) with the recipe's flags.
-  2. **Generation sanity** — small set of prompts must produce
-     coherent outputs. Filters obvious catastrophic breakage
-     (NaN/repetition loops/nonsense) before wasting on stats.
-  3. **Perplexity / NLL** — logprobs over a diverse held-out
-     prompt suite. Hard thresholds: `ppl < MAX_PPL` and
-     worst per-prompt NLL < `MAX_P99_NLL` (legacy flag name).
-     The worst-prompt guard catches the 27B failure mode where
-     80% of prompts scored NLL~10 while 2/10 scored normally.
-  4. **MTP acceptance** — if spec-decode is on, per-position
-     acceptance > `MIN_MTP_ACCEPT_P0` at position 0.
+   2. **Generation sanity** — small set of prompts must produce
+      coherent outputs. Filters obvious catastrophic breakage
+      (NaN/repetition loops/nonsense) before wasting on stats.
+   3. **Boundary behavior** — sampled (temperature > 0) generations over
+      terse boundary-stressing prompts (`BOUNDARY_PROMPTS`), scored
+      mechanically for `</think>` stutter/loop, zero-tag runaway, and
+      cap-truncation-before-answer. The chat endpoint is mandatory: raw
+      completions do not apply the model's reasoning template. Zero defects
+      under 64 tokens remains a fail-closed historical default pending #87's
+      paired-control policy; it is not a calibrated universal claim. This
+      is the axis KL/PPL (distribution distance) and greedy-smoke (argmax
+      agreement) cannot see at any threshold: three DSV4-Flash quants
+      within ~3% PPL spanned a 6x behavioral gap (14/180 to 83/180).
+   4. **Perplexity / NLL** — logprobs over a diverse held-out
+      prompt suite. Hard thresholds: `ppl < MAX_PPL` and
+      worst per-prompt NLL < `MAX_P99_NLL` (legacy flag name).
+      The worst-prompt guard catches the 27B failure mode where
+      80% of prompts scored NLL~10 while 2/10 scored normally.
+   5. **MTP acceptance** — if spec-decode is on, per-position
+      acceptance > `MIN_MTP_ACCEPT_P0` at position 0.
 
 Use from CI or pre-ship hook:
 
@@ -78,6 +88,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field, asdict
 
 
@@ -109,6 +120,59 @@ GEN_PROMPTS: list[str] = [
     "The single most important fact about photosynthesis is",
 ]
 
+# Boundary-behavior prompts — terse, boundary-token-stressing inputs scored
+# under SAMPLING for `</think>` stutter/loop, zero-tag runaway, and
+# cap-truncation-before-answer (issue #87).
+#
+# Why this gate exists: quantized DSV4-Flash artifacts stutter or fail to emit
+# a clean `</think>` on ultra-short numeric prompts under sampling while the
+# answer stays correct. Greedy takes the argmax path where the boundary token
+# still wins, and KL/PPL average a per-token near-tie at one boundary position
+# into noise — so no argmax-agreement or distributional-distance gate can see
+# the defect at any threshold, while under a token cap the model never reaches
+# its answer. Three independently built DSV4-Flash quants sat within ~3% PPL
+# of each other while the behavioral battery spanned 14/180 → 83/180.
+#
+# Strata (proposal: ultra-short numeric, terse QA, short recall). The first
+# three prompts are verbatim from the issue report (`144÷12`, `9²`, and the
+# spider-legs terse QA that zero-tag-ran 5/6 on the broken artifact); the last
+# two are same-strata companions (one more ultra-short numeric, one short
+# recall) so each stratum is exercised more than once.
+BOUNDARY_PROMPTS: tuple[str, ...] = (
+    "144÷12",
+    "9²",
+    "How many legs does a spider have?",
+    "What is 7×8?",
+    "Name the capital of France.",
+)
+
+#: Closed defect vocabulary for one sampled generation. `zero_tag` (no
+#: `</think>` emitted — the runaway shape), `think_stutter` (more than one
+#: `</think>` — the stutter/loop shape), and `cap_truncation` (the server
+#: stopped on `length`). A cap hit describes censored output; healthy thinking
+#: models can also exhaust the historical cap, so it alone does not establish
+#: an artifact defect (issue #87).
+BOUNDARY_DEFECTS: tuple[str, ...] = (
+    "zero_tag",
+    "think_stutter",
+    "cap_truncation",
+)
+
+THINK_CLOSE_TAG = "</think>"
+
+# The boundary gate must exercise the model's chat template.  Raw
+# ``/v1/completions`` continues the literal user string and therefore never
+# enters a thinking model's reasoning scaffold.  These values are also filed
+# in the shipcard metrics so offline replay can reject a clean-looking count
+# produced under the old, structurally blind request.
+BOUNDARY_ENDPOINT = "/v1/chat/completions"
+BOUNDARY_REQUEST_SCHEMA = "prismaquant.boundary_chat_request/1"
+BOUNDARY_RESPONSE_SCHEMA = "prismaquant.boundary_chat_response/1"
+BOUNDARY_CHAT_TEMPLATE_KWARGS = {
+    "thinking": True,
+    "enable_thinking": True,
+}
+
 
 # -----------------------------------------------------------------
 # Default thresholds (tune via CLI if needed)
@@ -118,11 +182,32 @@ DEFAULT_MAX_P99_NLL = 6.0
 DEFAULT_MAX_MEAN_NLL = 3.0
 DEFAULT_MIN_GEN_LEN = 30               # chars in each generated completion
 DEFAULT_MIN_MTP_ACCEPT_P0 = 0.60       # position-0 accept fraction
+# Boundary-behavior gate (issue #87).  Temperature 1.0 is the unmodified
+# distribution and `REPS` 6 is the published battery's own replication count.
+# The zero bound and 64-token cap are retained as fail-closed historical
+# defaults only while the paired-control policy is unresolved: a first real
+# endpoint audit found healthy DSV4 at 7/30 defects under 64 tokens and stock
+# Qwen3-8B at 10/15 even under 600.  They are not calibrated universal claims
+# and must not be used to close #87 or promote an artifact without the pending
+# same-session control decision.
+DEFAULT_MAX_BOUNDARY_DEFECTS = 0
+DEFAULT_BOUNDARY_TEMPERATURE = 1.0
+DEFAULT_BOUNDARY_MAX_TOKENS = 64
+DEFAULT_BOUNDARY_REPS = 6
 
 
 # -----------------------------------------------------------------
 # Data classes
 # -----------------------------------------------------------------
+class SpecDecodeUndetermined(RuntimeError):
+    """The spec-decode guard could not read /metrics.
+
+    Distinct from "spec-decode is off": the perplexity check refuses on this
+    rather than proceeding, because the failure mode it guards against
+    (publishing the DRAFT model's NLL as the target's) is silent.
+    """
+
+
 @dataclass
 class CheckResult:
     name: str
@@ -160,9 +245,33 @@ def _get_text(url: str, timeout: float = 30.0) -> str:
         return resp.read().decode("utf-8")
 
 
+def _server_root(base_url: str) -> str:
+    """Server root for the operational endpoints, from the OpenAI API root.
+
+    `/health` and `/metrics` are mounted at the SERVER root; the completions
+    endpoints live under `/v1`.  ``--base-url`` names the latter, so appending
+    `/health` to it yields `/v1/health`, which vLLM answers with 404.
+
+    Measured 2026-08-14 on the Qwen3.8-27B ship gate: `wait_for_ready` polled
+    `/v1/health` for 11 minutes and would have timed out at 900 s without
+    sending a single prompt, while `/metrics` failed the same way and made the
+    spec-decode guard fail OPEN (see `_spec_decode_on`).
+
+    Only a trailing `/v1` is stripped, so a serve behind `--root-path /foo`
+    (`http://h:8000/foo/v1`) resolves to `http://h:8000/foo` rather than being
+    flattened to the bare host.
+    """
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    return root
+
+
 def _health_ok(base_url: str) -> bool:
     try:
-        with urllib.request.urlopen(f"{base_url}/health", timeout=5.0) as r:
+        with urllib.request.urlopen(
+            f"{_server_root(base_url)}/health", timeout=5.0
+        ) as r:
             return r.status == 200
     except Exception:
         return False
@@ -181,11 +290,24 @@ def _spec_decode_on(base_url: str) -> bool:
     the NLL values returned are the 1-layer MTP head's logprobs,
     NOT the target model's. Those are not usable for target-model
     perplexity measurement. Detecting the condition lets the
-    validator refuse to silently mis-report."""
+    validator refuse to silently mis-report.
+
+    THIS GUARD FAILS CLOSED.  It used to swallow every fetch error and
+    return False, which reads as "spec-decode is off" — so an unreachable
+    `/metrics` produced a confident all-clear from the one check whose job is
+    to stop a draft-model NLL being published.  Until 2026-08-14 the URL was
+    also wrong (`/v1/metrics`, 404), so on the standard `--base-url .../v1`
+    invocation the guard could never fire at all.  An indeterminate answer is
+    now an exception, not a False.
+    """
     try:
-        text = _get_text(f"{base_url}/metrics")
-    except Exception:
-        return False
+        text = _get_text(f"{_server_root(base_url)}/metrics")
+    except Exception as exc:  # noqa: BLE001 - re-raised as a refusal below
+        raise SpecDecodeUndetermined(
+            f"cannot read {_server_root(base_url)}/metrics ({exc}); refusing "
+            "to certify perplexity, because a guard that cannot see the "
+            "server must not report 'no spec-decode'"
+        ) from exc
     return "vllm:spec_decode" in text
 
 
@@ -255,6 +377,203 @@ def check_generation_sanity(base_url: str, model_name: str,
     )
 
 
+def score_boundary_text(
+    text: str,
+    finish_reason: str | None = None,
+) -> dict:
+    """Score one sampled generation for boundary-token defects (pure).
+
+    Stdlib-only and server-free, so the gate's decision rule is unit-testable
+    without a serve: the same function the live check calls is what the tests
+    pin. Returns `{"think_tag_count": int, "defects": [...]}` with defects
+    drawn from :data:`BOUNDARY_DEFECTS`.
+    """
+    body = text if isinstance(text, str) else ""
+    count = body.count(THINK_CLOSE_TAG)
+    defects: list[str] = []
+    if count == 0:
+        defects.append("zero_tag")
+    elif count > 1:
+        defects.append("think_stutter")
+    if finish_reason == "length":
+        defects.append("cap_truncation")
+    return {"think_tag_count": count, "defects": defects}
+
+
+def _boundary_text_from_chat_choice(choice: Mapping) -> tuple[str, str]:
+    """Recover boundary semantics from one chat-completion choice.
+
+    vLLM without a reasoning parser returns the raw generated text in
+    ``message.content``.  With a parser, it consumes the first ``</think>`` and
+    returns the two sides as ``message.reasoning`` (current spelling) or
+    ``message.reasoning_content`` (older OpenAI-compatible spelling).  In the
+    structured case we synthesize exactly that one consumed delimiter only
+    when both reasoning-side and answer-side content are non-empty.  A second
+    delimiter remains in content and is still scored as stutter; an empty
+    side remains zero-tag/cap-truncation rather than receiving an invented
+    close token.
+
+    The accepted shapes are deliberately closed.  An ambiguous pair of
+    non-null reasoning fields or a non-string field is a malformed response,
+    not a clean generation.
+    """
+    if not isinstance(choice, Mapping):
+        raise TypeError("chat choice is not an object")
+    message = choice.get("message")
+    if not isinstance(message, Mapping):
+        raise TypeError("chat choice is missing message object")
+
+    content = message.get("content")
+    if content is not None and not isinstance(content, str):
+        raise TypeError("chat message.content is not a string or null")
+
+    structured: list[tuple[str, str]] = []
+    for field_name in ("reasoning", "reasoning_content"):
+        value = message.get(field_name)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise TypeError(
+                f"chat message.{field_name} is not a string or null")
+        structured.append((field_name, value))
+    if len(structured) > 1:
+        raise ValueError(
+            "chat message carries both reasoning and reasoning_content")
+
+    if structured:
+        field_name, reasoning = structured[0]
+        if reasoning and content:
+            return reasoning + THINK_CLOSE_TAG + content, field_name
+        if not reasoning:
+            return reasoning, f"{field_name}_empty"
+        return reasoning, f"{field_name}_without_content"
+    if content is None:
+        raise TypeError(
+            "chat message has neither content nor structured reasoning")
+    return content, "content"
+
+
+def check_boundary_behavior(
+    base_url: str,
+    model_name: str,
+    max_defects: int = DEFAULT_MAX_BOUNDARY_DEFECTS,
+    *,
+    temperature: float = DEFAULT_BOUNDARY_TEMPERATURE,
+    max_tokens: int = DEFAULT_BOUNDARY_MAX_TOKENS,
+    reps: int = DEFAULT_BOUNDARY_REPS,
+    prompts: tuple[str, ...] | list[str] = BOUNDARY_PROMPTS,
+) -> CheckResult:
+    """Sample chat-templated prompts and score `</think>` behavior.
+
+    Each prompt is sampled `reps` times at `temperature > 0` (sampling, not
+    the argmax path greedy-smoke takes) with a small `max_tokens` cap, and
+    every generation is scored by :func:`score_boundary_text`.  The request
+    uses ``/v1/chat/completions`` with a ``messages`` body; raw completions do
+    not apply the model's chat template and cannot exercise this boundary.
+    Reasoning-parser responses are recovered through
+    :func:`_boundary_text_from_chat_choice` before scoring. Fails when
+    total flagged generations exceed `max_defects`. The historical 64-token
+    cap and zero bound remain fail-closed pending #87's paired-control policy;
+    neither is a calibrated universal artifact-quality threshold. Runs
+    alongside KL/PPL, not replacing them.
+    """
+    invalid = []
+    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+            or not math.isfinite(temperature) or temperature <= 0):
+        invalid.append(f"boundary_temperature={temperature!r} is not sampling; must be finite and > 0")
+    if type(reps) is not int or reps <= 0:
+        invalid.append(f"boundary_reps={reps!r} must be a positive integer")
+    if type(max_tokens) is not int or max_tokens <= 0:
+        invalid.append(f"boundary_max_tokens={max_tokens!r} must be a positive integer")
+    if type(max_defects) is not int or max_defects < 0:
+        invalid.append(f"max_boundary_defects={max_defects!r} must be a non-negative integer")
+    if (not isinstance(prompts, (tuple, list)) or not prompts
+            or any(not isinstance(prompt, str) or not prompt.strip() for prompt in prompts)):
+        invalid.append("boundary_prompts must be a nonempty sequence of nonempty strings")
+    if invalid:
+        return CheckResult(
+            name="boundary_behavior",
+            passed=False,
+            detail="invalid sampling contract: " + "; ".join(invalid),
+        )
+    n_defects = 0
+    by_kind: dict[str, int] = {kind: 0 for kind in BOUNDARY_DEFECTS}
+    response_modes: dict[str, int] = {}
+    failing_examples: list[dict] = []
+    n_generations = 0
+    for prompt in prompts:
+        for _rep in range(reps):
+            try:
+                r = _post_json(
+                    f"{_server_root(base_url)}{BOUNDARY_ENDPOINT}",
+                    {
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "include_reasoning": True,
+                        "skip_special_tokens": False,
+                        "chat_template_kwargs": dict(
+                            BOUNDARY_CHAT_TEMPLATE_KWARGS),
+                    },
+                )
+                choice = r["choices"][0]
+                text, response_mode = _boundary_text_from_chat_choice(choice)
+                response_modes[response_mode] = (
+                    response_modes.get(response_mode, 0) + 1)
+                finish = choice.get("finish_reason")
+                if finish is not None and not isinstance(finish, str):
+                    raise TypeError(
+                        "chat choice.finish_reason is not a string or null")
+            except Exception as e:
+                return CheckResult(
+                    name="boundary_behavior",
+                    passed=False,
+                    detail=f"request failed on {prompt!r}: "
+                           f"{type(e).__name__}: {e}",
+                )
+            scored = score_boundary_text(text, finish)
+            n_generations += 1
+            for kind in scored["defects"]:
+                by_kind[kind] = by_kind.get(kind, 0) + 1
+            if scored["defects"]:
+                n_defects += 1
+                if len(failing_examples) < 5:
+                    failing_examples.append({
+                        "prompt": prompt,
+                        "defects": list(scored["defects"]),
+                        "think_tag_count": scored["think_tag_count"],
+                        "finish_reason": finish,
+                        "excerpt": text[:200],
+                    })
+    metrics = {
+        "endpoint": BOUNDARY_ENDPOINT,
+        "request_schema": BOUNDARY_REQUEST_SCHEMA,
+        "response_schema": BOUNDARY_RESPONSE_SCHEMA,
+        "response_modes": response_modes,
+        "n_prompts": len(list(prompts)),
+        "reps": reps,
+        "n_generations": n_generations,
+        "n_defects": n_defects,
+        "max_defects": max_defects,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "defects_by_kind": by_kind,
+        "failing_examples": failing_examples,
+    }
+    passed = n_defects <= max_defects
+    return CheckResult(
+        name="boundary_behavior",
+        passed=passed,
+        detail=(f"{n_defects}/{n_generations} boundary-defective generations "
+                f"(≤ {max_defects} allowed)"
+                if not passed else
+                f"all {n_generations} sampled generations clean "
+                f"({len(list(prompts))} prompts × {reps} reps)"),
+        metrics=metrics,
+    )
+
+
 def check_perplexity(base_url: str, model_name: str,
                      max_ppl: float, max_p99_nll: float,
                      max_mean_nll: float,
@@ -289,7 +608,16 @@ def check_perplexity(base_url: str, model_name: str,
     without --speculative-config; see the module docstring for the
     standard two-serve workflow.
     """
-    if _spec_decode_on(base_url):
+    try:
+        spec_on = _spec_decode_on(base_url)
+    except SpecDecodeUndetermined as exc:
+        return CheckResult(
+            name="perplexity",
+            passed=False,
+            detail=str(exc),
+            metrics={"spec_decode_detected": None, "skipped": True},
+        )
+    if spec_on:
         return CheckResult(
             name="perplexity",
             passed=False,
@@ -363,6 +691,7 @@ def check_perplexity(base_url: str, model_name: str,
         "max_nll_per_tok": max_nll,
         "per_prompt_avg_nll": per_prompt_avg_nll,
         "n_tokens": total_tokens,
+        "spec_decode_detected": False,
     }
 
     reasons = []
@@ -386,7 +715,7 @@ def check_mtp_acceptance(base_url: str, min_p0: float) -> CheckResult:
     position-0 acceptance fraction exceeds `min_p0`. If no spec-decode
     metrics are exposed (spec-decode not enabled), passes with 'skipped'."""
     try:
-        text = _get_text(f"{base_url}/metrics")
+        text = _get_text(f"{_server_root(base_url)}/metrics")
     except Exception as e:
         return CheckResult(
             name="mtp_acceptance",
@@ -429,10 +758,22 @@ def run_validation(
     max_p99_nll: float = DEFAULT_MAX_P99_NLL,
     min_gen_len: int = DEFAULT_MIN_GEN_LEN,
     min_mtp_accept_p0: float = DEFAULT_MIN_MTP_ACCEPT_P0,
+    max_boundary_defects: int = DEFAULT_MAX_BOUNDARY_DEFECTS,
+    boundary_temperature: float = DEFAULT_BOUNDARY_TEMPERATURE,
+    boundary_max_tokens: int = DEFAULT_BOUNDARY_MAX_TOKENS,
+    boundary_reps: int = DEFAULT_BOUNDARY_REPS,
     wait_seconds: float = 900.0,
     bos_token: str | None = None,
     add_special_tokens: bool = True,
 ) -> ValidationReport:
+    # `base_url` is the SERVER root, not the OpenAI API root: this module
+    # appends `/v1/completions` itself and reads `/health` and `/metrics` off
+    # the root. Callers naturally pass the OpenAI root instead (the lane spec
+    # published `http://127.0.0.1:8000/v1`), which silently yields
+    # `/v1/v1/completions` and `/v1/health` — all 404, so the run waits out its
+    # full 900 s timeout having sent no prompt. Normalizing here rather than at
+    # each call site keeps the two spellings from diverging again.
+    base_url = _server_root(base_url)
     rep = ValidationReport(
         artifact=model_name,
         base_url=base_url,
@@ -443,6 +784,10 @@ def run_validation(
             "max_p99_nll": max_p99_nll,
             "min_gen_len": min_gen_len,
             "min_mtp_accept_p0": min_mtp_accept_p0,
+            "max_boundary_defects": max_boundary_defects,
+            "boundary_temperature": boundary_temperature,
+            "boundary_max_tokens": boundary_max_tokens,
+            "boundary_reps": boundary_reps,
             "bos_token": bos_token,
             "add_special_tokens": add_special_tokens,
         },
@@ -460,6 +805,13 @@ def run_validation(
 
     rep.checks.append(check_serve_ready(base_url))
     rep.checks.append(check_generation_sanity(base_url, model_name, min_gen_len))
+    rep.checks.append(check_boundary_behavior(
+        base_url, model_name,
+        max_boundary_defects,
+        temperature=boundary_temperature,
+        max_tokens=boundary_max_tokens,
+        reps=boundary_reps,
+    ))
     rep.checks.append(check_perplexity(
         base_url, model_name,
         max_ppl=max_ppl, max_p99_nll=max_p99_nll, max_mean_nll=max_mean_nll,
@@ -497,13 +849,81 @@ def format_report_md(rep: ValidationReport) -> str:
 
 
 # -----------------------------------------------------------------
+# Ship record (R13)
+# -----------------------------------------------------------------
+def _resolve_artifact_dir(args, card_model_dir: str | None) -> str | None:
+    """Which directory this verdict is about.
+
+    The validator drives an HTTP endpoint, so it cannot see what the server
+    loaded; the honest fallback order is explicit flag, then --model-name if it
+    happens to be a local path, then the directory the shipcard was opened on.
+    """
+    if args.artifact_dir:
+        return args.artifact_dir
+    if args.model_name and os.path.isdir(args.model_name):
+        return args.model_name
+    return card_model_dir
+
+
+def _fill_shipcard(args, rep: "ValidationReport") -> None:
+    if not getattr(args, "shipcard", None):
+        return
+    from .shipcard import (
+        compute_model_sha, fill_if_requested, git_provenance, load_shipcard,
+        make_record,
+    )
+
+    try:
+        card = load_shipcard(args.shipcard)
+    except Exception as exc:
+        print(f"[shipcard] WARN {args.shipcard} unreadable: {exc!r}")
+        return
+    model_dir = _resolve_artifact_dir(args, card.get("model_dir"))
+    try:
+        model_sha = compute_model_sha(model_dir) if model_dir else None
+    except Exception:
+        model_sha = None
+
+    ppl_check = next((c for c in rep.checks if c.name == "perplexity"), None)
+    spec_detected = None
+    if ppl_check is not None:
+        spec_detected = bool(ppl_check.metrics.get("spec_decode_detected", False))
+    metrics = {c.name: {"passed": c.passed, **c.metrics} for c in rep.checks}
+    perplexity = metrics.get("perplexity")
+    if isinstance(perplexity, dict):
+        # Make the replayable evidence self-contained. ValidationReport already
+        # owns the threshold decision; the shipcard additionally needs the
+        # exact number of scored tokens to reject a fabricated empty pass.
+        if "n_tokens" not in perplexity:
+            perplexity["n_tokens"] = 0
+    record = make_record(
+        slot="ship_gate",
+        tool="validate_quantized_model.py",
+        passed=bool(rep.passed),
+        model_sha=model_sha,
+        metrics=metrics,
+        detail="; ".join(
+            f"{c.name}={'pass' if c.passed else 'FAIL'}" for c in rep.checks),
+        spec_decode_detected=spec_detected,
+        git_commit=git_provenance().get("commit"),
+        extra={
+            "base_url": rep.base_url,
+            "served_model_name": rep.model_name,
+            "thresholds": rep.thresholds,
+            "model_sha_source": model_dir,
+        },
+    )
+    fill_if_requested(args.shipcard, "ship_gate", record)
+
+
+# -----------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Pre-ship quality validator for PrismaQuant artifacts. "
+                description="Pre-ship quality validator for PrismaQuant artifacts. "
                     "Hits a running vLLM endpoint and runs serve / generation "
-                    "sanity / perplexity / MTP acceptance checks.")
+                    "sanity / perplexity / MTP acceptance / boundary-behavior checks.")
     ap.add_argument("--base-url", default=os.environ.get("VLLM_URL",
                                                          "http://localhost:8000"),
                     help="vLLM OpenAI-compatible server URL")
@@ -516,6 +936,19 @@ def main() -> int:
     ap.add_argument("--min-gen-len", type=int, default=DEFAULT_MIN_GEN_LEN)
     ap.add_argument("--min-mtp-accept-p0", type=float,
                     default=DEFAULT_MIN_MTP_ACCEPT_P0)
+    ap.add_argument("--max-boundary-defects", type=int,
+                    default=DEFAULT_MAX_BOUNDARY_DEFECTS,
+                    help="Max sampled boundary-defective generations allowed "
+                         "(stutter/zero-tag/cap-truncation on terse prompts)")
+    ap.add_argument("--boundary-temperature", type=float,
+                    default=DEFAULT_BOUNDARY_TEMPERATURE,
+                    help="Sampling temperature for the boundary check; must "
+                         "stay > 0 (the defect is invisible at temp 0)")
+    ap.add_argument("--boundary-max-tokens", type=int,
+                    default=DEFAULT_BOUNDARY_MAX_TOKENS)
+    ap.add_argument("--boundary-reps", type=int,
+                    default=DEFAULT_BOUNDARY_REPS,
+                    help="Sampled repetitions per boundary prompt")
     ap.add_argument("--bos-token", default=None,
                     help="Optional literal BOS string to prepend before "
                          "perplexity prompts for BOS-sensitive tokenizers "
@@ -530,6 +963,15 @@ def main() -> int:
                     help="Max time to wait for /health 200 before giving up")
     ap.add_argument("--report", default=None,
                     help="Optional path to write the markdown report")
+    ap.add_argument("--shipcard", default=None,
+                    help="Path to the artifact's shipcard.json; this run's "
+                         "verdict is appended to the ship_gate slot "
+                         "(see python -m prismaquant.shipcard_cli).")
+    ap.add_argument("--artifact-dir", default=None,
+                    help="Local directory of the artifact being served, used "
+                         "to stamp model_sha on the shipcard record. Defaults "
+                         "to --model-name when that is a directory, then to "
+                         "the shipcard's own model_dir.")
     args = ap.parse_args()
 
     rep = run_validation(
@@ -539,6 +981,10 @@ def main() -> int:
         max_p99_nll=args.max_p99_nll,
         min_gen_len=args.min_gen_len,
         min_mtp_accept_p0=args.min_mtp_accept_p0,
+        max_boundary_defects=args.max_boundary_defects,
+        boundary_temperature=args.boundary_temperature,
+        boundary_max_tokens=args.boundary_max_tokens,
+        boundary_reps=args.boundary_reps,
         wait_seconds=args.wait_seconds,
         bos_token=args.bos_token,
         add_special_tokens=args.add_special_tokens,
@@ -548,6 +994,7 @@ def main() -> int:
     if args.report:
         with open(args.report, "w") as f:
             f.write(md)
+    _fill_shipcard(args, rep)
     return 0 if rep.passed else 1
 
 

@@ -1,0 +1,366 @@
+# Joint AURA and runtime-constrained allocation
+
+Status: research, opt-in. Tracked by PrismaQuant #237. This extends the
+streamed AURA producer, production weight cache, allocator candidate builders,
+and existing serving-constraint controls. It does not change the default
+format menu, Tessera runtime pin, or serving admission.
+
+The [full-domain Tessera quality–prefill experiment specification](tessera_quality_prefill_experiment.md)
+defines the proposed multi-unit transfer validation, matched runtime producer,
+full-model coverage expansion and empirical confirmation program. It is a
+handoff for implementation; the contracts and measured readiness below remain
+unchanged. Its optional runtime-v2 dependency does not block direct measured
+comparisons of independently configured complete artifacts.
+
+## Measurement and objective
+
+For one Linear, a route changes both its input and its rendered weight.
+With `dX = Xhat - X` and `dW = What - W`, the complete local perturbation is
+
+```
+dY = X dW.T + dX W.T + dX dW.T
+a[k] = <G_Y[k], dY>
+cost = 0.5 mean_k(a[k] ** 2)
+```
+
+The streamed producer's `joint_activation=True` mode (CLI
+`--joint-activation`) projects these terms through its downstream KL
+cotangents. Terms and repeated invocations of the same Linear are summed
+while signed, before squaring. The existing production cache supplies actual
+rendered tensors. The shared activation QDQ owner supplies the route's
+activation behavior, including calibrated static scales. The lease owns no
+additional activation or weight cache. Resident FP32 projection products
+reuse one activation-perturbation GEMM across matching activation policies.
+
+Joint rows retain their signed components, aligned probe samples, source and
+render tensor identities, activation policy/scales, projection arithmetic,
+calibration and probe identities. A joint price already includes its
+downstream Fisher and activation error; scalar sensitivity, calibrated gains
+and AQUA activation transfer must not be applied again. Joint and weight-only
+or output-MSE rows cannot share a joint allocation table. BF16 controls carry
+complete measured zero rows rather than an unobserved zero placeholder.
+
+Joint rows require at least two probes; one draw cannot estimate sampling
+variance. Common probes enable paired differences. Their conditional sampling error is
+not uncertainty over new calibration data or evidence of generalization.
+The additive sum of local quadratic prices is still a model approximation;
+it does not establish the quality of every joint assignment.
+
+### Packed source projections
+
+`--include-routed-experts` with streamed joint AURA also accepts the existing
+profile-declared `PackedExpertProjection` views. A packed source is observed
+through its actual per-expert `F.linear` slices or `F.grouped_mm` packed
+transposes and cumulative expert row offsets. Its model, expert backend, routing
+and source arithmetic remain intact. Fused gate/up output gradients are split using those
+exact views. Source views refresh at each streaming install and unload, and a
+single hook on each packed leaf serves its logical members. An implementation
+that bypasses the declared Linear boundaries refuses instead of emitting an
+unobserved zero price. A genuinely unrouted member still receives aligned zero
+samples.
+
+The LFM packed block produces 96 source-Linear rows (32 experts times w1/w3/w2),
+with each member's actual rendered weight and activation policy. These require
+original decoded production-cache entries; the on-demand dense renderer is not
+an adapter for packed sources and refuses early. All repeated uses of the SAME
+logical Linear sum while signed before squaring. Different members remain
+separate unary prices under the existing additive objective. A whole-block
+runtime measurement binds the complete roster without inventing a group quality
+price; the explicitly requested diagnostics below remain available.
+
+## Assignment diagnostics
+
+`joint_aura.assignment_probe_summary` and `paired_assignment_difference`
+consume complete joint rows keyed by unit. The paired helper requires the
+same nonempty unit roster in both arms, including unchanged units. Every row
+must pass the producer's identity and sample validator. Probe IDs and the full
+probe identity (source model, calibration, producer source and arithmetic)
+must agree. Each unit retains its source weight; different formats carry
+their own validated render and activation identities. The same unit/format
+cannot silently change operator binding between arms.
+
+The explicit `objective` determines the per-probe quantity:
+
+- `additive` (default): `0.5 sum_i(a_i[k] ** 2)`, the allocator's unary sum.
+- `joint_quadratic`: `0.5 (sum_i a_i[k]) ** 2`, the baseline local
+  linearization with cross-unit terms retained.
+
+Pairing reports A minus B on common samples and its empirical standard error,
+conditional on the fixed calibration. Unchanged units cancel from additive
+differences, but remain in the cross terms of `joint_quadratic`. Neither
+objective measures a new background forward pass or fixes background-dependent
+unary ordering. There is no automatic allocator refinement or admission from
+these diagnostics.
+
+The existing `aura_additivity_gate` CLI accepts `--comparison-assignment` and
+`--paired-objective` to append this paired report. Its additivity prediction
+always remains additive. Complete aligned joint rows use
+`stderr_method=per_probe_aligned_empirical`. Historical bare arrays retain
+their previous numeric estimate as `per_probe_unverified`; equal lengths are
+not proof of alignment. Without arrays the independence estimate is labeled
+`independence_assumed`, not a covariance lower bound. Old bare-list screen
+receipts remain unverified by this identity contract.
+
+Measured KL must be finite; a finite negative sample estimate is allowed.
+Its supplied standard error must be finite and nonnegative.
+The existing `measured_kl_stderr` is caller-supplied held-out sequence
+uncertainty and stays separate from the probe standard error. The residual
+z-score is descriptive and assumes independent probe and sequence errors;
+this helper does not certify the supplied held-out dataset or estimate
+generalization from probe variance.
+
+## Runtime input and search
+
+`--measured-runtime-table` opts the allocator into measured-resource search.
+`--measured-runtime-context` supplies the independently expected context. The
+existing `--slo-prefill-p95-ttft-ms` sets its prefill proposal budget; optional
+decode ITL and device-memory limits remain separate constraints. This mode
+does not mix the legacy family-relative dispatch table with exact operator
+measurements. A throughput floor cannot be inferred from operator medians.
+
+The versioned table binds the actual cost-payload digest, source/calibration,
+GPU and full runtime identity, prompt length, batch, TP, graph/residency mode,
+and exact operator routes. `source_sha256` equals the streamed source model
+identity's `content_sha256`; `calibration_sha256` equals the joint AURA probe
+identity's calibration digest. The CLI compares these against the cost rows.
+Every row binds actual joint operator identities,
+member formats and shapes. Timings are repeated GPU measurements with raw
+receipt hashes; the stored price is their median. Fused-group options need
+whole-group timing. Encoder time, activation width and relative speed hints
+cannot substitute for this input. No current runtime timing table ships as a
+default.
+
+Candidate reduction preserves all legal alternatives before runtime pricing,
+including a faster, higher-loss route at the same serialized size. Fused
+folding preserves every licensed coherent member recipe under an explicit
+combination cap. The new solver enumerates the discrete nondominated
+frontier in serialized bytes, quality cost and prefill time, optionally
+including decode and device resources. It uses integer bytes, with no
+rate-bin rounding or convex-hull assumption. State and transition limits
+refuse excess work instead of silently truncating an answer.
+
+Serialized weight bytes, terminal weight residency, peak activation memory,
+peak scratch, and fixed KV/non-Linear resources remain separate. The solver
+adds residency and tracks activation and scratch maxima independently.
+Exactness describes the supplied additive resource model and finite menu.
+Variable assignment-shared overhead needs explicit accounting; a final
+feasibility filter cannot by itself establish global artifact optimality.
+
+The allocator checks the expanded, promoted assignment and its fixed
+auxiliary choices against the same measured resource contract. The sum of
+operator medians is a proposal estimate, not an end-to-end p95 TTFT or decode
+measurement. Existing serving and publication gates remain authoritative.
+
+## Validation and promotion plan
+
+The baseline is weight-only AURA over exactly the same production renders,
+calibration tensors, sequence lengths and common probes. The candidate adds
+the complete activation/weight residual. Numerical checks compare the
+decomposition against an independently formed local residual, including
+cancellation, mixed terms, repeated invocations, static QDQ and the identity
+activation case. Cache/checkpoint tests verify resumption and changed-input
+refusals. Solver checks compare exhaustive assignment enumeration on
+nonconvex, same-byte and multiple-resource examples; CLI checks exercise
+actual selection and final expanded-assignment feasibility.
+
+The current-model numerical screen uses Qwen3-0.6B, a fixed unquantized
+teacher, shared calibration and separate held-out tokens, and a bounded
+measured subset of real Linears. It compares candidate and assignment KL/NLL
+without re-centering the teacher. In-process profiles and host telemetry
+record the workload and execution cost; outcomes belong in dated measurement
+receipts, including negative or inconclusive results.
+
+Production promotion additionally requires real served assignments on the
+target runtime, matched-byte uniform controls, end-to-end prefill/decode and
+residency measurements, and the existing held-out/downstream gates. The
+fixed teacher remains the reference for bounded close swaps. Sparse-anchor
+interpolation requires separate joint-currency pilot and held-out evidence;
+the existing output-MSE replay and historical Gridbook coefficients do not
+qualify this currency. Until those gates pass, this feature remains research.
+
+## Explicit invocation
+
+With an existing matching production cache, probe file and measured format
+list, collect the joint table using the normal streamed producer:
+
+```bash
+python3 -m prismaquant.aura_cost --model "$MODEL" \
+  --streaming --joint-activation --production-cache production.pkl \
+  --formats "$MEASURED_FORMATS" --n-probes 16 \
+  --checkpoint-dir joint-checkpoints --output joint.pkl
+
+python3 -m prismaquant.allocator --probe probe.pkl --costs joint.pkl \
+  --formats "$MEASURED_FORMATS" --target-bits "$TARGET_BITS" \
+  --measured-runtime-table runtime.json --measured-runtime-context context.json \
+  --slo-prefill-p95-ttft-ms "$PREFILL_BUDGET_MS" \
+  --layer-config layer-config.json --pareto-csv pareto.csv
+```
+
+`runtime.json` must contain measurements of the exact supplied operator
+recipes and workload, including fixed work. The numerical screen does not
+produce those serving measurements. Menu eligibility and model-profile
+requirements still apply to these direct CLI invocations. The pipeline
+wrapper does not infer these experimental inputs or enable this mode.
+
+The [current-model screen](../measurements/pq237-joint-aura-screen-2026-09-05.md)
+verifies numerical decomposition but shows no selection-quality gain.
+Qualification remains open in #237.
+
+An existing draw can be passed unchanged with `--calibration-input` and its
+independently held `--calibration-input-sha256`. The safetensors artifact contains
+only `calibration_ids` (int64, samples × sequence length); its
+`calibration_provenance` metadata records the original draw, including
+`fit_ids_sha256`, `fit_tokens`, `nsamples`, and `seqlen`. The explicit CLI sample
+and sequence counts must match. This path bypasses dataset sampling and refuses
+`--dataset`. It checks the campaign's int32 token hash and separately records
+the int64 token hash used by joint AURA, with the original seed retained in
+provenance. A WT2 train 32 × 512 torch-randint draw and the retained diverse
+32 × 1024 Fisher draw are different calibrations even when both name seed zero.
+
+The research native bridge in `prismaquant.native_operator_panel` prepares
+reference inputs through the existing PWC, shared activation QDQ, and decoded
+producer wire. `experiments/pq267_native_panel.py` transports those immutable
+artifacts to Tessera's separate `bench_native_operator.py`; PQ imports no
+Tessera serving runtime. A preparation plan freezes the source checkpoint,
+calibration draw, probe seed/count, input row counts, and numerical tolerance
+before native output is observed. Actual joint cost rows must match those
+inputs before the independent panel is frozen. Native preparation facts never
+substitute for numerical references.
+
+Receipt intake verifies the exact panel/runtime/tensor/route bindings, both
+prefill and decode numerical results at the frozen tolerance, and repeated
+single-apply measurements. Native allocation bounds require the accompanying
+memory trace and matching collector identity. The bridge preserves unknown
+native scratch as unknown, and always leaves fixed/full-model resources
+unknown. It produces operator evidence, not a complete runtime table: complete
+table admission still needs independently measured fixed/KV work and the
+serving-unit coverage required above. A readable research rung or a local
+operator parity result does not change the runtime pin or serving gates.
+
+
+The whole routed native bridge (`native_moe_panel.py`, #309) compares actual
+module-local attention/expert selectors between capture and probe; semantic
+config dumps alone do not include these private Transformers selectors. New
+captures record the shared `source_execution_identity`. A legacy boundary
+requires a separate hash-bound fresh source qualification with identical source,
+runtime, calibration, inputs, route IDs/weights, bias and token coordinates.
+The panel seals that proof digest without rewriting the original capture.
+
+The bridge binds one complete
+32-expert LFM E4M3 K1 R1024 stack to all 96 ordered w1/w3/w2 members. It reuses
+`RuntimeBinding` over validated member rows on the same source and signed
+probes, without introducing a scalar group cost. Actual external top-k IDs and
+weights are retained before coercion; supported transport casts must round-trip
+losslessly. The reference calls the existing packed-expert operation and the
+shared QDQ at both input and intermediate boundaries. The scoped measurement
+protocol explicitly disables optional activation preclip and refuses clipped
+joint rows; the global default remains unchanged.
+
+The capture must carry the actual checkpoint initializer descriptor and eager
+backend, with source files/config and calibration bound to the member probes.
+LFM routing uses sigmoid, selection-only expert bias, normalization with its
+source epsilon and the captured final weights; the bridge never renormalizes
+them. A first-sequence M=1 prefix is only an operator shape check, not a served
+autoregressive measurement. Native resource evidence keeps runtime workspace
+separate from layer storage and incremental scratch. Operator observations
+still cannot supply a complete model-fixed or SLO/runtime table.
+
+The preparation/freeze/consume adapter is
+`experiments/pq309_native_moe_panel.py`. Its versioned input plan pins the shared
+capture-v2 manifest and census, original routed PAC file, exact token draw,
+original PWC pickle, all 96 wire/record file hashes, immutable runtime image,
+serving configuration bytes and probe policy. Preparation independently derives
+each producer encoding identity from source weights and the prefetched full
+Hessians before checking original wire decode against PWC. The original router
+weights remain unchanged, with int32 IDs and FP32 weights used only as verified
+lossless transport. The adapter requires the canonical capture-v2 implementation
+and real materialization outputs; historical captures cannot qualify it.
+
+A bounded native integration screen may use only sample zero for its joint
+probes. Preparation verifies the actual subset IDs against the full token draw
+and keeps the full capture/Hessian provenance intact. `probe_scope` binds the
+parent and subset calibration hashes and sample index in the frozen panel and
+observation; the subset hash is the joint currency. Full-draw probes omit the
+subset receipt and carry null `probe_scope`. A subset screen cannot be reported
+as full-draw quality evidence.
+
+
+## Exact boundary working storage (opt-in)
+
+For bounded target replay, `SharedStateCotangents.fork_for_replay` accepts a
+mandatory `max_resident_bytes` cap for the fork's newly allocated compact
+adjoint tensors. It requires a quiescent owner after harvest, deep-copies all
+accumulators, and keeps diagnostic lists independent. The original adjoints
+remain separately charged. Earlier target windows may consume/harvest one
+batch's disposable fork and release it; only the final target window may use
+the original owner and commit outgoing cotangents. This helper does not itself
+schedule replay or change reverse-pass behavior.
+
+`compute_aura_cost_streamed(..., boundary_storage=policy)`, CLI
+`--boundary-storage-config policy.json`, or the Tessera joint plan's
+`execution.boundary_storage` accepts the closed policy:
+
+```json
+{
+  "schema": "prismaquant.aura.boundary_storage.v1",
+  "directory": "/run/exact-boundaries",
+  "max_resident_bytes": 1073741824,
+  "max_auxiliary_bytes": 1073741824,
+  "max_artifact_bytes": 536870912000,
+  "prefetch_batches": 2
+}
+```
+
+These illustrative caps are not a GLM admission plan. The resident cap charges
+all exact tensors in the current prefetched CPU window plus one compact CPU
+writer copy; source replay/gradients, decoded candidates and allocator/runtime
+scratch still need their independent memory reservation and free-memory floor.
+On Spark CPU and GPU ownership share physical memory. The auxiliary cap counts
+all retained input/mask/position/shared-state storage, including full backing
+storages of views and tensors in mapping keys as well as values, and
+conservatively reserves one >=FP32 shared-state
+cotangent per captured occurrence per probe. Opaque state owners refuse.
+Nothing samples, reshapes, rounds or reorders a boundary.
+
+Each invocation starts a fresh generation only after input/checkpoint identity
+validation. The ordinary atomic activation writer publishes exact tensors and
+immutable receipts. A whole bounded window is loaded and checked before model
+replay; window lookups have no lazy-read path. Outgoing cotangents publish to
+new coordinates before retiring their consumed predecessor. Completed layer
+boundaries retire after all original probes consume them. Working entries are
+removed on normal completion or an ordinary exception; a killed process can
+leave an isolated incomplete generation, which is never accepted as resume
+input. Existing signed cost checkpoints own resume. A completed-checkpoint
+resume skips boundary generation entirely. The policy is checkpoint-bound but
+does not change the probe arithmetic identity or signed samples.
+
+To opt into layer-major baseline capture, use the same fields with
+`schema: "prismaquant.aura.boundary_storage.v2"` and the required additional
+field `capture_order: "layer_major"`. V1 remains closed and unchanged.
+`capture_layer_major_boundaries(input_batches, storage=owner)` consumes the
+existing `visit_layer_batches(..., boundary_storage=owner)` traversal. Source
+layers install/prefetch once, original batches remain in order, exact input
+windows are verified before source calls, and outputs are written immediately.
+All boundary receipts remain available for the ordinary reverse pass.
+
+Global forward order becomes layer/batch; each batch's original layer sequence,
+shape, masks, positions and distinct profile state remain intact. V2 requires
+evaluation mode and prefetched source delivery. It refuses observed Torch CPU
+or active-runner CUDA RNG consumption around preparation, source calls and
+profile state creation/capture. Python/NumPy RNG, other CUDA devices and
+arbitrary mutable custom-model state are not certified; supported source
+identity and equivalence remain qualification gates. Probe RNG and global row
+coordinates are unchanged. All simultaneous live per-batch shared states and
+transient final CPU copies are charged to the auxiliary cap, including
+potential per-probe adjoints.
+
+The exact files and verified page advice make I/O explicit; advice does not
+establish physical release. Profile read/write barriers independently and keep
+actual physical memory checks. V1 preserves the source loop to make
+byte/order parity reviewable. Its batch-major capture still
+traverses all decoder layers per calibration batch. With two source slots,
+512 B1 samples do not get a whole-model resident reuse window: layer-level
+source payload is fetched repeatedly. This source-derived traffic observation
+is unmeasured, not a timing estimate. V2 addresses the initial capture traversal; production qualification still
+needs full-scale physical memory and bounded PWC/delta/diagnostic lifetimes. The mode stays default-off until these
+remaining production gates are satisfied.

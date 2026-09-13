@@ -1,0 +1,13 @@
+{
+  "schema": "prismaquant.gridbook_runtime_pin.v3",
+  "repository": "https://github.com/RobTand/gridbook.git",
+  "commit": "227420f9821bab7089632ee914f0ba050f82b817",
+  "version": "0.9.1",
+  "version_is_release": true,
+  "runtime_contract_schema": "gridbook.runtime-contract.v12",
+  "required_abi_features": {
+    "routed_moe_per_role_codebook_lut": 1,
+    "source_fp8_block128_w8a16": 1,
+    "dspark_construction_physical_bridge": 1
+  }
+}

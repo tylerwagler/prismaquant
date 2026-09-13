@@ -12,7 +12,25 @@ Current production path:
 Older cross-layer allocators are archived under archive/cross_layer_2026-05-09
 for artifact replay and comparison.
 """
+import contextlib as _contextlib
+from contextvars import ContextVar as _ContextVar
+
+_checkpoint_initializing = _ContextVar("prismaquant_checkpoint_initializing", default=False)
+_INITIALIZATION_CONTRACT_ATTRIBUTE = "_prismaquant_pretrained_initialization_contract"
+
 from .format_registry import FormatSpec, REGISTRY, register_format
+
+# Resolved from installed metadata rather than duplicated here, so
+# pyproject.toml stays the single source of truth (the release pipeline asserts
+# the git tag matches the built version). A source checkout that was never
+# installed has no metadata; report that honestly instead of guessing a number.
+try:  # pragma: no cover - trivial metadata lookup
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("prismaquant")
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.0.0+unknown"
+del _pkg_version, PackageNotFoundError
 
 
 def _ensure_triton_cache_writable() -> None:
@@ -78,22 +96,44 @@ def _polyfill_transformers() -> None:
     except Exception:
         pass
     try:
-        # `_init_weights` is wasted work across every prismaquant
-        # model-load path: we build a meta skeleton via `from_config`
-        # then immediately overwrite every parameter from the
-        # checkpoint via `_materialize` / `_fast_install`. Running
-        # `_init_weights` in between costs bounded real time on small
-        # models and is a compatibility landmine on remote modeling
-        # files — transformers 5.x's `_init_weights` now expects
-        # rotary modules to expose `compute_default_rope_parameters`,
-        # which older remote modeling files (MiniMax M2/M2.7) don't
-        # provide. No-op it globally at import time.
+        # From-config meta skeletons overwrite checkpoint parameters later,
+        # so they retain the existing no-init policy. Ordinary checkpoint
+        # loads must still initialize missing state, including nonpersistent
+        # buffers that Transformers rematerializes with empty_like.
         import transformers.modeling_utils as _mu
         if hasattr(_mu, "PreTrainedModel") and \
                 not getattr(_mu.PreTrainedModel, "_prismaquant_init_noop", False):
-            _mu.PreTrainedModel._initialize_weights = (
-                lambda self, *a, **kw: None)
-            _mu.PreTrainedModel._prismaquant_init_noop = True
+            model_class = _mu.PreTrainedModel
+            real_initialize = model_class._initialize_weights
+            real_missing = model_class._initialize_missing_keys
+            model_class._prismaquant_real_initialize_weights = real_initialize
+
+            def _initialize_for_checkpoint(self, *args, **kwargs):
+                if _checkpoint_initializing.get():
+                    return real_initialize(self, *args, **kwargs)
+                return None
+
+            def _initialize_missing_checkpoint_state(self, *args, **kwargs):
+                import transformers
+                # An unsuccessful repeated finalization must not retain an
+                # earlier completion descriptor.
+                self.__dict__.pop(_INITIALIZATION_CONTRACT_ATTRIBUTE, None)
+                token = _checkpoint_initializing.set(True)
+                try:
+                    result = real_missing(self, *args, **kwargs)
+                finally:
+                    _checkpoint_initializing.reset(token)
+                setattr(self, _INITIALIZATION_CONTRACT_ATTRIBUTE, {
+                    "schema": "prismaquant.pretrained_initialization.v1",
+                    "scope": "checkpoint_missing_state",
+                    "status": "completed",
+                    "transformers_version": transformers.__version__,
+                })
+                return result
+
+            model_class._initialize_weights = _initialize_for_checkpoint
+            model_class._initialize_missing_keys = _initialize_missing_checkpoint_state
+            model_class._prismaquant_init_noop = True
     except Exception:
         pass
     try:
@@ -149,6 +189,75 @@ def _polyfill_transformers() -> None:
         _register_qwen3()
     except Exception:
         pass
+
+
+def validate_pretrained_initialization_contract(value):
+    """Validate and copy a checkpoint initialization provenance descriptor."""
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "scope", "status", "transformers_version"
+    } or value.get("schema") != "prismaquant.pretrained_initialization.v1" \
+            or value.get("scope") != "checkpoint_missing_state" \
+            or value.get("status") != "completed" \
+            or not isinstance(value.get("transformers_version"), str) \
+            or not value["transformers_version"].strip():
+        raise ValueError("Missing or invalid pretrained initialization contract")
+    return dict(value)
+
+
+def pretrained_initialization_contract(model):
+    """Require evidence that this model completed checkpoint initialization.
+
+    From-config skeletons have no such descriptor. This records the load
+    phase, not a general certification of subsequent model mutations.
+    """
+    return validate_pretrained_initialization_contract(
+        getattr(model, _INITIALIZATION_CONTRACT_ATTRIBUTE, None))
+
+
+def validate_source_initialization_contract(value):
+    """Read either qualified source-loading route without conflating them."""
+    if isinstance(value, dict) and value.get("schema") == "prismaquant.streaming_initialization.v1":
+        from .streaming_model import validate_streaming_initialization_contract
+        return validate_streaming_initialization_contract(value)
+    return validate_pretrained_initialization_contract(value)
+
+
+@_contextlib.contextmanager
+def genuine_weight_initialization():
+    """Build a model the way transformers would, inside a PrismaQuant process.
+
+    `_polyfill_transformers` suppresses `PreTrainedModel._initialize_weights`
+    outside checkpoint missing-state finalization, because streaming loads
+    build a `from_config` skeleton and overwrite checkpoint parameters. That makes `from_config` construction
+    silently return **uninitialized** parameters for any tensor the
+    modeling file allocates as a bare `nn.Parameter(torch.empty(...))` --
+    routed-expert weights and hyper-connection tensors are the common
+    cases -- and heap contents are neither reproducible nor guaranteed
+    finite, so a forward on such a model can be fine on one run and `nan`
+    on the next.
+
+    Wrap a from-config construction in this context manager when the model
+    it returns is used as-is:
+
+        with genuine_weight_initialization():
+            model = SomeForCausalLM(config)
+
+    A no-op when the polyfill never applied (older transformers, or an
+    import that raised), so callers need not test for it.
+    """
+    import transformers.modeling_utils as _mu
+
+    real = getattr(
+        _mu.PreTrainedModel, "_prismaquant_real_initialize_weights", None)
+    if real is None:
+        yield
+        return
+    patched = _mu.PreTrainedModel._initialize_weights
+    _mu.PreTrainedModel._initialize_weights = real
+    try:
+        yield
+    finally:
+        _mu.PreTrainedModel._initialize_weights = patched
 
 
 _ensure_triton_cache_writable()

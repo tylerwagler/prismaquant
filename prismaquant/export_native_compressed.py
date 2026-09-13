@@ -54,18 +54,20 @@ from __future__ import annotations
 
 import argparse
 import gc
+import resource
 import json
 import math
 import os
 import re
 import shutil
+import sys
 import time
 from contextlib import contextmanager
 from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
 
 import torch
 import torch.nn as nn
@@ -79,7 +81,12 @@ except ModuleNotFoundError:
             yield
 from safetensors.torch import save_file
 
-from .allocator_candidates import check_format_applicability
+from . import nvfp4_activation_contract as _nvfp4_activation_contract
+from .allocator_candidates import (
+    PASSTHROUGH_SOURCE_REQUIREMENTS,
+    _scan_source_dtype_manifest,
+    check_format_applicability,
+)
 from .fp8_dynamic import fp8_dynamic_weight_qdq
 from .mx_formats import e8m0_to_scale, mxfp8_e4m3_qdq
 from .serving_profiles import resolve_target_profile
@@ -88,7 +95,24 @@ from .layer_config import (
     canonicalize_format,
 )
 from .model_profiles.qwen3_5 import Qwen3_5Profile
+from .layer_config import (
+    is_layer_config_meta_key as _is_layer_config_meta_key,
+    layer_config_metadata as _layer_config_metadata,
+)
 from .schemas import validate_layer_config_payload
+from .export_output_safety import (
+    prepare_fresh_export_directory,
+    transactional_export_directory,
+    validate_fresh_export_directory,
+)
+from .nvfp4_cb_footprint import (
+    enforce_whole_artifact_budget,
+    whole_artifact_budget_from_assignment_payload,
+)
+from .render_score import (
+    normalize_clipped_fisher_row_weights,
+    resolve_fisher_row_weight_clip,
+)
 
 # ---------------------------------------------------------------------------
 # NVFP4 packing. The byte layout (two 4-bit indices/byte, element-0 low nibble,
@@ -102,8 +126,8 @@ from .schemas import validate_layer_config_payload
 # stable across the transformers 4.x -> 5.x break.
 # ---------------------------------------------------------------------------
 FLOAT_TO_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-NVFP4_MAX = 6.0     # max(|FLOAT_TO_E2M1|)
-FP8_E4M3_MAX = 448.0  # max representable in torch.float8_e4m3fn
+NVFP4_MAX = _nvfp4_activation_contract.FP4_E2M1_MAX
+FP8_E4M3_MAX = _nvfp4_activation_contract.FP8_E4M3_MAX
 NVFP4_SCALE_RULE_ENV = "PRISMAQUANT_NVFP4_SCALE_RULE"
 NVFP4_SCALE_RULE_STATIC_6 = "static_6"
 NVFP4_SCALE_RULE_FOUR_OVER_SIX_MSE = "four_over_six_mse"
@@ -172,8 +196,35 @@ def _to_vllm_internal_name(checkpoint_name: str) -> str:
     return name
 
 
+# The NVFP4 codebook is a CONSTANT -- the eight positive E2M1 levels -- but it
+# was being rebuilt from a Python list on every call, and the GPTQ render calls
+# it once per column-quantize. Measured on one 5120x5120 Linear with
+# gptq+static_act_order+joint_scale_opt: 11,562 calls, 2.279 s of a 3.705 s
+# render. Building a CUDA tensor from a Python list is ~200 us (Python-side
+# element walk, then an H2D copy), so 62% of the render was materializing 8
+# floats over and over while the GPU sat at 33 W.
+#
+# Memoizing is safe because the value never varies and both call sites are
+# strictly read-only (`cb[idx]`, `torch.bucketize(x, cb)`, `cb.numel()`); no
+# caller mutates or keeps an escaping alias. Keyed on (device, dtype) so a
+# mixed-device run cannot be handed a tensor from the wrong device, which would
+# be a silent correctness bug rather than a slow path.
+#
+# The cached tensor must be BIT-IDENTICAL to the freshly built one -- this runs
+# inside the production render, and a render that differs from the exported
+# bytes is the rendering confound principle 8 exists to prevent. Pinned by
+# tests/test_nvfp4_codebook_cache.py, which compares cached against fresh and
+# renders a whole Linear both ways.
+_NVFP4_CODEBOOK_CACHE: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+
+
 def _nvfp4_codebook(device, dtype=torch.float32) -> torch.Tensor:
-    return torch.tensor(FLOAT_TO_E2M1, device=device, dtype=dtype)
+    key = (str(device), dtype)
+    cb = _NVFP4_CODEBOOK_CACHE.get(key)
+    if cb is None:
+        cb = torch.tensor(FLOAT_TO_E2M1, device=device, dtype=dtype)
+        _NVFP4_CODEBOOK_CACHE[key] = cb
+    return cb
 
 
 def resolve_nvfp4_scale_rule(raw: str | None = None) -> str:
@@ -314,6 +365,7 @@ def _select_nvfp4_group_scales(
     *,
     scale_rule: str | None = None,
     global_real: torch.Tensor | None = None,
+    joint_scale_levels: tuple[float, ...] | None = None,
 ) -> torch.Tensor:
     """Return per-block real NVFP4 scales for ``grouped[..., group_size]``.
 
@@ -339,7 +391,11 @@ def _select_nvfp4_group_scales(
     if rule == NVFP4_SCALE_RULE_JOINT_MSE:
         return _nvfp4_best_max_to_level_scale(
             grouped,
-            _NVFP4_JOINT_SCALE_LEVELS,
+            (
+                _NVFP4_JOINT_SCALE_LEVELS
+                if joint_scale_levels is None
+                else joint_scale_levels
+            ),
             global_real=global_real,
         )
     raise AssertionError(f"unhandled NVFP4 scale rule: {rule!r}")
@@ -364,20 +420,35 @@ def _select_nvfp4_pack_scales_and_global(
     *,
     global_real_override: torch.Tensor | None = None,
     scale_rule: str | None = None,
+    snapped_scale_scoring: bool | None = None,
+    joint_scale_levels: tuple[float, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not _nvfp4_snapped_scale_scoring_enabled():
+    score_snapped = (
+        _nvfp4_snapped_scale_scoring_enabled()
+        if snapped_scale_scoring is None
+        else bool(snapped_scale_scoring)
+    )
+    if not score_snapped:
         # Pre-2026-06-12 behavior (byte-stable with shipped artifacts):
         # scales scored under the RAW real scale; the tensor global is
         # derived once from the chosen scales (or taken verbatim from the
         # fused-sibling override) without re-scoring.
-        scale = _select_nvfp4_group_scales(grouped, scale_rule=scale_rule)
+        scale = _select_nvfp4_group_scales(
+            grouped,
+            scale_rule=scale_rule,
+            joint_scale_levels=joint_scale_levels,
+        )
         if global_real_override is not None:
             global_real = global_real_override.to(
                 grouped.device, dtype=torch.float32).clamp_min(1e-12)
         else:
             global_real = (scale.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
         return scale, global_real
-    scale = _select_nvfp4_group_scales(grouped, scale_rule=scale_rule)
+    scale = _select_nvfp4_group_scales(
+        grouped,
+        scale_rule=scale_rule,
+        joint_scale_levels=joint_scale_levels,
+    )
     if global_real_override is not None:
         global_real = global_real_override.to(
             grouped.device,
@@ -387,6 +458,7 @@ def _select_nvfp4_pack_scales_and_global(
             grouped,
             scale_rule=scale_rule,
             global_real=global_real,
+            joint_scale_levels=joint_scale_levels,
         )
         return scale, global_real
 
@@ -396,6 +468,7 @@ def _select_nvfp4_pack_scales_and_global(
             grouped,
             scale_rule=scale_rule,
             global_real=global_real,
+            joint_scale_levels=joint_scale_levels,
         )
         next_global = (
             snapped_scale.amax() / FP8_E4M3_MAX
@@ -763,7 +836,9 @@ def _normalize_fisher_row_weights(
     least-squares GPTQ objective, `X.T @ diag(g²) @ X` is equivalent to
     scaling each activation row by `sqrt(g²)`.  Normalizing the selected
     slice to mean 1 preserves the scale expected by the existing damping
-    candidates and local error gates.
+    candidates and local error gates. The normalise-then-clip rule itself
+    lives in render_score.normalize_clipped_fisher_row_weights so the cost
+    paths cannot drift (issue #159).
     """
     if row_weights is None or n_rows <= 0:
         return None
@@ -774,22 +849,9 @@ def _normalize_fisher_row_weights(
     if rw.numel() < n_rows:
         return None
     rw = rw[:n_rows]
-    rw = torch.where(torch.isfinite(rw), rw, torch.zeros_like(rw))
-    rw = rw.clamp_min(0.0)
-    mean = rw.mean()
-    if not torch.isfinite(mean) or float(mean.item()) <= 0.0:
-        return None
-    rw = rw / mean.clamp_min(1e-12)
-    try:
-        clip = float(os.environ.get("PRISMAQUANT_FISHER_GPTQ_ROW_WEIGHT_CLIP", "64"))
-    except Exception:
-        clip = 64.0
-    if clip > 0.0:
-        rw = rw.clamp_max(float(clip))
-        mean2 = rw.mean()
-        if torch.isfinite(mean2) and float(mean2.item()) > 0.0:
-            rw = rw / mean2.clamp_min(1e-12)
-    return rw
+    return normalize_clipped_fisher_row_weights(
+        rw, resolve_fisher_row_weight_clip(), require_positive_mean=True
+    )
 
 
 def _activation_col_importance_for_gptq(
@@ -854,17 +916,16 @@ def pack_fp4_indices(fp4_indices: torch.Tensor, last_dim: int) -> torch.Tensor:
     return (pairs[..., 0] | (pairs[..., 1] << 4)).to(torch.uint8)
 
 
-DEFAULT_INPUT_GLOBAL_SCALE = 1.0  # uncalibrated fallback; matches
-# compressed-tensors generate_gparam's nan/inf -> 1.0 "no global
-# scaling" fallback for uncalibrated tensors.
+DEFAULT_INPUT_GLOBAL_SCALE = (
+    _nvfp4_activation_contract.UNCALIBRATED_INPUT_GLOBAL_SCALE
+)  # uncalibrated fallback; matches
+# compressed-tensors' 1.0 "no global scaling" fallback for uncalibrated or
+# degenerate nonpositive tensors.
 
-# FP4 E2M1 maximum representable value. Used to rescale activations so
-# they fit inside the FP4 grid after the per-tensor scale divide.
-_FP4_E2M1_MAX = 6.0
-# FP8 E4M3 maximum (alias of FP8_E4M3_MAX above, kept next to
-# _FP4_E2M1_MAX because the two together define the compressed-tensors
-# input_global_scale convention below).
-_FP8_E4M3_MAX = FP8_E4M3_MAX
+# Compatibility aliases retained for external callers/tests.  The versioned
+# activation-contract module is the sole owner of their values and policy.
+_FP4_E2M1_MAX = _nvfp4_activation_contract.FP4_E2M1_MAX
+_FP8_E4M3_MAX = _nvfp4_activation_contract.FP8_E4M3_MAX
 
 
 def _nvfp4_input_gscale_fp8_range_enabled() -> bool:
@@ -884,37 +945,44 @@ def _nvfp4_input_gscale_fp8_range_enabled() -> bool:
     only behind a per-artifact served A/B (the scale is a free
     post-export knob: patch input_global_scale in place, re-measure).
     """
-    return os.environ.get(
-        "PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE", "0") == "1"
+    return (
+        _nvfp4_activation_contract.resolve_input_global_scale_policy()
+        == _nvfp4_activation_contract.FULL_E4M3_INPUT_GLOBAL_SCALE_POLICY
+    )
 
 
-def _nvfp4_input_global_scale_from_max_abs(max_abs: float) -> float:
+def _nvfp4_input_global_scale_from_max_abs(
+    max_abs: float, *, policy: str | None = None,
+) -> float:
     """input_global_scale for a calibrated activation ``max_abs``.
 
-    Convention (compressed_tensors.quantization.utils.generate_gparam):
-    ``G = FP8_E4M3_MAX * FP4_E2M1_MAX / amax``. vLLM computes each
-    16-block's FP8-stored activation scale as ``fp8(block_amax / 6 * G)``
-    and compensates via alpha, so the dequant identity is invariant to
-    ``G`` — its only function is placing the serve-time block scales in
-    FP8's representable range (0, 448].
+    The shared policy owner selects the legacy ``6 / amax`` bytes by default
+    or the explicit compressed-tensors ``448 * 6 / amax`` opt-in.  This
+    compatibility wrapper never defines a second formula.
+
+    ``policy`` is optional and resolves live when omitted, as every historical
+    caller expects.  A caller that has already resolved ONE policy for a whole
+    operation -- the production cache fill, whose render levers stamp it --
+    passes it, so the G that reaches the renderer and the G its score records
+    are priced at cannot come from two different resolutions (#227).
     """
-    max_abs = float(max_abs)
-    if max_abs <= 0.0:
-        return float(DEFAULT_INPUT_GLOBAL_SCALE)
-    if _nvfp4_input_gscale_fp8_range_enabled():
-        return float(_FP8_E4M3_MAX * _FP4_E2M1_MAX / max_abs)
-    return float(_FP4_E2M1_MAX / max_abs)
+    return _nvfp4_activation_contract.input_global_scale_from_max_abs(
+        max_abs,
+        policy=(
+            _nvfp4_activation_contract.resolve_input_global_scale_policy(policy)
+        ),
+        nonpositive_fallback=(
+            _nvfp4_activation_contract.UNCALIBRATED_INPUT_GLOBAL_SCALE
+        ),
+    )
 
 
 def compute_nvfp4_input_global_scale(activations: torch.Tensor) -> float:
     """Per-tensor input_global_scale from cached activations.
 
-    Returns ``FP8_E4M3_MAX * FP4_E2M1_MAX / max(|activations|)`` — the
-    compressed-tensors ``generate_gparam`` convention, so serve-time
-    activation block scales (``fp8(block_amax / 6 * G)``) span the whole
-    FP8 range instead of collapsing into subnormals. Activations can be
-    any shape; we flatten for the max. See
-    ``_nvfp4_input_global_scale_from_max_abs`` for the kill-switch.
+    Activations can have any shape.  The shared activation-contract policy
+    converts their maximum absolute value and preserves the legacy all-zero
+    fallback required for byte-compatible native export.
     """
     max_abs = float(activations.detach().abs().max().item())
     return _nvfp4_input_global_scale_from_max_abs(max_abs)
@@ -925,6 +993,26 @@ def compute_nvfp4_input_global_scale(activations: torch.Tensor) -> float:
 # when no explicit override is passed in. Keyed by the recipe name
 # (post-profile.live_to_recipe_name remap). None means "not computed".
 _INPUT_GLOBAL_SCALES: dict[str, float] | None = None
+
+
+def _resolve_nvfp4_input_global_scale(
+    override: float | None = None,
+    *,
+    target: str | None = None,
+) -> float:
+    """Legacy native-export compatibility delegate.
+
+    The uncalibrated fallback preserves existing native artifact bytes.  Its
+    presence is also why this exporter does not claim the versioned Gridbook
+    fused-W4A4 activation contract.
+    """
+
+    return _nvfp4_activation_contract.resolve_input_global_scale_value(
+        override,
+        target=target,
+        calibrated_scales=_INPUT_GLOBAL_SCALES,
+        allow_uncalibrated_fallback=True,
+    )
 
 # Module-level raw-activation cache populated by main() when
 # --activation-cache-dir is provided AND any of the activation-aware
@@ -1084,13 +1172,26 @@ def _production_cache_lookup_key(name: str, fmt: str):
 def _production_cache_expected_keys(
     assignment: dict[str, str],
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Cache keys export will actually READ, and which of them are absent.
+
+    Passthrough formats are excluded, not just BF16: their emit paths copy
+    source bytes and never call `_pack_production_cached_2d` (the
+    FP8_SOURCE branch in the streaming Linear loop returns before the
+    cache lookup). `build_production_cache --render-scope assignment` does
+    render them — FP8_SOURCE's `quantize_dequantize` is identity — so the
+    keys usually exist, but demanding a render this export cannot consume
+    would fail an otherwise-valid FP8-source export over an unused entry.
+    Before issue #29 the question never arose: the runtime-legality guard
+    rewrote every FP8_SOURCE entry to BF16 before this check saw it.
+    """
     from prismaquant.production_weight_cache import is_uncached_packed_expert_qname
 
     keys: list[tuple[str, str]] = []
     missing: list[tuple[str, str]] = []
     for qname, fmt in assignment.items():
         cache_fmt = str(fmt).upper()
-        if _canonical_export_format(cache_fmt) == "BF16":
+        canonical = _canonical_export_format(cache_fmt)
+        if canonical in PASSTHROUGH_SOURCE_REQUIREMENTS:
             continue
         key = _production_cache_lookup_key(qname, cache_fmt)
         if key is None:
@@ -1155,6 +1256,12 @@ def _production_cache_fingerprint(
     digest = hashlib.sha256(
         _json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:16]
+    # Hook enumeration the shipped bytes were rendered against (#147,
+    # consumer 3): a shipped artifact records which enumeration its bytes
+    # saw, so a cost table priced from one rendering cannot be silently
+    # served from another. ``None`` for caches that predate the stamp.
+    from prismaquant.production_weight_cache import activation_hook_scope_of
+
     return {
         "path": str(Path(cache_dir).resolve()) if cache_dir else None,
         "n_entries": len(rows),
@@ -1162,6 +1269,7 @@ def _production_cache_fingerprint(
         "activation_max_abs_hash": act_digest,
         "metadata_hash": metadata_digest,
         "levers": dict(getattr(cache, "levers", {}) or {}),
+        "activation_hook_scope": activation_hook_scope_of(cache),
     }
 
 
@@ -1208,27 +1316,341 @@ def _source_weight_shape_for_recipe(
     return None
 
 
+class _RuntimeCoercion(NamedTuple):
+    """One Linear the runtime-legality guard rewrote to BF16.
+
+    Positionally tuple-compatible with the legacy ``(name, shape,
+    from_fmt)`` row this function used to return: `_bf16_upgrade_audit`
+    and the manifest read the first three fields, so old readers keep
+    working while the serving-group fields carry WHY a Linear the
+    allocator chose a quantized format for is shipping unquantized.
+    """
+    name: str
+    shape: list[int] | None
+    from_fmt: str
+    reason: str = ""
+    detail: str = ""
+    # Set only when the coercion was forced by serving-atomicity rather
+    # than by this Linear's own legality verdict.
+    serving_group: str | None = None
+    serving_group_kind: str | None = None
+    serving_group_members: tuple[str, ...] = ()
+    trigger: str | None = None
+    delta_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class _ServingUnit:
+    """A set of Linears that must carry ONE format to be servable.
+
+    ``kind`` is ``fused_siblings`` (vLLM merges q/k/v, gate/up into one
+    packed Linear with one scheme) or ``packed_moe_experts`` (vLLM's
+    ``CompressedTensorsMoEMethod`` selects one scheme per FusedMoE
+    layer). Both are the hard serving invariants of CLAUDE.md §6.
+    """
+    kind: str
+    key: str
+    members: tuple[str, ...]
+
+
+def _serving_atomic_units(
+    names: Iterable[str],
+    profile,
+) -> tuple[tuple[_ServingUnit, ...], dict[str, str]]:
+    """Serving-atomic units among ``names``, from the profile accessors.
+
+    Grouping is asked of the shared activation-contract policy through the
+    compatibility delegate `_fused_group_key_for_name` (the same
+    `fused_sibling_group` / `fused_sibling_leaf_mapping` chain the
+    fused-coherence gate in `build_quantization_config` derives its
+    sibling sets from) and `profile.packed_expert_format_group` (what
+    that gate's `_packed_format_group_members` uses). Nothing here
+    parses Linear names: a new architecture declares its couplings once,
+    in its profile/structure spec, and every consumer sees them.
+
+    Returns the units with >= 2 members present (a lone present member
+    cannot disagree with anything) plus, for fail-closed handling, the
+    names whose packed-expert grouping accessor RAISED — a profile that
+    cannot answer "which unit is this expert projection in" must not be
+    silently treated as "no unit".
+    """
+    grouped: dict[tuple[str, str], list[str]] = {}
+    failures: dict[str, str] = {}
+    packed_getter = (
+        getattr(profile, "packed_expert_format_group", None)
+        if profile is not None
+        else None
+    )
+    for name in names:
+        fused_key = _fused_group_key_for_name(name, profile)
+        if fused_key:
+            grouped.setdefault(("fused_siblings", str(fused_key)), []).append(name)
+        if not callable(packed_getter):
+            continue
+        try:
+            packed_key = packed_getter(name)
+        except Exception as exc:  # PackedExpertRoleUnknown and friends
+            failures[name] = f"{type(exc).__name__}: {exc}"
+            continue
+        if packed_key:
+            grouped.setdefault(
+                ("packed_moe_experts", str(packed_key)), []
+            ).append(name)
+    units = tuple(
+        _ServingUnit(kind, key, tuple(sorted(members)))
+        for (kind, key), members in sorted(grouped.items())
+        if len(members) >= 2
+    )
+    return units, failures
+
+
+def _serving_atomic_components(
+    names: Iterable[str],
+    profile,
+) -> tuple[dict[str, list[str]], dict[str, tuple[_ServingUnit, ...]], dict[str, str]]:
+    """Connected components of the serving-atomic units over ``names``.
+
+    Units are unioned rather than handled one at a time because they can
+    overlap: on the split per-expert representation
+    ``...experts.7.gate_proj`` is both a fused sibling of
+    ``...experts.7.up_proj`` and a member of the layer's packed-expert
+    unit. Coercing one unit at a time could then still leave the other
+    mixed. This mirrors the allocator's own union-find serving-unit
+    promotion (`allocator_solver._promote_group_components`).
+
+    Returns ``(members_by_name, units_by_name, grouping_failures)`` where
+    the first two are keyed by EVERY name in its component (so a lookup
+    needs no root bookkeeping at the call site).
+    """
+    all_names = list(names)
+    units, failures = _serving_atomic_units(all_names, profile)
+    parent = {name: name for name in all_names}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for unit in units:
+        members = [m for m in unit.members if m in parent]
+        for member in members[1:]:
+            ra, rb = find(members[0]), find(member)
+            if ra != rb:
+                parent[rb] = ra
+
+    members_by_root: dict[str, list[str]] = {}
+    for name in all_names:
+        members_by_root.setdefault(find(name), []).append(name)
+    units_by_root: dict[str, list[_ServingUnit]] = {}
+    for unit in units:
+        present = [m for m in unit.members if m in parent]
+        if present:
+            units_by_root.setdefault(find(present[0]), []).append(unit)
+
+    members_by_name: dict[str, list[str]] = {}
+    units_by_name: dict[str, tuple[_ServingUnit, ...]] = {}
+    for root, members in members_by_root.items():
+        component = sorted(members)
+        component_units = tuple(units_by_root.get(root, ()))
+        for name in members:
+            members_by_name[name] = component
+            units_by_name[name] = component_units
+    return members_by_name, units_by_name, failures
+
+
+def _bf16_coercion_delta_bytes(
+    shape: Sequence[int] | None,
+    from_fmt: str,
+) -> int | None:
+    """Bytes a Linear GAINS by shipping BF16 instead of ``from_fmt``."""
+    if not shape:
+        return None
+    from .format_registry import get_format
+
+    try:
+        src = get_format(from_fmt)
+        bf16 = get_format("BF16")
+    except KeyError:
+        return None
+    shape_t = tuple(int(dim) for dim in shape)
+    return int(
+        bf16.memory_bytes_for_shape(shape_t) - src.memory_bytes_for_shape(shape_t)
+    )
+
+
+def _human_bytes(n_bytes: int | None) -> str:
+    if n_bytes is None:
+        return "unknown"
+    value = float(n_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(value) < 1024.0 or unit == "GiB":
+            return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+    return f"{value:.2f} GiB"
+
+
+def _group_legal_quantized_formats(
+    shapes: dict[str, list[int] | None],
+    members: Sequence[str],
+    target_profile: str,
+) -> list[tuple[str, float]]:
+    """Emittable QUANTIZED formats legal for every checkable member.
+
+    "Checkable" is the same bar the coercion itself uses: a member with a
+    known 2-D source shape. Passthrough formats are excluded: BF16 is the
+    fallback under discussion, and FP8_SOURCE is a *source-dependent*
+    rung (legal only where every member's source is already fp8), so
+    offering it as a substitute would flip refuse-vs-coerce on FP8-source
+    models — a unit that must fall back to BF16 today would instead be
+    refused. That rung is already in the allocator's menu, which is where
+    picking it belongs; export names alternatives, it does not choose.
+
+    A non-empty answer is the decisive fact for refuse-vs-coerce: it says
+    the allocation is repairable upstream at a quantized bit rate, so
+    rewriting the whole serving unit to 16 bpp is NOT what a
+    shape-aware allocator would have produced.
+    """
+    from .format_registry import get_format
+
+    checkable = [
+        (name, tuple(int(d) for d in shapes[name]))
+        for name in members
+        if shapes.get(name) is not None and len(shapes[name] or ()) == 2
+    ]
+    if not checkable:
+        return []
+    legal: list[tuple[str, float]] = []
+    for fmt in sorted(EXPORTABLE_FORMATS - set(PASSTHROUGH_SOURCE_REQUIREMENTS)):
+        if not all(
+            check_format_applicability(
+                shape,
+                fmt,
+                qname=name,
+                target_profile=target_profile,
+            ).legal
+            for name, shape in checkable
+        ):
+            continue
+        try:
+            bits = get_format(fmt).effective_bits_for_shape(checkable[0][1])
+        except KeyError:
+            bits = float("nan")
+        legal.append((fmt, float(bits)))
+    return sorted(legal, key=lambda row: (row[1], row[0]))
+
+
 def _coerce_runtime_legal_assignment(
     src_model: str,
     assignment: dict[str, str],
     profile=None,
-) -> tuple[dict[str, str], list[tuple[str, list[int], str]]]:
+) -> tuple[dict[str, str], list[_RuntimeCoercion]]:
     """Adjust assignments that the target runtime cannot execute.
 
     Shape and format legality comes from serving-profile config. BF16 is the
-    conservative runtime fallback when an assigned format is not executable.
+    conservative runtime fallback when a format this exporter CAN emit turns
+    out to be illegal on this Linear's shape or denied by the resolved
+    serving profile.
+
+    A format the exporter cannot emit at all (not in `EXPORTABLE_FORMATS`)
+    is NOT coerced — it raises. Rewriting it to BF16 would ship that Linear
+    at 16 bpp, blowing the byte budget the allocation was selected under and
+    producing an artifact whose real bpp disagrees with its own
+    `layer_config.json`. The serving profile's export lane already bounds
+    the allocator's menu by this exporter's declaration, so reaching here
+    means that bound regressed; masking it with a rewrite is the
+    post-allocator band-aid CLAUDE.md §4.1 vetoes.
+
+    **Serving-atomic groups (issue #28).** The coercion is group-aware. A
+    packed-MoE expert unit and a fused-sibling set must carry ONE format
+    (vLLM selects one scheme per FusedMoE layer / per merged-column
+    Linear), and their members do NOT share a shape — an odd
+    `moe_intermediate_size` can make `down_proj` indivisible while
+    `gate_up_proj` is fine. Rewriting only the offending member would
+    produce a quantized + BF16 mix inside one serving unit: a
+    hard-serving-invariant violation that `build_quantization_config`'s
+    fused-coherence gate then reports as a wrong-model-profile problem it
+    is not. So when a member of a serving unit is illegal, this function
+    resolves the WHOLE unit, and never leaves a unit mixed:
+
+      * if some emittable QUANTIZED format is legal for every member, it
+        **raises**. Coercing would ship the whole unit at 16 bpp — for a
+        packed-expert unit that is `num_experts x` the per-Linear cost
+        this branch is justified by, and the model-wide dimension that
+        made one member illegal makes it every layer's unit — when a
+        re-solve lands the unit on that legal format for free. Export
+        must not pick the substitute itself: the format it picked is the
+        one the production weight cache holds a deliberate render for
+        (a substitute is a cache miss at best, an RTN render at worst),
+        so naming the legal rung and refusing is the honest move.
+      * if NO quantized format is legal for every member, BF16 is not a
+        band-aid but the only representable answer — exactly what a
+        shape-aware allocator would have had to pick — so the whole unit
+        is coerced, loudly, and every member is recorded in the returned
+        rows (and from there in `runtime_coercions` +
+        `bf16_audit.serving_group`).
+
+    **Passthrough source integrity (issue #29).**
+    `PASSTHROUGH_SOURCE_REQUIREMENTS` makes FP8_SOURCE legal only where the
+    source tensor is ALREADY fp8, which `check_format_applicability` can
+    only judge with a `source_kind`. That argument used to be omitted, so
+    every FP8_SOURCE Linear came back `source_dtype_mismatch` and was
+    rewritten to BF16 —
+    inert in the bytes (materialization copies the source fp8 verbatim and
+    `_fp8_source_config_overlay` restores the config), but it filled every
+    DSv4 / Hy3 / MiniMax manifest's `runtime_coercions` with rows for
+    demotions that never happened, hiding any real one. The `source_kind`
+    now comes from `_scan_source_dtype_manifest` — the SAME recipe-keyed
+    map `build_candidates` gates the allocator's passthrough candidates
+    on — so export's verdict and the gate that admitted the allocation
+    cannot disagree, and a passthrough row now means the source really is
+    not fp8 (i.e. an upstream `PASSTHROUGH_SOURCE_REQUIREMENTS` failure)
+    and the bytes really do change. Such a verdict is therefore treated
+    like any other illegality, group escalation included.
+
+    Upstream is the real fix: the allocator's candidate mask intersects
+    shape legality per member, so a promoted format is legal for every
+    member by construction and this path is unreachable in normal
+    operation. Treat any firing as an upstream regression worth reporting
+    — `_runtime_coercion_report` is written to be impossible to miss.
     """
     out = dict(assignment)
-    coerced: list[tuple[str, list[int], str]] = []
     target_profile = _allocator_target_profile_for_audit(profile) or "research"
+    shapes: dict[str, list[int] | None] = {}
+    # Recipe-keyed source dtypes, read lazily: only passthrough formats
+    # consult `source_kind` inside `check_format_applicability`, and the
+    # scan is safetensors-header IO that a BF16-source export never needs
+    # (CLAUDE.md §4.7 — no disk work on a path that cannot use it).
+    source_kinds: dict[str, str] | None = None
+
+    def _source_kind_for(qname: str) -> str | None:
+        nonlocal source_kinds
+        if source_kinds is None:
+            source_kinds = _scan_source_dtype_manifest(src_model, profile)
+        return source_kinds.get(qname)
+
+    # qname -> (shape, from_fmt, reason, detail)
+    illegal: dict[str, tuple[list[int], str, str, str]] = {}
     for qname, fmt in assignment.items():
         fmt_canonical = _canonical_export_format(fmt)
         out[qname] = fmt_canonical
         if fmt_canonical == "BF16":
             continue
-        if fmt_canonical not in FORMAT_SCHEME:
+        if fmt_canonical not in EXPORTABLE_FORMATS:
             from prismaquant.gguf_formats import GGUF_BLOCK_BYTES
+            from prismaquant.cb_layout import CB_FORMAT_NAMES
 
+            if fmt_canonical in CB_FORMAT_NAMES:
+                # Wrong container: an NVFP4-CB / FP8-CB assignment reaching the
+                # compressed-tensors exporter means the pipeline was launched
+                # without EXPORT_CONTAINER=nvfp4_cb. Stock compressed-tensors
+                # schemes cannot express codebooks; coercing to BF16 would ship
+                # a ~16 bpp artifact unrelated to the allocated budget.
+                raise ValueError(
+                    f"{qname}: format {fmt_canonical} ships via the nvfp4_cb "
+                    f"container (prismaquant.export_nvfp4_cb / "
+                    f"EXPORT_CONTAINER=nvfp4_cb), not compressed-tensors"
+                )
             if fmt_canonical in GGUF_BLOCK_BYTES:
                 # Wrong container, not a research format: a GGUF assignment
                 # reaching the compressed-tensors exporter means the pipeline
@@ -1240,35 +1662,440 @@ def _coerce_runtime_legal_assignment(
                     f"container (prismaquant.export_gguf / "
                     f"EXPORT_CONTAINER=gguf), not compressed-tensors"
                 )
-            shape = _source_weight_shape_for_recipe(src_model, qname, profile)
-            out[qname] = "BF16"
-            coerced.append((qname, shape or [], fmt_canonical))
-            continue
+            raise ValueError(
+                f"{qname}: format {fmt_canonical} has no compressed-tensors "
+                f"emit path -- it is absent from FORMAT_SCHEME, so there is "
+                f"no `config_groups` scheme for vLLM to dispatch on "
+                f"(emittable={sorted(EXPORTABLE_FORMATS)}). Rewriting it to "
+                f"BF16 here would ship this Linear at 16 bpp and silently "
+                f"blow the byte budget the allocation was selected under, "
+                f"leaving the artifact's real bpp disagreeing with its own "
+                f"layer_config.json. The serving profile that admitted it "
+                f"(target_profile={target_profile!r}) is supposed to bound "
+                f"its menu by this exporter's EXPORTABLE_FORMATS via its "
+                f"export lane, so this is a regression in that bound (or an "
+                f"allocation solved under a different profile than "
+                f"PRISMAQUANT_TARGET_PROFILE resolves to here) -- re-solve "
+                f"the allocation under the serving profile you are exporting "
+                f"for rather than letting export rewrite it."
+            )
         shape = _source_weight_shape_for_recipe(src_model, qname, profile)
+        shapes[qname] = shape
         if shape is None or len(shape) != 2:
             continue
         verdict = check_format_applicability(
             tuple(shape),
             fmt,
             qname=qname,
+            source_kind=(
+                _source_kind_for(qname)
+                if fmt_canonical in PASSTHROUGH_SOURCE_REQUIREMENTS
+                else None
+            ),
             target_profile=target_profile,
         )
         if not verdict.legal:
+            illegal[qname] = (
+                shape,
+                fmt_canonical,
+                verdict.reason or "illegal",
+                verdict.detail or "",
+            )
+
+    if not illegal:
+        return out, []
+
+    coerced: list[_RuntimeCoercion] = []
+    handled: set[str] = set()
+
+    # No passthrough exemption (issue #29). It existed only because the
+    # FP8_SOURCE verdict was an artifact of the missing `source_kind` —
+    # escalating a bogus demotion would have coerced whole packed-expert
+    # units to BF16 on every FP8-source model. Now that the verdict is
+    # source-aware, a passthrough mismatch is a real illegality with a
+    # real byte cost, and gets the same serving-atomic treatment as a
+    # shape or policy one: refused when the unit has a legal quantized
+    # rung, coerced as a whole unit when it does not.
+    members_by_name, units_by_name, grouping_failures = (
+        _serving_atomic_components(out.keys(), profile)
+    )
+    if grouping_failures:
+        # Fail closed. A name whose serving-unit accessor raised is absent
+        # from every unit, so "coerce the whole unit" would silently leave
+        # it behind -- i.e. produce exactly the mixed FusedMoE this branch
+        # exists to prevent. An undeclared packed-expert role is a profile
+        # declaration gap; guessing it is how you ship an allocation nobody
+        # selected.
+        raise ValueError(
+            f"cannot verify serving-atomic coherence: the model profile "
+            f"could not name the serving unit for "
+            f"{len(grouping_failures)} Linear(s), and "
+            f"{len(illegal) - len(handled)} Linear(s) need a runtime-legality "
+            f"coercion that must be applied to a whole unit or not at all. "
+            + "; ".join(
+                f"{name} ({err})"
+                for name, err in sorted(grouping_failures.items())[:8]
+            )
+            + ". Declare the packed-expert projection roles for this "
+            "architecture (model_profiles/specs/*.json "
+            "`packed_experts.projection_splits`) rather than letting export "
+            "guess which projections share a FusedMoE scheme."
+        )
+    refusals: list[str] = []
+    for qname in sorted(illegal):
+        if qname in handled:
+            continue
+        shape, from_fmt, reason, detail = illegal[qname]
+        units = units_by_name.get(qname, ())
+        if not units:
+            # Not serving-atomic: coerce this Linear alone, as before.
+            handled.add(qname)
             out[qname] = "BF16"
-            coerced.append((qname, shape, fmt_canonical))
+            coerced.append(
+                _RuntimeCoercion(
+                    qname, shape, from_fmt, reason, detail,
+                    delta_bytes=_bf16_coercion_delta_bytes(shape, from_fmt),
+                )
+            )
+            continue
+        members = members_by_name.get(qname, [qname])
+        co_triggers = sorted(m for m in members if m in illegal)
+        handled.update(co_triggers)
+        alternatives = _group_legal_quantized_formats(
+            shapes, members, target_profile
+        )
+        # Name the component by its WIDEST unit — the FusedMoE / merged
+        # column that actually constrains it. Concatenating every unit key
+        # would put a 128-expert layer's whole key list on every row of
+        # the manifest for no extra information: `serving_group_members`
+        # already carries the exact membership.
+        widest = max(units, key=lambda unit: (len(unit.members), unit.key))
+        group_key = widest.key
+        group_kind = "+".join(sorted({unit.kind for unit in units}))
+        would_cost = sum(
+            delta
+            for delta in (
+                _bf16_coercion_delta_bytes(
+                    shapes.get(member), _canonical_export_format(out[member])
+                )
+                for member in members
+                if _canonical_export_format(out[member]) != "BF16"
+            )
+            if delta is not None
+        )
+        if alternatives:
+            refusals.append(
+                _describe_serving_group_refusal(
+                    trigger=qname,
+                    shape=shape,
+                    from_fmt=from_fmt,
+                    reason=reason,
+                    detail=detail,
+                    group_key=group_key,
+                    group_kind=group_kind,
+                    members=members,
+                    co_triggers=co_triggers,
+                    alternatives=alternatives,
+                    would_cost=would_cost,
+                    target_profile=target_profile,
+                )
+            )
+            continue
+        # BF16 is the only representable format left for this unit: it is
+        # what a shape-aware allocator must pick, so take it for the WHOLE
+        # unit. Never one member — that is the mixed-scheme artifact.
+        for member in members:
+            member_fmt = _canonical_export_format(out[member])
+            if member_fmt == "BF16":
+                continue
+            member_shape = shapes.get(member)
+            out[member] = "BF16"
+            if member in illegal:
+                member_reason, member_detail = illegal[member][2], illegal[member][3]
+            else:
+                member_reason = "serving_group_coherence"
+                member_detail = (
+                    f"coerced with its serving-atomic unit; {qname} is "
+                    f"illegal for {from_fmt} ({reason})"
+                )
+            coerced.append(
+                _RuntimeCoercion(
+                    member,
+                    member_shape,
+                    member_fmt,
+                    member_reason,
+                    member_detail,
+                    group_key,
+                    group_kind,
+                    tuple(members),
+                    qname,
+                    _bf16_coercion_delta_bytes(member_shape, member_fmt),
+                )
+            )
+
+    if refusals:
+        raise ValueError(
+            f"serving-atomic group is not runtime-legal for its allocated "
+            f"format in {len(refusals)} unit(s). vLLM selects ONE scheme per "
+            f"FusedMoE layer and one per merged-column Linear, so every "
+            f"member of these units must carry ONE format; export refuses to "
+            f"rewrite them rather than ship a mixed (unservable) unit or a "
+            f"whole unit at 16 bpp when a quantized format legal for every "
+            f"member exists. "
+            + " || ".join(refusals)
+        )
     return out, coerced
 
 
+def _describe_serving_group_refusal(
+    *,
+    trigger: str,
+    shape: Sequence[int] | None,
+    from_fmt: str,
+    reason: str,
+    detail: str,
+    group_key: str,
+    group_kind: str,
+    members: Sequence[str],
+    co_triggers: Sequence[str],
+    alternatives: Sequence[tuple[str, float]],
+    would_cost: int,
+    target_profile: str,
+) -> str:
+    """One refusal clause: what is illegal, and what to do about it."""
+    alt_text = ", ".join(f"{fmt} (~{bits:.3f} bpp)" for fmt, bits in alternatives)
+    others = [name for name in co_triggers if name != trigger]
+    parts = [
+        f"unit {group_key!r} [{group_kind}] allocated {from_fmt} with "
+        f"{len(members)} member(s): {trigger} is ILLEGAL at shape "
+        f"{list(shape) if shape else None} "
+        f"(reason={reason}; {detail or 'no detail'}) under "
+        f"target_profile={target_profile!r}"
+        + (f"; also illegal in this unit: {others}" if others else ""),
+        f"but these emittable formats ARE legal for every member of the "
+        f"unit: {alt_text}. Coercing the unit to BF16 instead would add "
+        f"{_human_bytes(would_cost)} for nothing, and the "
+        + ("source precision"
+           if reason == "source_dtype_mismatch" else "dimension")
+        + f" that made {trigger.rsplit('.', 1)[-1]} illegal is model-wide, "
+        f"so it is that much per unit across every layer",
+    ]
+    parts.append(
+        f"members={sorted(members)[:8]}"
+        + (f" (+{len(members) - 8} more)" if len(members) > 8 else "")
+    )
+    parts.append(
+        f"FIX: re-solve the allocation for target_profile={target_profile!r} "
+        f"so this unit's promoted format is legal for every member -- "
+        f"legality (shape, serving policy, and passthrough source precision) "
+        f"has to be intersected ACROSS a serving unit, because that "
+        f"unit is one scheme at serve time (issue #28); or, when "
+        f"re-exporting an allocation that predates that, set every member of "
+        f"the unit to one of the legal formats above in layer_config.json. "
+        f"Export deliberately does not substitute the format itself: the "
+        f"production weight cache holds a deliberate render for the format "
+        f"that was ALLOCATED, so a substitution is a cache miss (or an RTN "
+        f"render), and picking formats is the allocator's job"
+    )
+    return " -- ".join(parts)
+
+
+def _runtime_coercion_report(coerced: Sequence[_RuntimeCoercion]) -> str:
+    """Operator-facing report for runtime coercions, group-aware.
+
+    A whole-serving-unit coercion means an allocation reached export with
+    a format that is illegal for a member of a unit that must be uniform.
+    Upstream is supposed to make that unrepresentable, so this is loud on
+    purpose: it is a safety net firing, i.e. evidence of an upstream
+    regression (or a pre-#28 `layer_config.json`), not routine hygiene.
+    """
+    if not coerced:
+        return ""
+    deltas = [
+        row.delta_bytes for row in coerced
+        if getattr(row, "delta_bytes", None) is not None
+    ]
+    lines = [
+        f"[export-stream] runtime format coercions: {len(coerced)} Linears "
+        f"-> BF16 (target runtime does not support those format/shape pairs)"
+        + (
+            f"; +{_human_bytes(sum(deltas))} over the allocated formats"
+            if deltas else ""
+        ),
+    ]
+    # A passthrough verdict is not a runtime-support fact but a broken
+    # allocator contract: FP8_SOURCE was assigned to a Linear whose source
+    # is not fp8, which `PASSTHROUGH_SOURCE_REQUIREMENTS` is supposed to
+    # make unreachable (issue #29). Since #29 this can no longer be the
+    # missing-`source_kind` false positive, so say so in those words.
+    passthrough = [
+        row for row in coerced
+        if getattr(row, "reason", "") == "source_dtype_mismatch"
+    ]
+    if passthrough:
+        lines.append(
+            f"[export-stream] WARNING: {len(passthrough)} PASSTHROUGH "
+            f"SOURCE MISMATCH(ES): a passthrough format was allocated to a "
+            f"Linear whose source is not that precision, so the source bytes "
+            f"cannot be copied and BF16 is the only representable answer. "
+            f"PASSTHROUGH_SOURCE_REQUIREMENTS is supposed to make this "
+            f"unreachable -- re-solve the allocation against this checkpoint "
+            f"(the allocator's source manifest disagrees with the source "
+            f"safetensors). "
+            + str([(row.name, row.from_fmt, row.detail)
+                   for row in passthrough[:6]])
+        )
+    groups: dict[str, list[_RuntimeCoercion]] = {}
+    singles: list[_RuntimeCoercion] = []
+    for row in coerced:
+        key = getattr(row, "serving_group", None)
+        if key:
+            groups.setdefault(str(key), []).append(row)
+        else:
+            singles.append(row)
+    if groups:
+        lines.append(
+            "[export-stream] " + "=" * 62
+        )
+        lines.append(
+            f"[export-stream] WARNING: {len(groups)} SERVING-ATOMIC UNIT(S) "
+            f"COERCED TO BF16 IN FULL."
+        )
+        lines.append(
+            "[export-stream]   vLLM needs ONE format per FusedMoE layer / "
+            "merged-column Linear, and no"
+        )
+        lines.append(
+            "[export-stream]   emittable quantized format was legal for "
+            "every member, so the whole unit"
+        )
+        lines.append(
+            "[export-stream]   ships unquantized. The allocator is supposed "
+            "to make this unreachable, so"
+        )
+        lines.append(
+            "[export-stream]   treat it as an UPSTREAM REGRESSION (or a "
+            "pre-#28 layer_config.json) and"
+        )
+        lines.append(
+            "[export-stream]   report it: this artifact's real bpp EXCEEDS "
+            "its own layer_config.json."
+        )
+        for key, rows in sorted(groups.items()):
+            first = rows[0]
+            delta = sum(
+                row.delta_bytes for row in rows
+                if row.delta_bytes is not None
+            )
+            lines.append(
+                f"[export-stream]   unit {key} [{first.serving_group_kind}]: "
+                f"{len(rows)} Linears -> BF16, +{_human_bytes(delta)}"
+            )
+            lines.append(
+                f"[export-stream]     trigger={first.trigger} "
+                f"from={first.from_fmt} reason={first.reason} "
+                f"detail={first.detail}"
+            )
+            lines.append(
+                "[export-stream]     members="
+                + str(list(first.serving_group_members)[:8])
+                + (
+                    f" (+{len(first.serving_group_members) - 8} more)"
+                    if len(first.serving_group_members) > 8
+                    else ""
+                )
+            )
+        lines.append("[export-stream] " + "=" * 62)
+    if singles:
+        lines.append(
+            "[export-stream]   ungrouped: "
+            + str([(row.name, row.shape, row.from_fmt) for row in singles[:6]])
+        )
+    return "\n".join(lines)
+
+
+def _runtime_coercion_manifest_rows(
+    coerced: Sequence[_RuntimeCoercion],
+) -> list[dict[str, object]]:
+    """`runtime_coercions` records for `mixed_native_manifest.json`."""
+    rows: list[dict[str, object]] = []
+    for row in coerced:
+        entry: dict[str, object] = {
+            "name": row[0],
+            "shape": row[1],
+            "from": row[2],
+            "to": "BF16",
+            "reason": getattr(row, "reason", "") or None,
+            "detail": getattr(row, "detail", "") or None,
+            "delta_bytes": getattr(row, "delta_bytes", None),
+        }
+        group = getattr(row, "serving_group", None)
+        if group:
+            entry["serving_group"] = {
+                "key": group,
+                "kind": row.serving_group_kind,
+                "members": list(row.serving_group_members),
+                "trigger": row.trigger,
+            }
+        rows.append(entry)
+    return rows
+
+
+# The serving profile the allocator actually solved with, read out of
+# layer_config.json's reserved metadata block at load time (re-vet R11).
+_ALLOCATOR_TARGET_PROFILE: str | None = None
+
+
 def _allocator_target_profile_for_audit(profile) -> str | None:
-    # PRISMAQUANT_TARGET_PROFILE lets the pipeline audit export legality
-    # under the SAME serving profile the allocator solved with. Without it
-    # a profile whose spec default differs (hy_v3 defaults to gguf) would
-    # coerce every format the default profile doesn't serve — 2026-07-11:
-    # 226 dense FP8 Linears silently -> BF16 on the Hy3 CT export.
-    requested = os.environ.get("PRISMAQUANT_TARGET_PROFILE") or None
+    # Export must audit legality under the SAME serving profile the allocator
+    # solved with. When they differ, export coerces every format the profile
+    # it resolved does not serve — 2026-07-11: 226 dense FP8 Linears silently
+    # -> BF16 on the Hy3 CT export, because the allocator ran vllm_packed_moe
+    # while export re-resolved hy_v3's declared `gguf`.
+    #
+    # Precedence: PRISMAQUANT_TARGET_PROFILE (explicit operator override for
+    # direct exporter invocations) > the allocator's stamp in
+    # layer_config.json > the architecture spec default. The stamp travels
+    # with the artifact, so the pipeline needs no env plumbing at all.
+    requested = (
+        os.environ.get("PRISMAQUANT_TARGET_PROFILE")
+        or _ALLOCATOR_TARGET_PROFILE
+        or None
+    )
     if profile is None and requested is None:
         return None
     return resolve_target_profile(profile, requested)
+
+
+def _bf16_passthrough_for_assignment(
+    explicit_ignore: Sequence[str] | None,
+    profile,
+    allocator_meta: Mapping[str, object] | None,
+) -> set[str]:
+    """Resolve profile pins without undoing an explicit head assignment.
+
+    Old layer configs carry no head metadata and retain the historical profile
+    pin. New allocator configs stamp ``lm_head_mode``: ``fixed`` means the
+    measured ``lm_head_format`` is auxiliary to body bpp, while ``dp`` means
+    ``--allow-pinned lm_head`` selected it. In either case the assignment — not
+    the exporter's default pin — is authoritative for that one head. An
+    explicit ``--ignore`` remains the highest-precedence operator override.
+    """
+    if explicit_ignore is not None:
+        return {str(name) for name in explicit_ignore}
+
+    from .fixed_head import remaining_profile_pins
+
+    meta = dict(allocator_meta or {})
+    mode = str(meta.get("lm_head_mode") or "")
+    fmt = str(meta.get("lm_head_format") or "BF16")
+    lift_head = mode == "dp" or (
+        mode == "fixed" and _canonical_export_format(fmt) != "BF16"
+    )
+    return set(remaining_profile_pins(
+        profile,
+        fixed_lm_head_quantized=lift_head,
+    ))
 
 
 def _bf16_upgrade_audit(
@@ -1286,6 +2113,10 @@ def _bf16_upgrade_audit(
     MXFP8_E4M3/MXFP8_E5M2/FP8 may be worth trying next.
     """
     coerced: dict[str, tuple[list[int], str]] = {}
+    # Serving-unit coercions (issue #28) are reported as such: a whole
+    # FusedMoE / merged-column unit shipping unquantized is a different
+    # (and louder) fact than one Linear whose own shape was illegal.
+    coerced_groups: dict[str, dict[str, object]] = {}
     for row in runtime_coerced:
         if len(row) >= 3:
             name, shape, from_fmt = row[:3]
@@ -1293,6 +2124,16 @@ def _bf16_upgrade_audit(
             name, shape = row[:2]
             from_fmt = "MXFP8_E4M3"
         coerced[str(name)] = (shape, str(from_fmt))
+        group_key = getattr(row, "serving_group", None)
+        if group_key:
+            coerced_groups[str(name)] = {
+                "key": str(group_key),
+                "kind": row.serving_group_kind,
+                "members": list(row.serving_group_members),
+                "trigger": row.trigger,
+                "reason": getattr(row, "reason", "") or None,
+                "detail": getattr(row, "detail", "") or None,
+            }
     target_profile = _allocator_target_profile_for_audit(profile)
     candidate_formats = ("MXFP8_E4M3", "MXFP8_E5M2", "FP8_E4M3", "FP8_E5M2")
     entries: list[dict[str, object]] = []
@@ -1312,7 +2153,9 @@ def _bf16_upgrade_audit(
             reason = "passthrough_or_immutable"
         elif coerced_entry is not None:
             reason = (
-                "runtime_coerced_from_"
+                "runtime_coerced_"
+                + ("serving_group_" if qname in coerced_groups else "")
+                + "from_"
                 + coerced_entry[1].lower().replace("-", "_")
             )
         else:
@@ -1368,6 +2211,9 @@ def _bf16_upgrade_audit(
                         "detail": verdict.detail,
                     }
             entry["eight_bit_candidates"] = verdicts
+        group_entry = coerced_groups.get(qname)
+        if group_entry is not None:
+            entry["serving_group"] = group_entry
         entries.append(entry)
 
     return {
@@ -1381,23 +2227,58 @@ def _production_cache_prefetch_assignment(
     assignment: dict[str, str],
     *,
     prefix: str | None = None,
+    mode: str | None = None,
 ) -> int:
+    """Prefetch this layer's rendered weights out of the production cache.
+
+    ``mode`` mirrors ``ProductionWeightCache.prefetch_assignment(require=…)``:
+    under ``require`` a cache that cannot supply the assignment is a hard
+    failure. Every failure path here used to return ``0`` and the caller only
+    logged when it prefetched something, so a TOTAL miss was invisible and the
+    export silently went NVMe-bound, tensor by tensor (re-vet R24 / debt D8).
+    """
+    mode = str(mode or _PRODUCTION_CACHE_PREFETCH_MODE or "warn").lower()
+    require = mode == "require"
+
+    def _refuse(reason: str) -> None:
+        if require:
+            raise RuntimeError(
+                f"production-cache prefetch (require): {reason}. The export "
+                "would fall back to per-tensor NVMe reads; pass "
+                "--production-cache-prefetch warn to accept that explicitly."
+            )
+
     cache = _PRODUCTION_WEIGHT_CACHE
     if cache is None or not hasattr(cache, "prefetch"):
+        _refuse("no production weight cache is installed")
         return 0
     keys: list[tuple[str, str]] = []
+    quantized = 0
     for qname, fmt in assignment.items():
         if prefix is not None and not (qname == prefix or qname.startswith(prefix + ".")):
             continue
         cache_fmt = str(fmt).upper()
         if _canonical_export_format(cache_fmt) == "BF16":
             continue
+        quantized += 1
         key = _production_cache_lookup_key(qname, cache_fmt)
         if key is not None:
             keys.append(key)
     if not keys:
+        # No quantized entries under this prefix is legitimate (an all-BF16
+        # layer); quantized entries with no cache keys is a total miss.
+        if quantized:
+            _refuse(
+                f"{quantized} quantized entries under prefix {prefix!r} "
+                "resolved to zero production-cache keys"
+            )
         return 0
-    return int(cache.prefetch(keys, max_workers=_PRODUCTION_CACHE_PREFETCH_WORKERS))
+    loaded = int(cache.prefetch(keys, max_workers=_PRODUCTION_CACHE_PREFETCH_WORKERS))
+    if loaded == 0:
+        _refuse(
+            f"{len(keys)} cache keys under prefix {prefix!r} loaded nothing"
+        )
+    return loaded
 
 
 @contextmanager
@@ -1502,12 +2383,7 @@ def _pack_production_cached_2d(
                 group_size=16,
                 global_real_override=nvfp4_global_real_override,
             )
-        input_scale = (
-            _INPUT_GLOBAL_SCALES.get(linear_name) if _INPUT_GLOBAL_SCALES
-            else None
-        )
-        if input_scale is None:
-            input_scale = DEFAULT_INPUT_GLOBAL_SCALE
+        input_scale = _resolve_nvfp4_input_global_scale(target=linear_name)
         return {
             "weight_packed": wp,
             "weight_scale": ws,
@@ -1610,9 +2486,8 @@ def _packed_expert_input_global_scale(
     *,
     cache: "ProductionWeightCache | None" = None,
 ) -> float | None:
-    """Calibrated W4A4 input_global_scale (FP8_MAX*FP4_MAX/max_abs, the
-    generate_gparam convention) for a packed-expert tensor, read from the
-    production cache's per-param activation max_abs.
+    """Policy-resolved W4A4 input_global_scale for a packed-expert tensor,
+    read from the production cache's per-param activation max_abs.
 
     Returns ``None`` when no cache/scale is available, so the caller falls back
     to ``DEFAULT_INPUT_GLOBAL_SCALE`` (only on the no-cache research path).
@@ -1628,6 +2503,86 @@ def _packed_expert_input_global_scale(
     if mx is None or float(mx) <= 0:
         return None
     return _nvfp4_input_global_scale_from_max_abs(float(mx))
+
+
+def _packed_expert_stage_attestation(
+    experts_param_name: str,
+    *,
+    cache: "ProductionWeightCache | None" = None,
+    profile=None,
+) -> dict[str, Any] | None:
+    """Attest one packed FusedMoE module's w13/w2 stages (ROADMAP K0.2).
+
+    This legacy container deliberately publishes no
+    ``execution_contracts.nvfp4_w4a4`` record (its activation scalars are
+    optional/defaultable and cannot carry the strict Gridbook fused-W4A4
+    claim), but it must not be able to emit a routed-MoE artifact whose two
+    stages were not both calibrated.  The section is built by the same shared
+    builder both CB exporters use, from the same calibration-source vocabulary,
+    so all three emit paths agree on stage identity, framing, and digests.
+
+    Returns ``None`` for anything that is not a packed routed-expert stage.
+    Raises when the sibling stage of the same FusedMoE module has no calibrated
+    max-abs — the exact half-calibrated state that makes fused MoE fail closed
+    at serving time.
+    """
+    parsed = _nvfp4_activation_contract.routed_moe_stage(
+        experts_param_name, profile=profile
+    )
+    if parsed is None:
+        return None
+    module, stage = parsed
+    if cache is None:
+        cache = _PRODUCTION_WEIGHT_CACHE
+    max_abs_map = (
+        getattr(cache, "activation_max_abs", None) or {}
+    ) if cache is not None else {}
+    max_abs_by_target: dict[str, float] = {}
+    for name, value in max_abs_map.items():
+        found = _nvfp4_activation_contract.routed_moe_stage(
+            str(name), profile=profile
+        )
+        if found is None or found[0] != module:
+            continue
+        if value is None or not math.isfinite(float(value)) or float(value) <= 0:
+            continue
+        max_abs_by_target[str(name)] = float(value)
+    staged = {
+        _nvfp4_activation_contract.routed_moe_stage(
+            name, profile=profile
+        )[1]: name
+        for name in sorted(max_abs_by_target)
+    }
+    missing = [
+        s for s in _nvfp4_activation_contract.NVFP4_ROUTED_MOE_STAGES
+        if s not in staged
+    ]
+    if missing:
+        raise RuntimeError(
+            f"[export-native] packed FusedMoE module {module!r} has a "
+            f"calibrated {stage} activation scale but no calibrated "
+            f"{missing} stage. A routed-MoE artifact must attest BOTH stages "
+            "(w13 from the experts-module input, w2 from the routed "
+            "intermediate); re-run build_production_cache with the packed "
+            "experts in scope so the missing packed_expert_max_abs entry is "
+            "recomputed."
+        )
+    policy = _nvfp4_activation_contract.resolve_input_global_scale_policy()
+    return _nvfp4_activation_contract.build_routed_moe_stage_attestation(
+        {
+            name: _nvfp4_input_global_scale_from_max_abs(value)
+            for name, value in max_abs_by_target.items()
+        },
+        policy=policy,
+        calibration_sources={
+            name: (
+                _nvfp4_activation_contract
+                .CALIBRATION_SOURCE_PACKED_EXPERT_RENDER
+            )
+            for name in max_abs_by_target
+        },
+        profile=profile,
+    )
 
 
 # Module-level flag bundle that controls which activation-aware
@@ -1663,6 +2618,9 @@ _INLINE_EXPERT_GPTQ = (
 )
 _PRODUCTION_CACHE_FINGERPRINT: dict[str, object] | None = None
 _PRODUCTION_CACHE_PREFETCH_WORKERS = 4
+# "require" | "warn" (D8). run-pipeline.sh passes require on the native
+# lane, matching VALIDATED_SOURCE_PREFETCH=require.
+_PRODUCTION_CACHE_PREFETCH_MODE = "warn"
 
 
 def _packed_expert_render_hist_label(
@@ -1702,6 +2660,121 @@ def _inline_expert_render_levers() -> dict[str, object]:
         "static_act_order": bool(_ACT_AWARE_FLAGS.get("static_act_order", False)),
         "joint_scale_opt": bool(_ACT_AWARE_FLAGS.get("joint_scale_opt", False)),
     }
+
+
+def _dump_live_cuda_tensors(where: str, min_mb: float = 200.0) -> None:
+    """Diagnostic (PRISMAQUANT_EXPORT_MEM_DUMP=1): aggregate every live CUDA
+    tensor above ``min_mb`` by (shape, dtype) and print one referrer summary
+    per group — the direct attribution for a cuda_alloc ramp that survives
+    gc.collect()+empty_cache() (a live reference is not garbage; only its
+    holder's name finds it)."""
+    groups: dict[tuple, list] = {}
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) and obj.is_cuda and not obj.is_meta:
+                nbytes = obj.numel() * obj.element_size()
+                if nbytes >= min_mb * 1024 * 1024:
+                    groups.setdefault(
+                        (tuple(obj.shape), str(obj.dtype)), []).append(obj)
+        except Exception:
+            continue
+    total = sum(
+        t.numel() * t.element_size() for ts in groups.values() for t in ts)
+    print(f"[mem-dump] {where}: cuda_alloc="
+          f"{torch.cuda.memory_allocated()/1024**3:.1f}G, "
+          f"{sum(len(v) for v in groups.values())} tensors >= {min_mb:.0f}MB "
+          f"({total/1024**3:.1f}G python-visible)", flush=True)
+    import types as _types
+    own_ids = {id(groups)} | {id(ts) for ts in groups.values()}
+
+    def _chase_iterator(it, depth: int = 0) -> str:
+        """Name the frame/generator that keeps an iterator alive."""
+        if depth > 4:
+            return "?"
+        for r in gc.get_referrers(it):
+            if id(r) in own_ids or isinstance(r, type):
+                continue
+            if isinstance(r, _types.FrameType):
+                owner = ""
+                for r2 in gc.get_referrers(r):
+                    if isinstance(r2, _types.GeneratorType):
+                        owner = " (suspended generator)"
+                        break
+                return (f"frame {r.f_code.co_filename.rsplit('/', 1)[-1]}:"
+                        f"{r.f_lineno} {r.f_code.co_name}{owner}")
+            if isinstance(r, _types.GeneratorType):
+                fr = r.gi_frame
+                return (f"generator {r.gi_code.co_name}"
+                        f":{fr.f_lineno if fr else 'done'}")
+            if type(r).__name__ in (
+                    "enumerate", "list_iterator", "tuple_iterator",
+                    "zip", "map", "filter", "chain", "islice",
+                    "dict_itemiterator", "dict_valueiterator"):
+                return f"{type(r).__name__} <- {_chase_iterator(r, depth+1)}"
+            if isinstance(r, (list, tuple, dict)):
+                return f"{type(r).__name__}(n={len(r)}) <- " + _chase_iterator(
+                    r, depth + 1)
+        return "no-gc-referrer"
+
+    def _describe(r, depth: int = 0) -> str:
+        if isinstance(r, dict):
+            holder = ""
+            if depth < 2:
+                for r2 in gc.get_referrers(r):
+                    if id(r2) in own_ids or isinstance(
+                            r2, (_types.FrameType, type)):
+                        continue
+                    holder = f" held-by {_describe(r2, depth + 1)}"
+                    break
+            return f"dict(n={len(r)}){holder}"
+        if isinstance(r, (list, tuple)):
+            holder = ""
+            if depth < 2:
+                for r2 in gc.get_referrers(r):
+                    if id(r2) in own_ids or isinstance(
+                            r2, (_types.FrameType, type)):
+                        continue
+                    holder = f" held-by {_describe(r2, depth + 1)}"
+                    break
+            return f"{type(r).__name__}[{len(r)}]{holder}"
+        if isinstance(r, _types.FrameType):
+            return (f"frame {r.f_code.co_name}:"
+                    f"{[k for k, v in r.f_locals.items()][:6]}")
+        return type(r).__name__
+    for (shape, dtype), ts in sorted(
+            groups.items(),
+            key=lambda kv: -sum(t.numel() * t.element_size()
+                                for t in kv[1])):
+        gb = sum(t.numel() * t.element_size() for t in ts) / 1024**3
+        ptrs = sorted({t.untyped_storage().data_ptr() for t in ts})
+        for i, t in enumerate(ts):
+            refs: list[str] = []
+            for r in gc.get_referrers(t):
+                if id(r) in own_ids or isinstance(r, type):
+                    continue
+                if isinstance(r, _types.FrameType):
+                    names = [k for k, v in r.f_locals.items() if v is t]
+                    refs.append(
+                        f"frame {r.f_code.co_filename.rsplit('/', 1)[-1]}:"
+                        f"{r.f_lineno} {r.f_code.co_name} locals{names}")
+                elif isinstance(r, dict):
+                    keys = [str(k) for k, v in r.items() if v is t][:2]
+                    refs.append(f"dict keys{keys} {_describe(r)}")
+                elif isinstance(r, (list, tuple)):
+                    refs.append(
+                        f"{type(r).__name__}[{len(r)}] <- "
+                        f"{_chase_iterator(r)}")
+                else:
+                    refs.append(
+                        f"{_describe(r)} <- {_chase_iterator(r)}")
+                if len(refs) >= 3:
+                    break
+            print(f"[mem-dump]   [{i}] {list(shape)} {dtype} = "
+                  f"{t.numel()*t.element_size()/1024**3:.2f}G "
+                  f"storage@{hex(t.untyped_storage().data_ptr())} "
+                  f"refs: {refs}", flush=True)
+        print(f"[mem-dump]   group {list(shape)} {dtype}: {len(ts)} tensors "
+              f"{gb:.2f}G across {len(ptrs)} storages", flush=True)
 
 
 def _inline_render_packed_expert_module(
@@ -2506,6 +3579,85 @@ def _rtn_dequant_nvfp4(
         scale_real=s_g_real,
     )
     return codec.dequant.reshape(rows, cols)
+
+
+def render_nvfp4_dequant(
+    weight: torch.Tensor,
+    *,
+    group_size: int = 16,
+    global_real_override: torch.Tensor | None = None,
+    scale_rule: str = NVFP4_SCALE_RULE_STATIC_6,
+    snapped_scale_scoring: bool = False,
+    joint_scale_levels: tuple[float, ...] = (6.0, 4.0),
+) -> torch.Tensor:
+    """Render a 2-D weight through the exact production NVFP4 codec.
+
+    Unlike the historical private RTN helper, every scale-plane choice is an
+    explicit argument.  Offline selectors such as PrismaSnap must be
+    reproducible from their receipt and therefore cannot inherit either
+    ``PRISMAQUANT_NVFP4_SCALE_RULE`` or the research-only snapped-scale
+    scoring switch from the process environment.  Existing exporter call
+    sites continue to use their unchanged environment/default behavior.
+    """
+    if weight.ndim != 2:
+        raise ValueError(
+            "production NVFP4 dequant render requires a rank-2 weight; "
+            f"got shape={tuple(weight.shape)}"
+        )
+    rows, cols = weight.shape
+    if cols % int(group_size) != 0:
+        raise ValueError(f"NVFP4 group_size={group_size} ∤ {cols}")
+    grouped = weight.float().reshape(
+        rows, cols // int(group_size), int(group_size)
+    )
+    scale_real, global_real = _select_nvfp4_pack_scales_and_global(
+        grouped,
+        global_real_override=global_real_override,
+        scale_rule=resolve_nvfp4_scale_rule(scale_rule),
+        snapped_scale_scoring=snapped_scale_scoring,
+        joint_scale_levels=joint_scale_levels,
+    )
+    codec = _nvfp4_quantize_grouped_codec(
+        grouped,
+        global_real=global_real,
+        scale_real=scale_real,
+        scale_rule=resolve_nvfp4_scale_rule(scale_rule),
+    )
+    return codec.dequant.reshape(rows, cols)
+
+
+def nvfp4_global_real(
+    weight: torch.Tensor,
+    *,
+    group_size: int = 16,
+    scale_rule: str = NVFP4_SCALE_RULE_STATIC_6,
+    snapped_scale_scoring: bool = False,
+    joint_scale_levels: tuple[float, ...] = (6.0, 4.0),
+) -> torch.Tensor:
+    """Return the explicit production-codec global multiplier for a weight.
+
+    This is the companion to :func:`render_nvfp4_dequant` used when vLLM
+    fuses sibling projections into one runtime parameter and therefore makes
+    them share the maximum of their natural globals.
+    """
+    if weight.ndim != 2:
+        raise ValueError(
+            "production NVFP4 global calculation requires a rank-2 weight; "
+            f"got shape={tuple(weight.shape)}"
+        )
+    rows, cols = weight.shape
+    if cols % int(group_size) != 0:
+        raise ValueError(f"NVFP4 group_size={group_size} ∤ {cols}")
+    grouped = weight.float().reshape(
+        rows, cols // int(group_size), int(group_size)
+    )
+    _scale_real, global_real = _select_nvfp4_pack_scales_and_global(
+        grouped,
+        scale_rule=resolve_nvfp4_scale_rule(scale_rule),
+        snapped_scale_scoring=snapped_scale_scoring,
+        joint_scale_levels=joint_scale_levels,
+    )
+    return global_real
 
 
 def quantize_dequantize_nvfp4_packed(
@@ -3857,58 +5009,20 @@ def _split_packed_expert_tensor(
 # weight_global_scale. We compute the max over each fused group's natural
 # global_scale and force every sibling to use it.
 #
-# Legacy fallback for callers that do not pass a ModelProfile. New model
-# families should declare fused groups in their profile structure spec.
-_FUSED_DENSE_PATTERNS = [
-    (re.compile(r"^(?P<pre>.+)\.self_attn\.(?P<sib>q_proj|k_proj|v_proj)$"),
-     ("q_proj", "k_proj", "v_proj")),
-    (re.compile(r"^(?P<pre>.+)\.mlp\.(?P<sib>gate_proj|up_proj)$"),
-     ("gate_proj", "up_proj")),
-    (re.compile(r"^(?P<pre>.+)\.mlp\.shared_expert\.(?P<sib>gate_proj|up_proj)$"),
-     ("gate_proj", "up_proj")),
-    (re.compile(r"^(?P<pre>.+)\.linear_attn\.(?P<sib>in_proj_qkv|in_proj_z)$"),
-     ("in_proj_qkv", "in_proj_z")),
-    (re.compile(r"^(?P<pre>.+)\.linear_attn\.(?P<sib>in_proj_a|in_proj_b)$"),
-     ("in_proj_a", "in_proj_b")),
-]
-
-
 def _fused_dense_group(name: str) -> tuple[str, tuple[str, ...]] | None:
-    """Return (group_key, sibling_member_names) if `name` is part of a
-    known fused dense Linear group; else None. group_key is the parent
-    prefix used to bucket siblings together."""
-    for pat, members in _FUSED_DENSE_PATTERNS:
-        m = pat.match(name)
-        if m:
-            return (m.group("pre"), members)
-    return None
+    """Compatibility delegate for the shared fusion catalog."""
+
+    return _nvfp4_activation_contract.fused_dense_group(name)
 
 
 def _fused_group_key_for_name(name: str, profile=None) -> str | None:
-    group_fn = getattr(profile, "fused_sibling_group", None)
-    if callable(group_fn):
-        try:
-            group = group_fn(name)
-        except Exception:
-            group = None
-        if group:
-            return str(group)
-    mapping_fn = getattr(profile, "fused_sibling_leaf_mapping", None)
-    if callable(mapping_fn) and "." in name:
-        try:
-            mapping = mapping_fn()
-        except Exception:
-            mapping = None
-        if mapping:
-            prefix, leaf = name.rsplit(".", 1)
-            for fused, members in mapping.items():
-                if leaf in set(str(member) for member in members):
-                    return f"{prefix}.{fused}"
-    fallback = _fused_dense_group(name)
-    if fallback is None:
-        return None
-    prefix, members = fallback
-    return f"{prefix}::__fused__:{','.join(members)}"
+    """Legacy error-tolerant delegate to the shared fusion policy."""
+
+    return _nvfp4_activation_contract.fused_sibling_group_key(
+        name,
+        profile=profile,
+        tolerate_profile_errors=True,
+    )
 
 
 def _unify_input_global_scales_across_fused_siblings(
@@ -3916,63 +5030,14 @@ def _unify_input_global_scales_across_fused_siblings(
     *,
     profile=None,
 ) -> dict[str, float]:
-    """Post-process per-Linear input_global_scale values so fused-
-    sibling groups share one scale.
+    """Compatibility delegate for the shared conservative scale join."""
 
-    vLLM concatenates q/k/v (and gate/up) into a single fused Linear
-    at load time and applies ONE input_global_scale to the forward
-    pass. If the siblings' scales don't match, vLLM warns and reduces
-    accuracy.
-
-    Siblings receive the same upstream activation, so their
-    `compute_nvfp4_input_global_scale` outputs are theoretically
-    identical — but capture + subsampling order introduces float-
-    precision drift in practice.  The stored values are reciprocals
-    (s = FP8_MAX·FP4_MAX / max_abs, or legacy 6 / max_abs under the
-    ``PRISMAQUANT_NVFP4_INPUT_GSCALE_FP8_RANGE=0`` kill-switch); the
-    conservative join is therefore ``min(vals)`` under either
-    convention (smallest reciprocal == largest max_abs == loosest
-    clipping), so the fused Linear never truncates any sibling's
-    activations. Siblings that weren't NVFP4-assigned pass through
-    unchanged.
-    """
-    # Bucket siblings by fused group.
-    groups: dict[str, list[str]] = {}
-    for name in scales:
-        g = _fused_group_key_for_name(name, profile)
-        if g is None:
-            continue
-        groups.setdefault(g, []).append(name)
-
-    out = dict(scales)
-    n_unified = 0
-    max_drift = 0.0
-    for key, members in groups.items():
-        members = [m for m in members if m in scales]
-        if len(members) < 2:
-            continue
-        vals = [scales[m] for m in members]
-        # input_global_scale stores FP8_MAX·FP4_MAX / max_abs (reciprocal
-        # convention, see compute_nvfp4_input_global_scale).  To pick a
-        # JOINT scale that doesn't over-clip ANY sibling's activations we
-        # want the smallest reciprocal == largest max_abs == loosest
-        # clipping.
-        # Previously this used max(vals), which under the reciprocal
-        # convention yields the TIGHTEST clipping — over-clipping the
-        # sibling with the largest activation range.  In practice fused
-        # siblings have similar activation distributions, so the drift
-        # is small, but min() is the correct conservative join.
-        joint = min(vals)
-        drift = max(abs(joint - v) for v in vals)
-        max_drift = max(max_drift, drift)
-        for m in members:
-            out[m] = joint
-        n_unified += 1
-    if n_unified:
-        print(f"[export-stream] unified input_global_scale across "
-              f"{n_unified} fused-sibling groups "
-              f"(max pre-unify drift: {max_drift:.3e})", flush=True)
-    return out
+    return _nvfp4_activation_contract.unify_fused_sibling_input_global_scales(
+        scales,
+        profile=profile,
+        tolerate_profile_errors=True,
+        diagnostic_prefix="[export-stream]",
+    )
 
 
 def _compute_nvfp4_joint_global(
@@ -4052,14 +5117,10 @@ def _quantize_2d(
     scale shared across all siblings. vLLM warns when sibling scales
     differ and reports degraded accuracy; sharing avoids both.
 
-    `input_global_scale_override`: per-Linear activation scale computed
-    from calibration — `FP8_MAX * FP4_MAX / max_abs(cached_activations)`
-    (the compressed-tensors `generate_gparam` convention) so serve-time
-    FP8-stored activation block scales span the whole FP8 range. If
-    None, falls back to `DEFAULT_INPUT_GLOBAL_SCALE` (1.0). Calibrated
-    values typically improve PPL noticeably on NVFP4 weights because
-    otherwise vLLM's runtime activation quant uses an undersized
-    dynamic range.
+    `input_global_scale_override`: explicit per-Linear activation scale.  If
+    absent, the shared resolver checks the calibrated mapping and finally the
+    legacy `DEFAULT_INPUT_GLOBAL_SCALE` (1.0).  That fallback preserves native
+    artifact semantics but does not qualify the versioned fused contract.
 
     `gptq_enabled` and `scale_sweep_enabled` compose activation-aware passes
     on NVFP4, MXFP4, FP8_E4M3/FP8_E5M2, and MXFP8_E4M3/MXFP8_E5M2 paths. Each
@@ -4138,9 +5199,15 @@ def _quantize_2d(
                 # Env-gated per-Linear damping sweep (#46). When set,
                 # try multiple λ values for the Hessian regularizer and
                 # pick the one with smallest output-space error. ~5×
-                # GPTQ wallclock; ~0.02–0.05 PPL gain on Llama-class.
-                # Default ON (validated on Qwen3-0.6B audit: −0.19 PPL
-                # vs single-damp). PRISMAQUANT_GPTQ_DAMP_SWEEP=0 disables.
+                # GPTQ wallclock.
+                # Default OFF since 2026-06-12 (see
+                # gptq_damp_sweep_enabled(), :1845-1857): its evaluator
+                # is in-sample, so its "winners" invert on held-out
+                # basins (31/31) and it lost the V1 served A/B to a
+                # fixed damp. Production uses the fixed damp from
+                # _resolve_gptq_fixed_damp() (1.0, :1860).
+                # PRISMAQUANT_GPTQ_DAMP_SWEEP=1 reproduces historical
+                # sweep-rendered artifacts.
                 if gptq_damp_sweep_enabled():
                     w_work = _gptq_obs_rounding_nvfp4_swept(
                         w_work, acts_work, group_size=16,
@@ -4221,16 +5288,17 @@ def _quantize_2d(
 
         # Step 4: final NVFP4 pack. `w_work` is the post-GPTQ,
         # post-act-round, post-scale-sweep weight.
-        input_scale = input_global_scale_override
-        if input_scale is None and linear_name is not None and _INPUT_GLOBAL_SCALES:
-            input_scale = _INPUT_GLOBAL_SCALES.get(linear_name)
-        if input_scale is None:
-            input_scale = DEFAULT_INPUT_GLOBAL_SCALE
+        input_scale = _resolve_nvfp4_input_global_scale(
+            input_global_scale_override,
+            target=linear_name,
+        )
 
-        # compute_only path (#12): defer final pack so block-output
-        # match can refine the dequantized weight before it's frozen
-        # into FP4 codes. Caller invokes _finalize_compute_only() to
-        # produce the final packed dict.
+        # compute_only path: return the dequantized weight WITHOUT freezing
+        # it into FP4 codes. Its only production consumer was block-output
+        # match, walled 2026-07-30 (archive/block_output_match_2026-07-30/,
+        # re-vet R25) along with the `_finalize_compute_only` packer that
+        # closed the loop. Kept as a lever-threading introspection hook —
+        # nothing in the export path sets it.
         if compute_only:
             return {
                 "_compute_only": True,
@@ -4551,42 +5619,6 @@ def _quantize_3d_packed(packed: torch.Tensor, fmt: str) -> dict[str, torch.Tenso
     raise ValueError(f"unsupported format for packed-MoE: {fmt}")
 
 
-def _finalize_compute_only(compute_dict: dict, *,
-                           weight_override: torch.Tensor | None = None
-                           ) -> dict[str, torch.Tensor]:
-    """Pack a compute_only result from `_quantize_2d` into the final
-    on-disk tensor dict. When `weight_override` is supplied (e.g. after
-    block-output match modified the dequantized weight), pack that
-    instead of the original `_w_dq`.
-
-    Currently only NVFP4 is supported in compute_only mode. Other
-    formats fall through to a clear error so a misuse fails loudly
-    rather than silently silently corrupting the artifact.
-    """
-    fmt = compute_dict.get("_fmt")
-    if fmt != "NVFP4":
-        raise ValueError(
-            f"_finalize_compute_only: only NVFP4 is supported "
-            f"(got fmt={fmt}). Other formats should not be in "
-            f"compute_only mode.")
-    w = compute_dict["_w_dq"] if weight_override is None else weight_override
-    nvfp4_global_real = compute_dict["_nvfp4_global_real"]
-    input_scale = compute_dict["_input_scale"]
-
-    wp, ws, wg = quantize_dequantize_nvfp4(
-        w, group_size=16,
-        global_real_override=nvfp4_global_real,
-    )
-    return {
-        "weight_packed": wp,
-        "weight_scale": ws,
-        "weight_global_scale": wg,
-        "input_global_scale": torch.tensor(
-            [float(input_scale)], dtype=torch.float32,
-        ),
-    }
-
-
 def _quantize_2d_group_same_shape(
     stacked_weights: torch.Tensor,
     fmt: str,
@@ -4824,12 +5856,7 @@ def _quantize_2d_nvfp4_group_batched(
             weights[i], group_size=16,
             global_real_override=override,
         )
-        input_scale = (
-            _INPUT_GLOBAL_SCALES.get(recipe_key) if _INPUT_GLOBAL_SCALES
-            else None
-        )
-        if input_scale is None:
-            input_scale = DEFAULT_INPUT_GLOBAL_SCALE
+        input_scale = _resolve_nvfp4_input_global_scale(target=recipe_key)
         out.append({
             "weight_packed": wp,
             "weight_scale": ws,
@@ -5198,7 +6225,21 @@ def _fp8_source_config_overlay(
 
     config_assignment = dict(assignment)
     overrides: set[str] = set()
+    # Packed-expert parents in the assignment (e.g.
+    # `model.layers.10.mlp.experts.gate_up_proj`) own their per-expert
+    # leaves: the packed emit writes those bytes in the allocated format,
+    # so a per-expert source-FP8 leaf (`...mlp.experts.7.up_proj`) must
+    # NOT be re-described as FP8_SOURCE — the config would contradict the
+    # emitted bytes (GLM-5.3: 168 such entries double-covered the NVFP4
+    # experts with the FP8 scheme).
+    packed_expert_prefixes = tuple(
+        {k.rsplit(".", 1)[0] + "." for k in assignment
+         if ".mlp.experts." in k or k.endswith(".mlp.experts")})
+    _per_expert_leaf = re.compile(r"\.experts\.[0-9]+\.")
     for recipe_key in sorted(source_recipe_keys):
+        if (_per_expert_leaf.search(recipe_key)
+                and recipe_key.startswith(packed_expert_prefixes)):
+            continue
         recipe_fmt = config_assignment.get(recipe_key)
         fmt = (
             _canonical_export_format(recipe_fmt)
@@ -5242,6 +6283,7 @@ def materialize_tensors_streaming(
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from .layer_streaming import (
+        _build_concat_merger,
         _build_expert_packer,
         _build_fp8_scale_inv_map,
         _build_install_resolver,
@@ -5254,9 +6296,13 @@ def materialize_tensors_streaming(
         _resolve_base_prefix,
         _unload,
     )
-    from .sensitivity_probe import stage_text_only
+    from .sensitivity_probe import stage_multimodal, stage_text_only
     # Canonical rotary init (profile-driven multi-layer-type dispatch).
-    from .streaming_model import _init_rotary_inplace
+    from .streaming_model import (
+        _init_rotary_inplace,
+        _mask_cuda_queries_during_meta_init,
+        _skeleton_config_and_class,
+    )
 
     # ----- 1. Meta skeleton + manual head materialization -----
     # Pure `init_empty_weights` path — avoids accelerate's
@@ -5269,14 +6315,33 @@ def materialize_tensors_streaming(
     #       state_dict — computed from config),
     #   (d) leave decoder layers on meta until the per-layer loop
     #       streams them in.
-    staged = stage_text_only(model_path)
+    # A family with no `<Arch>ForCausalLM` auto-route (glm5_next on
+    # transformers 5.16) cannot build a text-only skeleton at all; the
+    # profile declares that fact and the export inherits the same flip
+    # `_build_streaming_context` applies for probe/cost streaming. The
+    # visual tower stays on meta either way — export ships it via the
+    # source-passthrough merge, never through the body walk.
+    multimodal_skeleton = bool(profile.requires_multimodal_skeleton())
+    if multimodal_skeleton:
+        print("[export-stream] profile has no text-only skeleton route; "
+              "using the multimodal construction", flush=True)
+        staged = stage_multimodal(model_path)
+    else:
+        staged = stage_text_only(model_path)
     config = AutoConfig.from_pretrained(staged, trust_remote_code=True)
+    config, model_cls = _skeleton_config_and_class(
+        config, multimodal=multimodal_skeleton,
+        log_prefix="[export-stream]")
     # _init_weights is globally no-op'd by prismaquant.__init__'s
     # _polyfill_transformers (wasted work + transformers-5.x compat
     # landmine on remote modeling files).
-    with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(
-            config, trust_remote_code=True)
+    with _mask_cuda_queries_during_meta_init("[export-stream]"):
+        with init_empty_weights():
+            if model_cls is AutoModelForCausalLM:
+                model = AutoModelForCausalLM.from_config(
+                    config, trust_remote_code=True)
+            else:
+                model = model_cls._from_config(config)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -5285,14 +6350,66 @@ def materialize_tensors_streaming(
     num_layers = len(layers)
     layers_prefix = f"{base_prefix}.layers." if base_prefix else "layers."
 
-    weight_shard, weight_ckpt = _build_weight_map(model_path)
+    weight_shard, weight_ckpt = _build_weight_map(
+        model_path, multimodal=multimodal_skeleton)
     source_dtype_by_name = _build_source_dtype_map(weight_shard, weight_ckpt)
+    # Persistent buffers are emitted verbatim (3e), so the read must not
+    # narrow them to the parameter dtype the way `_read_layer_to_device`
+    # narrows weights: `_passthrough_tensor` restores the DECLARED dtype
+    # but cannot restore discarded values, and for a router bias the dtype
+    # is arithmetic rather than storage -- a BF16 score plus an FP32 bias
+    # sums in FP32, a BF16 bias rounds before top-k. Same map the resident
+    # and streaming source loads build (`layer_streaming._materialize`,
+    # `StreamingContext.buffer_dtypes`); walked once here rather than per
+    # layer because the skeleton's buffer declarations never change.
+    declared_buffer_dtypes = {
+        name: value.dtype
+        for name, value in model.named_buffers(remove_duplicate=False)
+    }
     # Per-expert -> packed-3D bridge for checkpoints that ship MoE experts
     # unfused while the live module is packed (driven by the model profile;
     # None for every other model). Keeps the exporter's source read aligned
     # with the streaming probe/cost path — a raw checkpoint exports without
     # an out-of-band pre-pack.
     expert_packer = _build_expert_packer(model, weight_ckpt)
+    # Sibling bridge for checkpoints that store one live parameter as several
+    # source tensors (transformers' `Concatenate(dim=...)` merges, declared as
+    # the profile spec's `concat_merges`). Same reason as the expert packer:
+    # the exporter must load exactly what the streaming probe/cost path loads.
+    concat_merger = _build_concat_merger(model, weight_ckpt)
+    # Emit-side inverse of `concat_merges`: the live module holds ONE
+    # merged tensor (glm5_next `self_attn.conv1d` <- q/k/v_conv1d) whose
+    # key never existed in the source checkpoint. Emitting the merged
+    # spelling would ship a key the serving runtime's loader does not
+    # know and drop the three it expects, so the 3e passthrough skips the
+    # merged live param and copies the SOURCE tensors verbatim instead.
+    concat_groups = tuple(profile.concat_merge_groups())
+    _src_tensor_index: dict[str, Path] | None = None
+
+    def _read_source_tensor_verbatim(ckpt_key: str) -> torch.Tensor:
+        nonlocal _src_tensor_index
+        from safetensors import safe_open
+        if _src_tensor_index is None:
+            _src_tensor_index = {}
+            src_root = Path(model_path)
+            index_path = src_root / "model.safetensors.index.json"
+            if index_path.exists():
+                with open(index_path) as fh:
+                    for key, shard in json.load(fh)["weight_map"].items():
+                        _src_tensor_index[key] = src_root / shard
+            else:
+                for shard in sorted(src_root.glob("*.safetensors")):
+                    with safe_open(str(shard), framework="pt") as sf:
+                        for key in sf.keys():
+                            _src_tensor_index[key] = shard
+        shard_path = _src_tensor_index.get(ckpt_key)
+        if shard_path is None:
+            raise KeyError(
+                f"[export-stream] concat-merge source tensor {ckpt_key!r} "
+                f"not present in the source checkpoint — the profile's "
+                f"concat_merges declaration disagrees with the shards.")
+        with safe_open(str(shard_path), framework="pt") as sf:
+            return sf.get_tensor(ckpt_key)
     # Native-FP8 dequant map, keyed by live weight-qname. Passed to
     # every `_read_layer_to_device` / `_materialize` call so fp8 source
     # weights land on the module as TRUE dequanted bf16 — not raw fp8
@@ -5431,78 +6548,19 @@ def materialize_tensors_streaming(
     cache_path = Path(export_cache_dir) if export_cache_dir else None
     if cache_path is not None:
         cache_path.mkdir(parents=True, exist_ok=True)
-
-        # Cache fingerprint (codex review #2): bind the cache to the
-        # quality-affecting state. If any of these change between runs,
-        # the cache is silently wrong because the saved layer tensors
-        # were quantized under a different recipe. Write/check a
-        # manifest.json; mismatch invalidates the cache wholesale.
-        import json as _json
-        fp_state = {
-            "PRISMAQUANT_DO_NO_HARM": os.environ.get(
-                "PRISMAQUANT_DO_NO_HARM", "1"),
-            "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
-                "PRISMAQUANT_GPTQ_DAMP_SWEEP", "0"),
-            "PRISMAQUANT_GPTQ_DAMP": os.environ.get(
-                "PRISMAQUANT_GPTQ_DAMP", ""),
-            "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING": os.environ.get(
-                "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING", "0"),
-            "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
-                "PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999"),
-            "PRISMAQUANT_BLOCK_OUTPUT_MATCH": os.environ.get(
-                "PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1"),
-            "PRISMAQUANT_BATCHED_NVFP4_EXPORT": os.environ.get(
-                "PRISMAQUANT_BATCHED_NVFP4_EXPORT", "1"),
-            NVFP4_SCALE_RULE_ENV: _nvfp4_scale_rule_from_env(),
-            "ACT_AWARE_FLAGS": dict(sorted(_ACT_AWARE_FLAGS.items())),
-            "activation_cache_fingerprint": _ACTIVATION_CACHE_FINGERPRINT,
-            "production_cache_fingerprint": _PRODUCTION_CACHE_FINGERPRINT,
-        }
-        # Hash the assignment dict (layer_config recipe) too — recipe
-        # changes invalidate per-Linear quantization output.
-        try:
-            fp_state["assignment_hash"] = hashlib.sha256(
-                _json.dumps(assignment, sort_keys=True).encode()
-            ).hexdigest()[:16]
-        except Exception:
-            fp_state["assignment_hash"] = None
-
-        manifest_path = cache_path / "manifest.json"
-        if manifest_path.exists():
-            try:
-                with manifest_path.open() as _f:
-                    prev = _json.load(_f)
-                if prev != fp_state:
-                    diff_keys = sorted(
-                        set(prev.keys()) | set(fp_state.keys())
-                    )
-                    diffs = [
-                        k for k in diff_keys
-                        if prev.get(k) != fp_state.get(k)
-                    ]
-                    print(f"[export-stream] cache fingerprint MISMATCH "
-                          f"(differs in: {diffs}); invalidating cache",
-                          flush=True)
-                    for _f in cache_path.glob("layer_*.pt"):
-                        _f.unlink()
-                    with manifest_path.open("w") as _f:
-                        _json.dump(fp_state, _f, indent=2)
-                else:
-                    print(f"[export-stream] cache fingerprint match — "
-                          f"resumable from {len(list(cache_path.glob('layer_*.pt')))} "
-                          f"layers", flush=True)
-            except Exception as _e:
-                print(f"[export-stream] cache manifest unreadable "
-                      f"({_e}); invalidating cache", flush=True)
-                for _f in cache_path.glob("layer_*.pt"):
-                    _f.unlink()
-                with manifest_path.open("w") as _f:
-                    _json.dump(fp_state, _f, indent=2)
-        else:
-            with manifest_path.open("w") as _f:
-                _json.dump(fp_state, _f, indent=2)
-            print(f"[export-stream] wrote cache fingerprint to {manifest_path}",
-                  flush=True)
+        # The fingerprint is computed ONLY when a cache dir was asked for, so
+        # the source hash never touches an export that is not resumable.
+        _admit_export_resume_cache(
+            cache_path,
+            _export_resume_fingerprint(
+                assignment=assignment,
+                model_path=model_path,
+                dtype=dtype,
+                declared_buffer_dtypes=declared_buffer_dtypes,
+                extra_shard_paths=set(weight_shard.values()),
+                digest_cache_path=cache_path / "source_identity_cache.json",
+            ),
+        )
 
     def _layer_cache_file(L: int) -> Path | None:
         return None if cache_path is None else cache_path / f"layer_{L:03d}.pt"
@@ -5551,7 +6609,9 @@ def materialize_tensors_streaming(
         load_t0 = time.time()
         tensors = _read_layer_to_device(
             f"{layers_prefix}{L}.", weight_shard, weight_ckpt, dtype, device,
-            fp8_scale_inv_map=fp8_scale_inv_map, pack_experts=expert_packer)
+            fp8_scale_inv_map=fp8_scale_inv_map, pack_experts=expert_packer,
+            merge_concat=concat_merger,
+            buffer_dtypes=declared_buffer_dtypes)
         resolver = _build_install_resolver(model, layer_qname)
         _fast_install(resolver, tensors, device, model=model)
         load_s = time.time() - load_t0
@@ -5594,24 +6654,6 @@ def materialize_tensors_streaming(
             and (_ACT_AWARE_FLAGS["gptq"] or _ACT_AWARE_FLAGS["scale_sweep"])
             and _CACHED_ACTIVATIONS is not None
         )
-
-        # #12 Block-output match deferred-pack list. Per-layer scope.
-        _BLOCK_COMPUTE_PENDING: list[dict] = []
-        # Capture FP16 snapshots of the layer's standard block Linears
-        # so we can run a reference (pre-quantization) forward pass for
-        # block-output match. Cheap: a layer's q/k/v/o + gate/up/down at
-        # FP32 ≈ 64-128 MB.
-        _FP16_BLOCK_SNAPSHOTS: dict[str, torch.Tensor] = {}
-        if os.environ.get("PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1") != "0":
-            for _sn, _m in layer_mod.named_modules():
-                if not isinstance(_m, nn.Linear):
-                    continue
-                _leaf = _sn.rsplit(".", 1)[-1] if _sn else ""
-                if _leaf in (
-                    "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
-                    "gate_proj", "up_proj", "down_proj",
-                ):
-                    _FP16_BLOCK_SNAPSHOTS[_sn] = _m.weight.detach().clone()
 
         for sub_name, mod in layer_mod.named_modules():
             if not isinstance(mod, nn.Linear):
@@ -5697,7 +6739,15 @@ def materialize_tensors_streaming(
                         f"fp8_e4m3fn at {weight_ckpt_key}, got "
                         f"{w_fp8.dtype}")
                 out[f"{emit_full}.weight"] = w_fp8.cpu().contiguous()
-                out[f"{emit_full}.weight_scale"] = w_scale.to(
+                # Runtime-pinned modules (e.g. GLM MLA attention
+                # projections) are dequantized by the serving runtime at
+                # load, keyed on the SOURCE scale name
+                # (`weight_scale_inv`); everything else serves through
+                # compressed-tensors and gets the CT name.
+                scale_key = ("weight_scale_inv"
+                             if profile.runtime_loads_source_fp8(full)
+                             else "weight_scale")
+                out[f"{emit_full}.{scale_key}"] = w_scale.to(
                     torch.float32).cpu().contiguous()
                 if mod.bias is not None and not mod.bias.is_meta:
                     out[f"{emit_full}.bias"], _ = _passthrough_tensor(
@@ -5737,36 +6787,6 @@ def materialize_tensors_streaming(
                 grouped_nvfp4_batched[shape].append(
                     (full, emit_full, recipe_key, mod))
                 continue
-
-            # #12 Block-output match: when enabled AND this is a
-            # standard "block" Linear (q/k/v/o or gate/up/down) on
-            # NVFP4, defer the final pack so we can refine its
-            # dequantized weight using block-level output MSE before
-            # freezing it into FP4 codes. The compute_dict + post-pack
-            # state is saved into _BLOCK_COMPUTE_PENDING; the post-loop
-            # phase invokes refine_block_scales then _finalize_compute_only.
-            sub_leaf = sub_name.rsplit(".", 1)[-1] if sub_name else ""
-            is_block_linear = (
-                fmt == "NVFP4"
-                and os.environ.get("PRISMAQUANT_BLOCK_OUTPUT_MATCH", "1") != "0"
-                and sub_leaf in (
-                    "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
-                    "gate_proj", "up_proj", "down_proj",
-                )
-            )
-            if is_block_linear:
-                compute_dict = _quantize_2d(
-                    mod.weight.detach().float(), fmt,
-                    nvfp4_global_real_override=override,
-                    linear_name=recipe_key,
-                    compute_only=True,
-                )
-                _BLOCK_COMPUTE_PENDING.append({
-                    "full": full, "emit_full": emit_full,
-                    "sub_name": sub_name, "sub_leaf": sub_leaf, "mod": mod,
-                    "compute_dict": compute_dict, "fmt": fmt,
-                })
-                continue  # skip immediate emit; finalized post-loop
 
             compressed = _quantize_2d(
                 mod.weight.detach().float(), fmt,
@@ -5836,164 +6856,6 @@ def materialize_tensors_streaming(
                         hist[("linear", "NVFP4")] += 1
                         covered.add(full)
 
-        # 3c'. Block-output match (#12). When PRISMAQUANT_BLOCK_OUTPUT_MATCH=1
-        # the per-Linear loop above deferred packing for standard block
-        # Linears (q/k/v/o, gate/up/down). Now run greedy refinement of
-        # per-Linear scale perturbations against an FP16 reference forward,
-        # then finalize the pack. Skipped if no compute-only entries
-        # accumulated (env flag off, or no eligible Linears in this layer).
-        if _BLOCK_COMPUTE_PENDING:
-            try:
-                from .block_output_match import (
-                    block_output_mse,
-                    make_attention_block_spec, make_mlp_block_spec,
-                    refine_block_scales,
-                )
-                # Group pending entries by sub_leaf so we can index
-                # them when applying refined scales. Also recover
-                # the FP16 reference weights from _FP16_BLOCK_SNAPSHOTS.
-                pending_by_sub = {p["sub_leaf"]: p
-                                  for p in _BLOCK_COMPUTE_PENDING}
-
-                # Use a small calibration input drawn from the cached
-                # activation of q_proj (its input == post-norm of the
-                # residual stream, which is the natural attn-block
-                # input). For MLP block, gate_proj input is the same
-                # post-norm residual after attention. If activations
-                # aren't cached for this layer, skip refinement —
-                # there's no reference signal.
-                cal_input_attn = None
-                cal_input_mlp = None
-                if _CACHED_ACTIVATIONS is not None:
-                    # cached keys are recipe_keys; pull from any
-                    # block-Linear that's pending so naming variation
-                    # across profiles still works.
-                    for p in _BLOCK_COMPUTE_PENDING:
-                        if p["sub_leaf"] in ("q_proj",) and cal_input_attn is None:
-                            cal_input_attn = _CACHED_ACTIVATIONS.get(
-                                profile.live_to_recipe_name(p["full"]))
-                        if p["sub_leaf"] in ("gate_proj",) and cal_input_mlp is None:
-                            cal_input_mlp = _CACHED_ACTIVATIONS.get(
-                                profile.live_to_recipe_name(p["full"]))
-
-                # Run refinement for each block we have a cal input for.
-                # Candidates are simple multiplicative perturbations of
-                # the current dequantized weight; refine_block_scales
-                # picks the per-Linear scale that minimizes block MSE.
-                cands = [torch.tensor(s) for s in (0.95, 1.0, 1.05)]
-
-                block_logs: list[str] = []
-
-                def _apply_refined_scales(label: str, spec_factory, cal_input):
-                    if cal_input is None:
-                        block_logs.append(f"{label}=no_cal")
-                        return
-                    ref_spec = spec_factory(layer_mod, layer_qname)
-                    if ref_spec is None:
-                        block_logs.append(f"{label}=no_spec")
-                        return
-                    # Cap the cal_input to a small batch to keep refinement fast.
-                    ci = cal_input.to(layer_mod.input_layernorm.weight.device
-                                      if hasattr(layer_mod, "input_layernorm")
-                                      else next(iter(layer_mod.parameters())).device)
-                    if ci.dim() == 2:
-                        ci = ci[:32]
-                    elif ci.dim() == 3:
-                        ci = ci[:8]
-                    run_dtype = next(
-                        (p["mod"].weight.dtype for p in _BLOCK_COMPUTE_PENDING
-                         if p["mod"].weight.dtype.is_floating_point),
-                        torch.float32,
-                    )
-                    ci_run = ci.to(dtype=run_dtype)
-                    # Full-precision reference first, while the live layer
-                    # still holds original weights. Earlier code built the
-                    # reference and candidates from the same live weights,
-                    # making scale=1.0 perfect and the pass a silent no-op.
-                    with torch.no_grad():
-                        ref = ref_spec.forward_fn(ci_run).float().clone()
-
-                    touched: list[dict] = []
-                    for ln in ref_spec.linears:
-                        p = pending_by_sub.get(ln)
-                        if p is None:
-                            continue
-                        mod = p["mod"]
-                        touched.append(p)
-                        q_weight = p["compute_dict"]["_w_dq"].to(
-                            device=mod.weight.device, dtype=mod.weight.dtype)
-                        mod.weight.data.copy_(q_weight)
-
-                    if not touched:
-                        block_logs.append(f"{label}=no_pending")
-                        return
-
-                    try:
-                        spec = spec_factory(layer_mod, layer_qname)
-                        if spec is None:
-                            block_logs.append(f"{label}=lost_spec")
-                            return
-                        candidates = {
-                            ln: cands for ln in spec.linears
-                            if ln in pending_by_sub
-                        }
-                        before = block_output_mse(spec, ci_run, ref)
-                        final = refine_block_scales(
-                            spec, ci_run, ref, candidates, max_passes=2)
-                        n_changed = 0
-                        n_eval = 0
-                        for ln in spec.linears:
-                            p = pending_by_sub.get(ln)
-                            if p is None:
-                                continue
-                            n_eval += len(cands) * 2
-                            s = float(spec.scale_getter(ln))
-                            if abs(s - 1.0) < 1e-8:
-                                continue
-                            p["compute_dict"]["_w_dq"] = (
-                                p["compute_dict"]["_w_dq"] * s)
-                            n_changed += 1
-                        block_logs.append(
-                            f"{label}=spec evals={n_eval} "
-                            f"changed={n_changed} "
-                            f"mse={before:.3e}->{final:.3e}")
-                    finally:
-                        for p in touched:
-                            snap = _FP16_BLOCK_SNAPSHOTS.get(p["sub_name"])
-                            if snap is not None:
-                                p["mod"].weight.data.copy_(
-                                    snap.to(device=p["mod"].weight.device,
-                                            dtype=p["mod"].weight.dtype))
-
-                _apply_refined_scales(
-                    "attn", make_attention_block_spec, cal_input_attn)
-                _apply_refined_scales(
-                    "mlp", make_mlp_block_spec, cal_input_mlp)
-                print(
-                    f"[block-output-match] {layer_qname}: "
-                    f"pending={len(_BLOCK_COMPUTE_PENDING)} "
-                    + " ".join(block_logs),
-                    flush=True,
-                )
-
-            except Exception as e:
-                print(f"[block-output-match] WARN refinement failed for "
-                      f"{layer_qname}: {e}", flush=True)
-
-            # Finalize the pack for every pending Linear (refined or not).
-            for p in _BLOCK_COMPUTE_PENDING:
-                compressed = _finalize_compute_only(p["compute_dict"])
-                emit_full = p["emit_full"]
-                for suffix, t in compressed.items():
-                    out[f"{emit_full}.{suffix}"] = t.cpu()
-                if p["mod"].bias is not None:
-                    out[f"{emit_full}.bias"], _ = _passthrough_tensor(
-                        f"{p['full']}.bias", p["mod"].bias,
-                        source_dtype_by_name)
-                hist[("linear", "NVFP4_block_match")] += 1
-                covered.add(p["full"])
-
-            del _BLOCK_COMPUTE_PENDING, _FP16_BLOCK_SNAPSHOTS
 
         # 3d. Emit packed MoE experts, scoped to this layer.
         packed_count = 0
@@ -6095,6 +6957,14 @@ def materialize_tensors_streaming(
                     if not _ALLOW_PACKED_EXPERT_RTN:
                         cached_3d = _read_cached_packed_expert(
                             full, fmt, device=device, cache=active_cache)
+                        if cached_3d is not None and active_cache is not None:
+                            # The transient inline render is read exactly once
+                            # per packed param — drop the CPU fp32 entry now
+                            # (18G for a GLM-class gate_up stack) instead of
+                            # holding it until layer teardown.
+                            _k = active_cache.resolve_key(full, fmt)
+                            if _k is not None:
+                                active_cache.weights.pop(_k, None)
                     if cached_3d is None:
                         if _INLINE_EXPERT_GPTQ and not _ALLOW_PACKED_EXPERT_RTN:
                             raise RuntimeError(
@@ -6150,6 +7020,11 @@ def materialize_tensors_streaming(
                         f"— re-run build_production_cache so the scale is "
                         f"recomputed, or delete the expert shard to force a "
                         f"full re-render.")
+                if expert_input_scale is not None and fmt == "NVFP4":
+                    # K0.2: a calibrated stage may only ship alongside its
+                    # attested sibling stage.
+                    _packed_expert_stage_attestation(
+                        full, cache=active_cache, profile=profile)
 
                 # M2: re-derive under the render's RECORDED NVFP4 scale
                 # rule (the dense _pack_production_cached_2d wrap, lifted
@@ -6157,7 +7032,16 @@ def materialize_tensors_streaming(
                 # re-derived under the export-entry default (static_6)
                 # cannot recover its codes.
                 with _temporary_export_nvfp4_scale_rule(packed_render_rule):
-                    for pi, (proj_name, sub_packed) in enumerate(proj_split):
+                    # Index-based on purpose: `enumerate` caches its last
+                    # yielded result tuple internally (CPython reuse), and a
+                    # surviving enumerate pinned the (proj_name, 9G-view)
+                    # tuple — and through it an 18G fp32 stack — across
+                    # layers (mem-dump attribution, GLM-5.3 probe runs).
+                    # Never pass tensor-bearing tuples through enumerate in
+                    # this function's scope.
+                    for pi in range(len(proj_split)):
+                        proj_name = proj_split[pi][0]
+                        sub_packed = proj_split[pi][1]
                         cached_sub = (
                             cached_split[pi][1]
                             if cached_split is not None else None
@@ -6203,6 +7087,14 @@ def materialize_tensors_streaming(
                 del packed_param, packed_param_src, proj_split
                 if cached_3d is not None:
                     del cached_3d, cached_split
+                # The inner-loop locals are function-scoped and survive this
+                # module (and this LAYER) otherwise: `sub_packed` views the
+                # 18G fp32 `packed_param` promotion, `cached_sub` views the
+                # 18G fp32 `cached_3d` — together they pinned 36G through the
+                # NEXT layer's render peak on GLM-5.3 (mem-dump attribution,
+                # probe runs 1-2; the steady-state OOM of export attempts
+                # 4-5 on the 118G unified pool).
+                sub_packed = cached_sub = expert_2d = None
 
         # 3e. Remaining layer-scoped params (norms, conv1d, biases on
         # passthrough-only modules) and persistent buffers.
@@ -6213,6 +7105,22 @@ def materialize_tensors_streaming(
             if any(full.startswith(c + ".") or full == c for c in covered):
                 continue
             if param.is_meta:
+                continue
+            concat_split = False
+            for target_suffix, source_suffixes, _dim in concat_groups:
+                if not (full == target_suffix
+                        or full.endswith("." + target_suffix)):
+                    continue
+                stem = full[: -len(target_suffix)]
+                for src_suffix in source_suffixes:
+                    live_src = stem + src_suffix
+                    ckpt_key = profile.export_tensor_name(
+                        profile.live_to_recipe_name(live_src))
+                    out[live_src] = _read_source_tensor_verbatim(ckpt_key)
+                    hist[("layer_concat_source", "verbatim")] += 1
+                concat_split = True
+                break
+            if concat_split:
                 continue
             out[full], label = _passthrough_tensor(
                 full, param, source_dtype_by_name)
@@ -6236,20 +7144,51 @@ def materialize_tensors_streaming(
         # Free this layer's inline expert renders (the 3-D dequant stacks) so
         # peak stays ~one layer's stack even across the whole sweep.
         del tensors, resolver, joint_globals, _inline_expert_caches
-        # Aggressive GPU cleanup — we've already `.cpu()`'d every
-        # quantized output into `out`, so the per-layer GPU working
-        # set (fp32 weight copies, grouped/packed intermediates) can
-        # be released immediately. Keeps per-layer peak bounded.
+        # The per-Linear walk's loop locals survive the layer iteration:
+        # `active_cache` in particular still references the layer's transient
+        # expert cache (27G CPU fp32 on GLM-5.3) until the NEXT layer's packed
+        # emit reassigns it — i.e. after that layer's full render peak. That
+        # exact residue OOM-killed export attempt 3 at layer 4 on the 118G
+        # unified pool. Drop it, then collect cycles BEFORE empty_cache so
+        # freed CUDA blocks actually return to the pool, every layer.
+        active_cache = None
+        gc.collect()
         if device.type == "cuda":
             torch.cuda.synchronize()  # ensure outputs are CPU-resident
             torch.cuda.empty_cache()
-        if L % 4 == 0:
-            gc.collect()
-        if L % 4 == 0 or L == num_layers - 1:
-            elapsed = time.time() - layer_t0
-            print(f"[export-stream] layer {L:02d}  linears={linear_count} "
-                  f"packed={packed_count}  load={load_s:.2f}s  "
-                  f"total={elapsed:.2f}s  out_keys={len(out)}", flush=True)
+        if os.environ.get("PRISMAQUANT_EXPORT_MEM_DUMP", "0") == "1":
+            _dump_live_cuda_tensors(f"post-cleanup layer {L:02d}")
+        # Every layer, unconditionally: a 306B layer can take minutes of
+        # GPU render, and a silent multi-minute phase is an observability
+        # defect on first-live-use exports.
+        elapsed = time.time() - layer_t0
+        done_n = L + 1
+        sweep_rate = (time.time() - t_layers) / max(done_n, 1)
+        eta_min = sweep_rate * (num_layers - done_n) / 60.0
+        # Memory attribution per layer: rss (process anon), cuda_alloc
+        # (live tensors), cuda_reserved (allocator pool). A layer-over-layer
+        # ramp in alloc = a real reference leak; in reserved-only =
+        # fragmentation; in rss-only = CPU-side. On the 118G unified pool a
+        # silent ~14G/layer ramp is fatal by layer 6 — attribute, don't guess.
+        try:
+            rss_gb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                      / 1024 / 1024)
+            with open("/proc/self/statm") as f:
+                cur_rss_gb = (int(f.read().split()[1])
+                              * os.sysconf("SC_PAGE_SIZE") / 1024**3)
+        except Exception:
+            rss_gb = cur_rss_gb = float("nan")
+        if device.type == "cuda":
+            mem_note = (f"  rss={cur_rss_gb:.1f}G(max {rss_gb:.1f}) "
+                        f"cuda_alloc={torch.cuda.memory_allocated()/1024**3:.1f}G "
+                        f"reserved={torch.cuda.memory_reserved()/1024**3:.1f}G")
+        else:
+            mem_note = f"  rss={cur_rss_gb:.1f}G(max {rss_gb:.1f})"
+        print(f"[export-stream] layer {L:02d}  linears={linear_count} "
+              f"packed={packed_count}  load={load_s:.2f}s  "
+              f"total={elapsed:.2f}s  out_keys={len(out)}  "
+              f"({done_n}/{num_layers}, {sweep_rate:.1f}s/layer, "
+              f"ETA {eta_min:.1f} min){mem_note}", flush=True)
         # v25: save layer cache BEFORE tensor_sink consumes the dict.
         # Use a tmp + rename to keep the cache file atomic — a kill in
         # the middle of torch.save leaves a .tmp behind which we'll
@@ -6262,6 +7201,14 @@ def materialize_tensors_streaming(
         if tensor_sink is not None:
             tensor_sink(out)
             out = {}
+        _stop_after = os.environ.get("PRISMAQUANT_EXPORT_STOP_AFTER_LAYER")
+        if _stop_after is not None and L >= int(_stop_after):
+            # Diagnostic runs only: exit AFTER the layer cache save + sink
+            # flush so the rendered layer is resumable. Artifact INCOMPLETE.
+            print(f"[export-stream] PRISMAQUANT_EXPORT_STOP_AFTER_LAYER="
+                  f"{_stop_after}: stopping after layer {L:02d} "
+                  f"(diagnostic run — artifact INCOMPLETE)", flush=True)
+            sys.exit(0)
 
     print(f"[export-stream] layer sweep: {time.time()-t_layers:.1f}s "
           f"(cache_hits={cache_hits}/{num_layers})",
@@ -6463,11 +7410,20 @@ def _materialize_tensors_inmemory(
                     f"(would ship the 1.0 placeholder). Re-run "
                     f"build_production_cache to recompute the scale, or delete "
                     f"the expert shard to force a full re-render.")
+            if expert_input_scale is not None and fmt == "NVFP4":
+                # K0.2: a calibrated stage may only ship alongside its
+                # attested sibling stage.
+                _packed_expert_stage_attestation(
+                    full_name, cache=active_cache, profile=profile)
 
             # M2: re-derive under the render's RECORDED NVFP4 scale rule
             # (same wrap as the streaming packed-expert path).
             with _temporary_export_nvfp4_scale_rule(packed_render_rule):
-                for pi, (proj_name, sub_packed) in enumerate(proj_split):
+                # Index-based on purpose — see the streaming emit: enumerate's
+                # result-tuple reuse pins tensor-bearing tuples across layers.
+                for pi in range(len(proj_split)):
+                    proj_name = proj_split[pi][0]
+                    sub_packed = proj_split[pi][1]
                     cached_sub = (
                         cached_split[pi][1]
                         if cached_split is not None else None
@@ -6500,6 +7456,9 @@ def _materialize_tensors_inmemory(
                     cached_3d=cached_3d,
                 ),
             )] += 1
+            # Same loop-local pinning class as the streaming emit: drop the
+            # views so the fp32 stacks free with their owners.
+            sub_packed = cached_sub = None
 
     for name, p in model.named_parameters():
         if any(name.startswith(c + ".") or name == c for c in covered):
@@ -6775,6 +7734,131 @@ FORMAT_SCHEME = {
     "FP8_SOURCE": FP8_SOURCE_SCHEME,
 }
 
+# Formats this container emits *without* a `config_groups` scheme, so they
+# cannot appear in `FORMAT_SCHEME` by construction. BF16 is written as a
+# plain safetensors bf16 tensor and named on the checkpoint's `ignore`
+# list. (FP8_SOURCE is *also* a verbatim-copy passthrough — no
+# `_quantize_2d` pass runs for it — but it still describes itself to vLLM
+# through `FP8_SOURCE_SCHEME`, so `FORMAT_SCHEME` already covers it.)
+CONTAINER_PASSTHROUGH_FORMATS = frozenset({"BF16"})
+
+# The authoritative set of formats THIS exporter can emit: everything it
+# can describe in `config_groups` metadata plus the container
+# passthroughs. Derived, never hand-listed, so a new scheme becomes
+# exportable in the same commit that adds it.
+#
+# It is deliberately NOT derived from the `_quantize_2d` byte-packer
+# branches, which do not agree with what is shippable: `FP8_E5M2` has a
+# packer branch but no scheme (it raises "research-only", and bytes with
+# no metadata are bytes vLLM cannot dispatch — CLAUDE.md gate #9), while
+# `FP8_SOURCE` has a scheme and no packer branch at all.
+#
+# `serving_profile_specs/vllm_packed_moe.json` reads this constant as its
+# export-lane bound, which is what keeps the allocator's menu from ever
+# containing a rung export would have to rewrite (issue #22 part 2).
+# `_coerce_runtime_legal_assignment` hard-fails on anything outside it.
+EXPORTABLE_FORMATS = frozenset(
+    {_canonical_export_format(name) for name in FORMAT_SCHEME}
+    | CONTAINER_PASSTHROUGH_FORMATS
+)
+
+
+def derive_executed_activation_formats() -> frozenset[str]:
+    """The canonical formats whose scheme the runtime executes with activations.
+
+    Derived from the producer table that owns it (``FORMAT_SCHEME``): a format
+    is executed exactly when its scheme carries ``input_activations``, which
+    is what vLLM's compressed-tensors dispatcher reads to pick W4A4/W8A8
+    over W4A16 at RUNTIME. Canonicalized, so the ``MXFP8`` legacy alias does
+    not leak in as a distinct rung. Principle 14: this is the value
+    ``lane_specs/compressed_tensors.json``'s
+    ``served_activation_quantization.executes`` must equal, and
+    ``require_compressed_executes_derived_from_scheme`` refuses any drift --
+    a scheme-table edit that adds/drops ``input_activations`` (MXFP4 is one
+    field away from flipping) fails there instead of silently keeping the old
+    A-side price.
+    """
+    return frozenset(
+        _canonical_export_format(fmt)
+        for fmt, scheme in FORMAT_SCHEME.items()
+        if "input_activations" in scheme
+    )
+
+
+def executed_activation_formats_in_quantization_config(qc: Mapping) -> frozenset[str]:
+    """Read the executed set off an EMITTED ``quantization_config``.
+
+    The lane spec's own ``if_this_changes`` note asks for exactly this: the
+    set of ``config_groups`` carrying ``input_activations``, mapped back to
+    format names by matching each group (minus its ``targets``) against the
+    producer table. A group no scheme explains is refused rather than
+    skipped -- an emitted group the table cannot account for is drift, not a
+    clean bill. Groups without ``input_activations`` (today: MXFP4's) are
+    correctly absent from the answer.
+    """
+    groups = qc.get("config_groups") or {}
+    if not isinstance(groups, Mapping):
+        raise RuntimeError(
+            "quantization_config config_groups is not an object; refusing "
+            "to read the executed set off it")
+    out: set[str] = set()
+    for name, group in groups.items():
+        if not isinstance(group, Mapping) or "input_activations" not in group:
+            continue
+        stripped = {k: v for k, v in group.items() if k != "targets"}
+        matched = {
+            _canonical_export_format(fmt)
+            for fmt, scheme in FORMAT_SCHEME.items()
+            if scheme == stripped
+        }
+        if not matched:
+            raise RuntimeError(
+                f"PRINCIPLE 14: emitted config group {name!r} carries "
+                f"input_activations but matches no scheme in "
+                f"export_native_compressed.FORMAT_SCHEME. The emission path "
+                f"and the producer table have drifted apart; re-derive, "
+                f"never edit the lane spec to silence this.")
+        out |= matched
+    return frozenset(out)
+
+
+def require_compressed_executes_derived_from_scheme() -> frozenset[str]:
+    """Principle 14: refuse when the lane spec and the scheme table disagree.
+
+    ``lane_specs/compressed_tensors.json``'s
+    ``served_activation_quantization.executes`` is a claim about what the
+    serving runtime executes, and on this lane the executed contract is a
+    function of the artifact we write -- so it is either equal to what the
+    per-format scheme table implies, or it is refused. There is no third
+    answer and in particular no "the rationale explains the difference": a
+    ``rationale`` field explains, it is never the value a gate reads. The
+    export preflight runs this before any GPU render.
+    """
+    from .lane_spec import load_lane_spec
+
+    derived = derive_executed_activation_formats()
+    spec = load_lane_spec("compressed_tensors")
+    declared = spec.served_activation_quantization
+    if declared is None:
+        raise RuntimeError(
+            "lane_specs/compressed_tensors.json declares no "
+            "served_activation_quantization, so the A-side of every NVFP4/FP8 "
+            "rung would price to zero; that is a currency error, not a "
+            "missing annotation")
+    if set(declared.executes) != set(derived):
+        missing = sorted(set(derived) - set(declared.executes))
+        extra = sorted(set(declared.executes) - set(derived))
+        raise RuntimeError(
+            "PRINCIPLE 14: lane_specs/compressed_tensors.json declares "
+            f"executes={sorted(declared.executes)} but the exporter scheme "
+            f"table implies {sorted(derived)} "
+            f"(missing={missing or '-'}, extra={extra or '-'}).\n"
+            "  The producer's claim about what the serving runtime executes "
+            "must be DERIVED from the per-format scheme table's "
+            "input_activations. Re-read the table; never edit the list to "
+            "silence this.")
+    return derived
+
 
 def _fused_modules_mapping_for_profile(profile) -> dict[str, tuple[str, ...]]:
     """Return fused-module leaf mapping for target emission.
@@ -6862,6 +7946,12 @@ def build_quantization_config(
     `profile` controls the architecture-specific bits: name remap,
     per-expert MoE / MTP regexes. Defaults to `DefaultProfile()` (plain
     names, no catch-all regexes) when omitted.
+
+    This legacy compressed-tensors container intentionally does not publish
+    ``execution_contracts.nvfp4_w4a4``.  Its optional/defaulted activation
+    scalars preserve existing native artifact bytes but cannot attest the
+    strict Gridbook fused-W4A4 activation contract; only the versioned CB
+    export path may emit that record after complete calibration.
     """
     from .model_profiles import DefaultProfile
     profile = profile or DefaultProfile()
@@ -6875,6 +7965,13 @@ def build_quantization_config(
     for name, fmt in sorted(assignment.items()):
         fmt = _canonical_export_format(fmt)
         vllm_name = profile.to_vllm_internal_name(name)
+        if fmt == "FP8_SOURCE" and profile.runtime_loads_source_fp8(name):
+            # The pinned runtime dequantizes these modules itself at load
+            # (source-style keys, module built without a quant config), so
+            # they are BF16 in the serving model — not CT-schemed. A
+            # config_groups entry here would double-describe them.
+            ignore.append(vllm_name)
+            continue
         if fmt == "BF16":
             ignore.append(vllm_name)
             # Packed MoE tensors in BF16 are emitted as per-expert
@@ -7031,6 +8128,25 @@ def build_quantization_config(
         return (
             f"re:^{escaped}[.][0-9]+[.]({proj_options})$"
         )
+
+    def _targets_name_experts(names: list[str]) -> bool:
+        """True when any target names a per-expert Linear.
+
+        `by_fmt` holds a mix of plain vLLM module names and pre-formed
+        regexes, and by the time this runs every per-expert entry is a
+        regex: the loop above moves plain `...experts.<eid>.<proj>` names
+        out of `by_fmt` into `packed_fused_states`, then re-adds them via
+        `_per_expert_regex_for`, whose literal dots are bracket-escaped
+        (`layers[.]0[.]mlp[.]experts[.][0-9]+`). So a bare `".experts."`
+        test matches nothing on any packed-MoE artifact. Undo the escape
+        before testing, and accept either form.
+        """
+        for name in names:
+            probe = name[len("re:"):] if name.startswith("re:") else name
+            probe = probe.replace("[.]", ".")
+            if ".experts." in probe or probe.endswith(".experts"):
+                return True
+        return False
 
     for fused_qname, states in packed_fused_states.items():
         if len(states) > 1:
@@ -7241,14 +8357,23 @@ def build_quantization_config(
         need_canon = ondisk != canon and bool(canon)
         canon_opts = "|".join(sorted(canon)) or "gate_proj|up_proj|down_proj"
         expert_regexes = []
-        for getter in (profile.per_expert_moe_regex, profile.per_expert_mtp_regex):
-            r = getter()
-            if r is None:
-                continue
-            if need_canon:
-                body = r[len("re:"):] if r.startswith("re:") else r
-                r = f"re:{_constrain_per_expert_projection_regex(body, canon_opts)}"
-            expert_regexes.append(r)
+        # Only attach the safety-net when the catch-all group actually
+        # holds packed/per-expert units. When the largest group is a
+        # non-expert format (GLM-5.3: FP8_SOURCE dense half vs NVFP4
+        # experts), the net would claim every per-expert Linear for the
+        # WRONG scheme — vLLM's get_moe_method probes `experts.0.X_proj`
+        # and a match here overrides the experts' real group.
+        catchall_has_experts = _targets_name_experts(by_fmt[catchall])
+        if catchall_has_experts:
+            for getter in (profile.per_expert_moe_regex,
+                           profile.per_expert_mtp_regex):
+                r = getter()
+                if r is None:
+                    continue
+                if need_canon:
+                    body = r[len("re:"):] if r.startswith("re:") else r
+                    r = f"re:{_constrain_per_expert_projection_regex(body, canon_opts)}"
+                expert_regexes.append(r)
         scheme["targets"] = _build_target_list(by_fmt[catchall]) + expert_regexes
         config_groups[f"group_{idx}"] = scheme
 
@@ -7268,6 +8393,11 @@ def _preflight_quantization_config(
     profile: "ModelProfile | None",
 ) -> None:
     """Run config-only export gates before GPU render and shard writes."""
+    # Principle 14, first: the lane spec's executed-activation list must equal
+    # what the scheme table implies, checked before any GPU hour is spent. A
+    # scheme-table edit that adds/drops `input_activations` refuses here
+    # instead of silently keeping the old A-side price (RobTand/prismaquant#163).
+    require_compressed_executes_derived_from_scheme()
     try:
         build_quantization_config(
             assignment,
@@ -7351,10 +8481,370 @@ def compute_extra_ignore(
     return extra_ignore
 
 
-def main():
+def _export_resume_fingerprint(
+    *,
+    assignment: dict,
+    model_path: str,
+    dtype: "torch.dtype",
+    declared_buffer_dtypes: dict,
+    extra_shard_paths: object = (),
+    digest_cache_path: str | Path | None = None,
+) -> dict:
+    """Everything a `layer_NNN.pt` payload is only valid under.
+
+    `_render_lever_provenance()` says how the export renders; this adds WHAT
+    it renders. Before #340 the manifest carried the levers alone, so a cache
+    dir reused against a different checkpoint replayed the first checkpoint's
+    quantized bytes -- the levers matched and no field named the source. The
+    `assignment_hash` beside them compared nothing: `hashlib` was in scope
+    nowhere inside `materialize_tensors_streaming`, so the call raised
+    NameError and the `except Exception` stamped a null on every manifest
+    ever written (measured on origin/main, PB action 41e6e63eb9dd). The
+    import is explicit here and there is no swallow: a recipe hash that
+    cannot be computed is a crash, not a null that matches the next null.
+
+    Three bindings, all of which a replayed payload silently bakes in:
+
+    * ``source_identity`` -- the sha256 of every safetensors shard the run
+      consumes, and of the non-shard files it reads from the checkpoint root:
+      ``config.json`` (the skeleton the payloads were quantized against),
+      ``model.safetensors.index.json`` (which shard each tensor comes from)
+      and every root ``*.py``, which a ``trust_remote_code`` checkpoint is
+      built through (all of them, not only the ones ``auto_map`` names).
+      See `build_source_checkpoint_identity`. Content, not path: a relocated
+      checkpoint still resumes, a same-size value edit does not.
+    * ``requested_dtype`` -- the parameter dtype the source read narrows to.
+    * ``declared_buffer_dtypes`` -- the skeleton's persistent-buffer dtype
+      map, which is what the reader restores buffers to (#311/PR #325). The
+      policy STAMP alone says the reader is correct; the map says it was
+      handed the same declarations.
+
+    Nothing here may degrade to ``None``: the manifest comparison is
+    equality, and ``None == None`` admits. A source that cannot be identified
+    raises instead.
+    """
+    import hashlib
+
+    from prismaquant.cost_streaming import build_source_checkpoint_identity
+
+    fp_state = _render_lever_provenance()
+    fp_state["assignment_hash"] = hashlib.sha256(
+        json.dumps(assignment, sort_keys=True).encode()
+    ).hexdigest()[:16]
+    fp_state["source_identity"] = build_source_checkpoint_identity(
+        model_path,
+        extra_shard_paths=extra_shard_paths,
+        digest_cache_path=digest_cache_path,
+    )
+    fp_state["requested_dtype"] = str(dtype)
+    fp_state["declared_buffer_dtypes"] = {
+        str(name): str(value)
+        for name, value in sorted(dict(declared_buffer_dtypes).items())
+    }
+    return fp_state
+
+
+# The manifest keys without which replay cannot be authorized. A pre-#340
+# cache carries none of them, and a manifest that lost one is not a weaker
+# match -- it is unreadable, and refused on the same branch.
+_EXPORT_RESUME_REQUIRED_KEYS = (
+    "source_identity",
+    "requested_dtype",
+    "declared_buffer_dtypes",
+    "assignment_hash",
+)
+
+
+def _admit_export_resume_cache(cache_path: Path, fp_state: dict) -> bool:
+    """Decide whether `layer_*.pt` replay is admitted, BEFORE any is read.
+
+    Returns True when the cache may be resumed. On any refusal every
+    `layer_*.pt` is removed and the manifest is rewritten, so the caller's
+    per-layer `cf.exists()` check cannot find a stale payload afterwards.
+    """
+    manifest_path = cache_path / "manifest.json"
+
+    def _refuse(reason: str) -> bool:
+        removed = 0
+        for stale in cache_path.glob("layer_*.pt"):
+            stale.unlink()
+            removed += 1
+        with manifest_path.open("w") as handle:
+            json.dump(fp_state, handle, indent=2)
+        print(f"[export-stream] resume REFUSED ({reason}); "
+              f"discarded {removed} cached layers", flush=True)
+        return False
+
+    if not manifest_path.exists():
+        if next(cache_path.glob("layer_*.pt"), None) is not None:
+            return _refuse("cached layers have no manifest binding")
+        with manifest_path.open("w") as handle:
+            json.dump(fp_state, handle, indent=2)
+        print(f"[export-stream] wrote cache fingerprint to {manifest_path}",
+              flush=True)
+        return True
+
+    try:
+        with manifest_path.open() as handle:
+            prev = json.load(handle)
+        if not isinstance(prev, dict):
+            raise ValueError("manifest is not an object")
+    except Exception as exc:
+        return _refuse(f"cache manifest unreadable: {exc}")
+
+    absent = [k for k in _EXPORT_RESUME_REQUIRED_KEYS if k not in prev]
+    if absent:
+        return _refuse(
+            f"manifest predates the source-identity contract, missing {absent}")
+
+    if prev != fp_state:
+        diffs = [
+            key for key in sorted(set(prev) | set(fp_state))
+            if prev.get(key) != fp_state.get(key)
+        ]
+        return _refuse(f"fingerprint differs in: {diffs}")
+
+    print(f"[export-stream] cache fingerprint match — resumable from "
+          f"{len(list(cache_path.glob('layer_*.pt')))} layers", flush=True)
+    return True
+
+
+def _render_lever_provenance() -> dict:
+    """The quality-affecting render state of this export run.
+
+    Two consumers, one definition: the per-layer export cache folds this dict
+    into its `manifest.json` fingerprint (a change means the cached layer
+    tensors were quantized under a different recipe and the cache is silently
+    wrong), and the shipcard echoes it so an artifact carries the levers it was
+    rendered under. Keep the key set stable — changing it invalidates every
+    in-flight export cache.
+
+    This is HOW the export renders, not WHAT it renders. The source checkpoint
+    identity, the requested dtype and the declared buffer-dtype map belong to
+    the cache fingerprint only (`_export_resume_fingerprint`, #340); the
+    shipcard records the source through its own `source_model` field.
+    """
+    return {
+        # Older layer_*.pt payloads may already contain narrowed persistent
+        # buffers. Recompute them even when the source and render knobs match:
+        # replay bypasses the corrected reader and cannot recover lost bits.
+        "persistent_buffer_read_policy": "model_declared_v1",
+        "PRISMAQUANT_DO_NO_HARM": os.environ.get(
+            "PRISMAQUANT_DO_NO_HARM", "1"),
+        "PRISMAQUANT_GPTQ_DAMP_SWEEP": os.environ.get(
+            "PRISMAQUANT_GPTQ_DAMP_SWEEP", "0"),
+        "PRISMAQUANT_GPTQ_DAMP": os.environ.get(
+            "PRISMAQUANT_GPTQ_DAMP", ""),
+        "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING": os.environ.get(
+            "PRISMAQUANT_NVFP4_SNAPPED_SCALE_SCORING", "0"),
+        "PRISMAQUANT_ACT_CLIP_QUANTILE": os.environ.get(
+            "PRISMAQUANT_ACT_CLIP_QUANTILE", "0.999"),
+        # Walled 2026-07-30 (re-vet R25): the lever no longer exists, so the
+        # key records that fact rather than echoing an env var nothing reads.
+        # This DOES move the fingerprint once — intended: any in-flight export
+        # cache was built by a binary that still carried the (unreachable)
+        # branch, and re-rendering is the honest outcome.
+        "PRISMAQUANT_BLOCK_OUTPUT_MATCH": "archived_2026-07-30",
+        "PRISMAQUANT_BATCHED_NVFP4_EXPORT": os.environ.get(
+            "PRISMAQUANT_BATCHED_NVFP4_EXPORT", "1"),
+        NVFP4_SCALE_RULE_ENV: _nvfp4_scale_rule_from_env(),
+        "ACT_AWARE_FLAGS": dict(sorted(_ACT_AWARE_FLAGS.items())),
+        "activation_cache_fingerprint": _ACTIVATION_CACHE_FINGERPRINT,
+        "production_cache_fingerprint": _PRODUCTION_CACHE_FINGERPRINT,
+    }
+
+
+def _write_shipcard(
+    out_dir: Path,
+    *,
+    source_model: str,
+    layer_config_path: str | None,
+    assignment: dict,
+    config_assignment: dict,
+    hist: dict,
+) -> None:
+    """Open the ship record (R13): build-lane facts + empty serve-lane slots.
+
+    The build lane cannot run a quality gate — `vllm` is not importable in the
+    build venv, and embedding a docker serve here would make the exporter own
+    the serving stack. What it can do is state, on the artifact, exactly which
+    serve-lane verdicts are still missing, so "we never ran the ship gate"
+    becomes a refusal (`python -m prismaquant.shipcard_cli verify`) instead of an omission.
+    """
+    import hashlib
+
+    from . import read_traffic as _read_traffic
+    from . import shipcard as _shipcard
+
+    def _hash(payload) -> str | None:
+        try:
+            return hashlib.sha256(
+                json.dumps(payload, sort_keys=True).encode()
+            ).hexdigest()[:16]
+        except Exception:
+            return None
+
+    build = {
+        "git": _shipcard.git_provenance(),
+        "source_model": source_model,
+        "layer_config": layer_config_path,
+        "layer_config_sha": (
+            _shipcard.file_sha256(layer_config_path)
+            if layer_config_path else None),
+        "assignment_hash": _hash(assignment),
+        "config_assignment_hash": _hash(config_assignment),
+        "n_assignment_entries": len(config_assignment),
+        "achieved_bpp": _shipcard.allocator_achieved_bpp(layer_config_path),
+        # Disk bytes are not what decode throughput is made of: a dense
+        # weight is streamed every token while a routed expert stack is
+        # streamed topk/E of the time, so bpp and per-token read bytes rank
+        # artifacts differently on a sparse MoE. Stamped beside the bpp,
+        # measured from the shards this export just wrote.
+        "read_gb_per_token": _read_traffic.read_traffic_claim(out_dir),
+        "format_histogram": {f"{k[0]}/{k[1]}": v for k, v in hist.items()},
+        "render_levers": _render_lever_provenance(),
+        "kv_shared_fisher": _shipcard.kv_shared_fisher_echo(),
+    }
+    card = _shipcard.build_shipcard(out_dir, build=build)
+    path = _shipcard.write_shipcard(
+        out_dir / _shipcard.SHIPCARD_FILENAME, card)
+    print(f"[export-stream] shipcard opened: {path}", flush=True)
+    print(f"[export-stream]   serve-lane slots still UNFILLED: "
+          f"{', '.join(_shipcard.unfilled_slots(card))}", flush=True)
+    print(f"[export-stream]   close them, then: python3 -m prismaquant.shipcard_cli "
+          f"verify {path}", flush=True)
+
+
+def _refuse_archived_block_output_match() -> None:
+    """Fail loudly if an old script still asks for block-output match.
+
+    Walled 2026-07-30 (re-vet R25, archive/block_output_match_2026-07-30/).
+    Silently ignoring `PRISMAQUANT_BLOCK_OUTPUT_MATCH=1` would mean an old
+    launcher exports *differently* than it did with no signal at all — the
+    band-aid this house forbids. `=0` (the explicit disable) is accepted: it
+    already asked for what now always happens.
+    """
+    raw = os.environ.get("PRISMAQUANT_BLOCK_OUTPUT_MATCH")
+    if raw is None:
+        return
+    if str(raw).strip().lower() in {"0", "false", "no", "off", ""}:
+        return
+    raise SystemExit(
+        "[export] ERROR: PRISMAQUANT_BLOCK_OUTPUT_MATCH="
+        f"{raw} — block-output match is archived under "
+        "archive/block_output_match_2026-07-30. It was UNREACHABLE on the "
+        "shipping recipe (the production-cache pack fires first and "
+        "`continue`s, so with PRODUCTION_CACHE=1 no dense NVFP4 Linear ever "
+        "reached the branch; zero hits in two real production export logs), "
+        "and had it been reached it would have re-derived NVFP4 group scales "
+        "outside _export_match_render_scale_rule and discarded the render's "
+        "joint_mse scales — the -6.6% KL defect M19 fixed everywhere else. "
+        "Its {0.95, 1.0, 1.05} per-tensor gain re-search is subsumed by JSO. "
+        "Unset the variable (or set it to 0) to export."
+    )
+
+
+def _replace_cli_option(argv: Sequence[str], option: str, value: str) -> list[str]:
+    """Replace every spelling of one required argparse option."""
+    rewritten = list(argv)
+    found = False
+    index = 0
+    while index < len(rewritten):
+        item = rewritten[index]
+        if item == option:
+            if index + 1 >= len(rewritten):
+                break
+            rewritten[index + 1] = value
+            found = True
+            index += 2
+            continue
+        if item.startswith(option + "="):
+            rewritten[index] = option + "=" + value
+            found = True
+        index += 1
+    if not found:
+        raise RuntimeError(f"required CLI option {option!r} was not found")
+    return rewritten
+
+
+def _cleanup_successful_export_cache(
+    export_cache_dir: str | None,
+    *,
+    keep_export_cache: bool,
+) -> None:
+    """Remove resumable layer state only after final artifact publication."""
+    if (
+        not export_cache_dir
+        or keep_export_cache
+        or not Path(export_cache_dir).exists()
+    ):
+        return
+    try:
+        shutil.rmtree(export_cache_dir)
+        print(
+            f"[export-stream] removed export cache {export_cache_dir}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[export-stream] WARN cache cleanup failed: {exc!r}",
+            flush=True,
+        )
+
+
+def main(argv: Sequence[str] | None = None):
+    """Run one native export inside an artifact-level output transaction."""
+    raw_argv = list(argv) if argv is not None else None
+    parse_argv = raw_argv if raw_argv is not None else os.sys.argv[1:]
+    preflight = argparse.ArgumentParser(add_help=False)
+    preflight.add_argument("--model")
+    preflight.add_argument("--output")
+    preflight.add_argument("--export-cache-dir")
+    preflight.add_argument("--keep-export-cache", action="store_true")
+    known, _unknown = preflight.parse_known_args(parse_argv)
+    if known.model is None or known.output is None:
+        # Preserve the complete parser's native --help/missing-argument errors.
+        return _main_impl(parse_argv)
+
+    # Refuse a stale/tampered or merely MATERIALIZED PrismaSnap source before
+    # opening the export transaction or doing any GPU render work.  Ordinary
+    # unsnapped sources remain a no-op in this preflight.
+    from .prismasnap_contract import require_verified_prismasnap_if_present
+
+    require_verified_prismasnap_if_present(known.model)
+
+    requested_output = Path(known.output)
+    with transactional_export_directory(
+        known.model,
+        requested_output,
+        where="export_native_compressed",
+    ) as staged_output:
+        staged_argv = _replace_cli_option(
+            parse_argv,
+            "--output",
+            str(staged_output),
+        )
+        result = _main_impl(staged_argv)
+
+    _cleanup_successful_export_cache(
+        known.export_cache_dir,
+        keep_export_cache=bool(known.keep_export_cache),
+    )
+    print(
+        "[export-stream] done. Serve with:\n"
+        f"  vllm serve {requested_output.resolve()} "
+        "--quantization compressed-tensors",
+        flush=True,
+    )
+    return result
+
+
+def _main_impl(argv: Sequence[str] | None = None):
     global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS, _ACTIVATION_CACHE_FINGERPRINT
     global _PRODUCTION_WEIGHT_CACHE, _PRODUCTION_CACHE_FINGERPRINT
     global _PRODUCTION_CACHE_PREFETCH_WORKERS, _NVFP4_SCALE_RULE
+    global _PRODUCTION_CACHE_PREFETCH_MODE, _ALLOCATOR_TARGET_PROFILE
+    _refuse_archived_block_output_match()
     _INPUT_GLOBAL_SCALES = None
     _CACHED_ACTIVATIONS = None
     _ACTIVATION_CACHE_FINGERPRINT = None
@@ -7369,10 +8859,23 @@ def main():
     ap.add_argument("--layer-config", default=None,
                     help="layer_config.json from allocator.py. Optional when "
                          "--perturbed-x-dir is supplied.")
+    ap.add_argument(
+        "--allow-research-cost-selection",
+        action="store_true",
+        help="explicitly acknowledge export of a research-stamped assembled "
+             "cost selection; the default ship gate refuses it",
+    )
     ap.add_argument("--output", required=True,
                     help="Output directory for the compressed checkpoint")
-    ap.add_argument("--shard-bytes", type=int, default=5 * 1024**3,
-                    help="Approx per-shard size in bytes (default 5 GiB)")
+    ap.add_argument("--shard-bytes", type=int, default=1024**3,
+                    help="Approx per-shard size in bytes (default 1 GiB). "
+                         "Robert's standing packaging preference for every "
+                         "published artifact since 2026-08-20; it was 5 GiB "
+                         "before. Smaller shards resume better on a flaky "
+                         "download and let a client fetch a subset, at the "
+                         "cost of more files in the index. A single tensor "
+                         "larger than this still gets its own shard -- the "
+                         "writer flushes it whole rather than splitting it.")
     ap.add_argument("--device", default="cuda",
                     help="CUDA device for quantization arithmetic. Layer "
                          "weights are read into this device; "
@@ -7386,7 +8889,9 @@ def main():
                     help="Module qnames to keep at bf16 even if the "
                          "allocator assigned another format. Default: the "
                          "active model profile's pinned_names (typically "
-                         "lm_head/head for current vLLM serving targets). "
+                         "lm_head/head for current vLLM serving targets), "
+                         "except when allocator metadata explicitly stamps "
+                         "a fixed or DP-unpinned lm_head assignment. "
                          "Pass --ignore with no values to disable profile "
                          "pinning for a runtime that supports quantized heads.")
     ap.add_argument("--activation-cache-dir", default=None,
@@ -7412,6 +8917,13 @@ def main():
                          "current layer into this LRU.")
     ap.add_argument("--production-cache-prefetch-workers", type=int, default=4,
                     help="Thread count for production-cache prefetch.")
+    ap.add_argument("--production-cache-prefetch",
+                    choices=("require", "warn"), default="warn",
+                    help="`require` fails the export when the production "
+                         "cache cannot supply a layer's assignment instead of "
+                         "silently falling back to per-tensor NVMe reads "
+                         "(re-vet R24/D8). run-pipeline.sh passes require on "
+                         "the native lane; the bare-CLI default stays warn.")
     ap.add_argument("--perturbed-x-dir", default=None,
                     help="Directory containing final_layer_config.json and "
                          "activation cache files from a prior production "
@@ -7462,7 +8974,17 @@ def main():
                     help="Don't remove --export-cache-dir on success. "
                          "Useful for debugging or comparing two exports "
                          "against the same cache.")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+
+    out_dir = Path(args.output)
+    # Path safety is the first preflight: an in-place/aliased/stale target must
+    # be rejected before parsing model tensors or allocating any exporter state.
+    # Directory creation remains delayed until the recipe/config gates pass.
+    validate_fresh_export_directory(
+        args.model,
+        out_dir,
+        where="export_native_compressed",
+    )
 
     from .model_profiles import detect_profile, DefaultProfile
     profile = detect_profile(args.model)
@@ -7501,6 +9023,12 @@ def main():
     with open(args.layer_config) as _lc_for_cache:
         _layer_config_payload_for_cache = json.load(_lc_for_cache)
     validate_layer_config_payload(_layer_config_payload_for_cache, args.layer_config)
+    from .research_cost_acceptance import enforce_research_export_acknowledgement
+    enforce_research_export_acknowledgement(
+        _layer_config_payload_for_cache,
+        acknowledged=args.allow_research_cost_selection,
+        where="export_native_compressed",
+    )
     _assignment_for_cache = _canonicalize_assignment(_layer_config_payload_for_cache)
     _assignment_for_cache, _ = _coerce_runtime_legal_assignment(
         args.model,
@@ -7523,6 +9051,8 @@ def main():
         _PRODUCTION_CACHE_PREFETCH_WORKERS = max(
             1, int(args.production_cache_prefetch_workers)
         )
+        _PRODUCTION_CACHE_PREFETCH_MODE = str(
+            args.production_cache_prefetch or "warn").lower()
         expected_keys, missing_keys = _production_cache_expected_keys(
             _assignment_for_cache
         )
@@ -7531,17 +9061,17 @@ def main():
                            if str(k[0]).startswith("mtp.")]
             mtp_hint = ""
             if mtp_missing:
-                # No producer renders mtp.* into ProductionWeightCache yet
-                # (build_production_cache/production_recache never see the
-                # MTP sidecar). Fail HERE at attach time with the contract,
-                # not hours later in _materialize_tensors_inmemory.
+                # Fail at attach time with the producer contract, not hours
+                # later in _materialize_tensors_inmemory. The shared cache
+                # builder can synthesize profile MTP now, but it needs the
+                # probe activation cache and the concrete non-BF16 assignment.
                 mtp_hint = (
                     f" {len(mtp_missing)} of these are MTP sidecar entries "
-                    f"(e.g. {mtp_missing[0][0]}): no producer renders mtp.* "
-                    "into the production cache today — non-BF16 MTP with an "
-                    "attached cache is an unsupported configuration. Set "
-                    "MTP_FORMAT=BF16, or add MTP coverage to "
-                    "build_production_cache before exporting."
+                    f"(e.g. {mtp_missing[0][0]}). Rebuild with the current "
+                    "build_production_cache, the same --render-layer-config, "
+                    "and --activation-cache-dir from the probe so its "
+                    "profile-synthesized MTP producer can render them; or "
+                    "set MTP_FORMAT=BF16."
                 )
             raise RuntimeError(
                 "[export-stream] production-weight-cache missing recipe "
@@ -7654,7 +9184,8 @@ def main():
             with open(args.layer_config) as _lc:
                 _recipe_payload = json.load(_lc)
             validate_layer_config_payload(_recipe_payload, args.layer_config)
-            _recipe_names = list(_recipe_payload.keys())
+            _recipe_names = [n for n in _recipe_payload.keys()
+                             if not _is_layer_config_meta_key(n)]
             idx = ActivationIndex(cache_dir, _recipe_names)
             _ACTIVATION_CACHE_FINGERPRINT = _activation_index_fingerprint(
                 idx, cache_dir)
@@ -7698,6 +9229,11 @@ def main():
     with open(args.layer_config) as f:
         raw_recipe = json.load(f)
     validate_layer_config_payload(raw_recipe, args.layer_config)
+    _allocator_meta = _layer_config_metadata(raw_recipe)
+    if _allocator_meta.get("target_profile"):
+        _ALLOCATOR_TARGET_PROFILE = str(_allocator_meta["target_profile"])
+        print(f"[export] allocator target profile (from layer_config): "
+              f"{_ALLOCATOR_TARGET_PROFILE}", flush=True)
     assignment = _canonicalize_assignment(raw_recipe)
     assignment, runtime_coerced = _coerce_runtime_legal_assignment(
         args.model,
@@ -7705,22 +9241,21 @@ def main():
         profile,
     )
     if runtime_coerced:
-        print(
-            "[export-stream] runtime format coercions: "
-            f"{len(runtime_coerced)} Linears -> BF16 "
-            "(target runtime does not support those format/shape pairs). "
-            f"sample={runtime_coerced[:6]}",
-            flush=True,
-        )
+        print(_runtime_coercion_report(runtime_coerced), flush=True)
+    whole_artifact_budget_from_assignment_payload(
+        raw_recipe,
+        where="export_native_compressed preflight",
+        assignment=assignment,
+    )
     validate_mtp_assignment_coverage(args.model, assignment, profile)
     fmts = Counter(assignment.values())
     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
           flush=True)
 
-    bf16_passthrough = set(
-        args.ignore
-        if args.ignore is not None
-        else profile.pinned_names()
+    bf16_passthrough = _bf16_passthrough_for_assignment(
+        args.ignore,
+        profile,
+        _allocator_meta,
     )
     config_assignment, config_bf16_passthrough, fp8_source_overrides = (
         _fp8_source_config_overlay(
@@ -7742,6 +9277,11 @@ def main():
         profile=profile,
     )
     print("[export-stream] quantization-config preflight passed", flush=True)
+    out_dir = prepare_fresh_export_directory(
+        args.model,
+        out_dir,
+        where="export_native_compressed",
+    )
 
     from prismaquant.gpu_guard import require_cuda_hot_path
 
@@ -7750,16 +9290,23 @@ def main():
         "export_native_compressed",
         args.device,
     )
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     if args.offload_folder is None:
         args.offload_folder = str(out_dir / "_streaming_offload")
 
     def _rename_body_batch(
         batch: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        return {profile.export_tensor_name(k): v for k, v in batch.items()}
+        # Body-walk keys are LIVE module qnames. `export_tensor_name`
+        # speaks the RECIPE namespace, so normalize first — a no-op for
+        # every family whose live skeleton already uses recipe names
+        # (`live_to_recipe_name` is idempotent prefix/segment rewriting),
+        # and the only correct spelling on multimodal-forced skeletons
+        # (glm5_next: `model.language_model.` + `.forget_gate.` segments
+        # exist live but not in the recipe or the checkpoint).
+        return {
+            profile.export_tensor_name(profile.live_to_recipe_name(k)): v
+            for k, v in batch.items()
+        }
 
     writer = IncrementalSafetensorsWriter(out_dir, args.shard_bytes)
     sample_recipe_key = "model.layers.0.self_attn.q_proj.weight"
@@ -7790,7 +9337,7 @@ def main():
     if profile.has_mtp():
         print("[export-stream] materializing MTP tensors ...", flush=True)
         mtp_tensors = _materialize_mtp_tensors(
-            args.model, assignment,
+            args.model, assignment, profile=profile,
             bf16_passthrough=bf16_passthrough, hist=hist,
             device=device)
         print(f"[export-stream] MTP: {len(mtp_tensors)} tensors", flush=True)
@@ -7880,10 +9427,7 @@ def main():
             "n_assignment_entries": len(config_assignment),
             "source_assignment_entries": len(assignment),
             "fp8_source_passthrough_overrides": sorted(fp8_source_overrides),
-            "runtime_coercions": [
-                {"name": name, "shape": shape, "from": from_fmt, "to": "BF16"}
-                for name, shape, from_fmt in runtime_coerced
-            ],
+            "runtime_coercions": _runtime_coercion_manifest_rows(runtime_coerced),
             "bf16_audit": _bf16_upgrade_audit(
                 args.model,
                 config_assignment,
@@ -7896,25 +9440,34 @@ def main():
             "ignore": sorted(config_bf16_passthrough),
         }, f, indent=2)
 
-    # v25: clear the per-layer cache on successful export. --keep-export-cache
-    # leaves it intact (debugging / comparison). On a failed run the cache
-    # stays anyway since this code wouldn't be reached.
-    if (args.export_cache_dir
-            and not args.keep_export_cache
-            and Path(args.export_cache_dir).exists()):
-        import shutil
-        try:
-            shutil.rmtree(args.export_cache_dir)
-            print(f"[export-stream] removed export cache "
-                  f"{args.export_cache_dir}", flush=True)
-        except Exception as e:
-            print(f"[export-stream] WARN cache cleanup failed: {e!r}",
-                  flush=True)
+    # R13: open the ship record. Build-lane facts are final here; the
+    # serve-lane slots stay empty until the validators and the gold lane fill
+    # them (docs/ARCHITECTURE.md §7.1).
+    try:
+        _write_shipcard(
+            out_dir,
+            source_model=args.model,
+            layer_config_path=args.layer_config,
+            assignment=assignment,
+            config_assignment=config_assignment,
+            hist=hist,
+        )
+    except Exception as e:
+        print(f"[export-stream] WARN shipcard not written: {e!r}", flush=True)
 
-    print(f"[export-stream] done. Serve with:\n"
-          f"  vllm serve {out_dir.resolve()} --quantization compressed-tensors",
-          flush=True)
-
+    budget_attestation = enforce_whole_artifact_budget(
+        out_dir,
+        raw_recipe,
+        where="export_native_compressed",
+        assignment=assignment,
+    )
+    if budget_attestation is not None:
+        print(
+            "[export-stream] whole-artifact budget passed: "
+            f"{budget_attestation['actual_bytes']}B <= "
+            f"{budget_attestation['budget_bytes']}B",
+            flush=True,
+        )
 
 # ---------------------------------------------------------------------------
 # Sharded safetensors writer (mirrors HF transformers' shard layout so
@@ -7961,7 +9514,27 @@ class IncrementalSafetensorsWriter:
         self.tmp_shards: list[tuple[Path, list[str]]] = []
         self.weight_map: dict[str, str] = {}
         self.seen_keys: set[str] = set()
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(self.out_dir):
+            if self.out_dir.is_symlink() or not self.out_dir.is_dir():
+                raise RuntimeError(
+                    f"{self.out_dir}: native shard output must be a real "
+                    "directory, not a file or symlink"
+                )
+        else:
+            self.out_dir.mkdir(parents=True, exist_ok=False)
+        stale_temps = sorted(
+            path.name
+            for path in self.out_dir.iterdir()
+            if re.fullmatch(
+                r"[.]model-[0-9]+[.]safetensors[.]tmp",
+                path.name,
+            ) is not None
+        )
+        if stale_temps:
+            raise RuntimeError(
+                f"{self.out_dir}: refusing preexisting native temporary "
+                f"shard(s) {stale_temps[:12]}; use a fresh output directory"
+            )
 
     @staticmethod
     def _tensor_size(t: torch.Tensor) -> int:
@@ -7994,6 +9567,11 @@ class IncrementalSafetensorsWriter:
             return
         idx = len(self.tmp_shards) + 1
         tmp_path = self.out_dir / f".model-{idx:05d}.safetensors.tmp"
+        if os.path.lexists(tmp_path):
+            raise RuntimeError(
+                f"{tmp_path}: native temporary shard appeared during "
+                "export; refusing to overwrite a concurrent/stale writer"
+            )
         save_file(
             {k: v.contiguous() for k, v in
              _clone_shared_storage_for_safetensors(self.current).items()},
@@ -8010,6 +9588,44 @@ class IncrementalSafetensorsWriter:
         self.current_size = 0
         gc.collect()
 
+    @staticmethod
+    def _is_model_artifact_name(name: str) -> bool:
+        """Files this writer owns and may replace across export attempts."""
+        return (
+            name in {"model.safetensors", "model.safetensors.index.json"}
+            or re.fullmatch(
+                r"model-[0-9]{5}-of-[0-9]{5}\.safetensors", name
+            ) is not None
+        )
+
+    def _remove_stale_model_artifacts(self, planned_names: set[str]) -> None:
+        """Remove only obsolete model containers from an earlier export.
+
+        Tokenizer/config/processor files are intentionally outside this
+        writer's ownership. A directory at a reserved model filename is an
+        error rather than a recursive-delete target.
+        """
+        removed: list[str] = []
+        for path in self.out_dir.iterdir():
+            if (
+                not self._is_model_artifact_name(path.name)
+                or path.name in planned_names
+            ):
+                continue
+            if path.is_dir() and not path.is_symlink():
+                raise RuntimeError(
+                    f"cannot replace stale model artifact {path}: expected a "
+                    "file, found a directory"
+                )
+            path.unlink()
+            removed.append(path.name)
+        if removed:
+            print(
+                "[export-stream] removed stale model artifact(s): "
+                f"{sorted(removed)}",
+                flush=True,
+            )
+
     def finalize(self) -> None:
         self._flush_current()
         if not self.tmp_shards:
@@ -8021,6 +9637,7 @@ class IncrementalSafetensorsWriter:
             os.replace(tmp_path, self.out_dir / final_name)
             for key in keys:
                 self.weight_map[key] = final_name
+            self._remove_stale_model_artifacts({final_name})
             print("[export-stream] finalized single safetensors shard",
                   flush=True)
             return
@@ -8037,6 +9654,9 @@ class IncrementalSafetensorsWriter:
                 "metadata": {"total_size": self.total_size},
                 "weight_map": self.weight_map,
             }, f, indent=2)
+        self._remove_stale_model_artifacts(
+            {"model.safetensors.index.json", *set(self.weight_map.values())}
+        )
         print(f"[export-stream] finalized {n} safetensors shards",
               flush=True)
 
@@ -8122,6 +9742,7 @@ def write_config_with_quantization(
 def _materialize_mtp_tensors(src_model: str,
                              assignment: dict[str, str],
                              *,
+                             profile,
                              bf16_passthrough: set[str],
                              hist: dict,
                              device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
@@ -8130,27 +9751,35 @@ def _materialize_mtp_tensors(src_model: str,
     Transformers v5 does not instantiate MTP modules when loading
     Qwen3.5/3.6 MoE checkpoints (see `_keys_to_ignore_on_load_unexpected`),
     so the streaming decoder-layer sweep never sees any `mtp.*` entry in
-    `assignment`. We build a standalone MTP module, load the source
-    `mtp.*` weights into it, wrap it in a parent module named `mtp` (so
-    qualified names come out as `mtp.fc`, `mtp.layers.0.self_attn.q_proj`,
-    ...), and run the in-memory materialize helper.
+    `assignment`. We ask the model profile to build a standalone MTP
+    module, load the source MTP weights into it (the source prefix is
+    the profile's `mtp_source_prefix()`), wrap it in a parent module
+    named `mtp` (so qualified names come out as `mtp.fc`,
+    `mtp.layers.0.self_attn.q_proj`, ... per `build_mtp_module`'s
+    naming contract), and run the in-memory materialize helper.
 
     Output tensor names match the checkpoint convention (`mtp.fc.*`,
     `mtp.layers.0.<rest>`). vLLM's `qwen3_5_mtp.load_weights` remaps
     `mtp.→model.` at load time.
     """
-    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
     from transformers import AutoConfig
 
     # Build an MTP wrapper with source weights.
     cfg = AutoConfig.from_pretrained(src_model, trust_remote_code=True)
     text_config = getattr(cfg, "text_config", cfg)
-    inner = MtpModule(text_config)
+    inner = profile.build_mtp_module(text_config)
+    if inner is None:
+        raise RuntimeError(
+            f"profile '{profile.name}' declares has_mtp() but "
+            f"build_mtp_module() returned None — MTP tensors cannot be "
+            f"rendered. Either implement build_mtp_module() or take the "
+            f"passthrough route (has_mtp() -> False + "
+            f"source_passthrough_prefixes()).")
     wrapper = nn.Module()
     wrapper.add_module("mtp", inner)
     wrapper.to(dtype=torch.bfloat16)
-    raw = _load_mtp_state_dict(src_model)
-    _load_into_mtp(inner, raw)
+    raw = profile.read_mtp_source_state_dict(src_model)
+    profile.load_mtp_state_dict(inner, raw)
     # Move the whole MTP module to the export device so
     # _materialize_tensors_inmemory's per-linear quant runs on GPU when
     # EXPORT_DEVICE=cuda. Previously defaulted to CPU, costing ~10× on
@@ -8160,7 +9789,8 @@ def _materialize_mtp_tensors(src_model: str,
     for p in wrapper.parameters():
         p.requires_grad_(False)
 
-    # Filter assignment to just `mtp.*` entries.
+    # Filter assignment to just `mtp.*` entries. Recipe-name prefix, not
+    # the source prefix: `build_mtp_module`'s contract fixes it at `mtp.`.
     mtp_assignment = {k: v for k, v in assignment.items() if k.startswith("mtp.")}
     if not mtp_assignment:
         return {}
@@ -8347,6 +9977,54 @@ def _copy_tokenizer(src_model: str, out_dir: Path) -> None:
     for py in src.glob("*.py"):
         shutil.copy2(py, out_dir / py.name)
 
+    # PrismaSnap is an additive source-preparation pass.  Its compact,
+    # self-digested provenance must survive the otherwise unchanged native
+    # exporter so the final shipcard's model hash binds the treatment.  The
+    # absent-source path performs no write and remains byte-for-byte identical
+    # to every pre-PrismaSnap export.
+    snap_path = src / "prismasnap_provenance.json"
+    if os.path.lexists(snap_path):
+        if snap_path.is_symlink() or not snap_path.is_file():
+            raise RuntimeError(
+                f"PrismaSnap provenance is not a regular file: {snap_path}"
+            )
+        try:
+            snap = json.loads(snap_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"PrismaSnap provenance is unreadable: {snap_path}"
+            ) from exc
+        if (
+            not isinstance(snap, dict)
+            or snap.get("schema")
+            not in {
+                "prismaquant.prismasnap.provenance.v1",
+                "prismaquant.prismasnap.provenance.v2",
+            }
+        ):
+            raise RuntimeError(
+                f"PrismaSnap provenance has an unsupported contract: {snap_path}"
+            )
+        from .prismasnap_validation import (
+            validate_prismasnap_checkpoint,
+            validate_prismasnap_provenance_payload,
+        )
+
+        # Export can run for hours.  Replay the index/shard content identity
+        # immediately before the provenance is copied into the staged output;
+        # a source mutation after preflight must abort the transaction.
+        validate_prismasnap_checkpoint(src, require_verified=True)
+
+        validate_prismasnap_provenance_payload(
+            snap,
+            require_verified=True,
+            where=f"native export PrismaSnap provenance {snap_path}",
+        )
+        # This receipt describes the BF16 *source* tree, not the compressed
+        # output shards.  Preserve it under an unambiguous name so the final
+        # artifact never claims its own bytes are the materialized checkpoint.
+        shutil.copy2(snap_path, out_dir / "source_prismasnap_provenance.json")
+
 
 def _source_has_prefixed_weights(src_model: str, prefix: str) -> bool:
     """Return True when the source safetensors index contains any key
@@ -8379,8 +10057,12 @@ def validate_mtp_assignment_coverage(src_model: str,
     """
     if not profile.has_mtp():
         return
-    if not _source_has_prefixed_weights(src_model, "mtp."):
+    src_prefix = profile.mtp_source_prefix()
+    if not src_prefix or not _source_has_prefixed_weights(src_model, src_prefix):
         return
+    # Recipe names are always `mtp.*` — `build_mtp_module`'s contract
+    # wraps the module in a parent named `mtp` regardless of what prefix
+    # the source checkpoint used.
     if any(k.startswith("mtp.") for k in assignment):
         return
     raise RuntimeError(

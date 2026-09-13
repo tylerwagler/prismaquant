@@ -1,0 +1,43 @@
+{
+  "schema": "prismaquant.tessera_serving_runtime_pin.v2",
+  "repository": "https://github.com/RobTand/tessera.git",
+  "commit": "1c827abc4affdd9bed9c6b25af0705480381bf3a",
+  "version": "0.1.0",
+  "version_is_release": false,
+  "contract_sha256": "bafe8a4e9eff8551b34bbd2d7be9c29bf2cfa7bd836724ac9a9ab2f4e0bb922a",
+  "runtime_contract_schema": "tessera.runtime-contract.v1",
+  "plugin_entry_point": "tessera = tessera.serving:register",
+  "serving_residency_env": "TESSERA_SERVE_MODE",
+  "serving_native_extensions": [
+    {
+      "module_name_prefix": "tessera_nvfp4_",
+      "filename_glob": "tessera_nvfp4_*.so",
+      "match": "basename_fnmatch",
+      "when_unavailable": {
+        "resident": {
+          "status": "substituted",
+          "decoder": "torch_materialize_stock"
+        },
+        "streamed": {
+          "status": "refused",
+          "decoder": null
+        }
+      }
+    },
+    {
+      "module_name_prefix": "tessera_window_gemv",
+      "filename_glob": "tessera_window_gemv*.so",
+      "match": "basename_fnmatch",
+      "when_unavailable": {
+        "resident": {
+          "status": "substituted",
+          "decoder": "torch_window"
+        },
+        "streamed": {
+          "status": "substituted",
+          "decoder": "torch_window"
+        }
+      }
+    }
+  ]
+}

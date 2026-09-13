@@ -16,22 +16,37 @@ again.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import pickle
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from prismaquant import format_registry as fr
+from prismaquant.name_projection import strip_weight_leaf
+
+if TYPE_CHECKING:
+    from prismaquant.source_class_format_plan import SourceClassFormatPlan
 
 
 SCHEMA = "prismaquant.production_render_score_cost.v1"
 
 
 def canonical_cost_name(qname: str) -> str:
-    name = str(qname)
-    if name.endswith(".weight"):
-        name = name[:-len(".weight")]
+    """Normalize a producer-recorded qname to the recipe-unit spelling.
+
+    The leaf half is the shared layer's one leaf function
+    (`name_projection.strip_weight_leaf`). The umbrella-infix half mirrors
+    the base profile's checkpoint→live rule (`model.language_model.` →
+    `model.`, `model_profiles/base.py` `checkpoint_to_live_name`) and is
+    deliberately NOT routed through a projection: this module never sees a
+    profile, and a checkpoint/live projection may DECLINE a key (visual,
+    scale siblings) while cost/render payloads legitimately carry rows this
+    normalizer must keep — DSv4's MTP units are costed and keyed under their
+    physical spelling (deepseek_v4 fp8_scale_pairs retains it for the same
+    reason). Total by contract: every input comes back, spelled one way.
+    """
+    name = strip_weight_leaf(str(qname))
     prefix = "model.language_model."
     if name.startswith(prefix):
         name = "model." + name[len(prefix):]
@@ -75,6 +90,136 @@ def _cache_render_score_records(cache: object) -> dict[tuple[str, str], dict]:
     return out
 
 
+def _attested_transient_cb_pairs(cache: object) -> set[tuple[str, str]]:
+    """Validate score-only CB artifacts and return their admitted pair scope.
+
+    A bare ``render_scores`` row is deliberately insufficient.  The transient
+    producer must bind it to the canonical rendered tensor, synchronous
+    consumer result, exact pair identity, and the complete artifact-set digest.
+    """
+    meta = getattr(cache, "metadata", None)
+    if not isinstance(meta, Mapping):
+        return set()
+    transient = meta.get("transient_render_artifacts")
+    if not isinstance(transient, Mapping):
+        return set()
+    records = transient.get("records")
+    consumer_identity = transient.get("consumer_identity")
+    pair_set = meta.get("cb_cache_pair_identity")
+    if (
+        transient.get("schema")
+        != "prismaquant.production_weight_cache.transient_render_artifacts.v1"
+        or not isinstance(records, Mapping)
+        or not isinstance(consumer_identity, Mapping)
+        or not isinstance(pair_set, Mapping)
+    ):
+        raise ValueError("malformed transient CB render artifact manifest")
+
+    from prismaquant.production_weight_cache import (
+        CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA,
+        _canonical_json_sha256,
+        first_identity_difference,
+    )
+
+    if int(transient.get("entries", -1)) != len(records):
+        raise ValueError("transient CB render artifact entry count differs")
+    if int(pair_set.get("published_entries", -1)) != len(records):
+        raise ValueError("transient CB pair publication count differs")
+    observed_artifact_sha256 = _canonical_json_sha256(
+        records,
+        where="transient CB render artifact set",
+    )
+    if pair_set.get("artifact_sha256") != observed_artifact_sha256:
+        raise ValueError("transient CB render artifact set digest differs")
+
+    score_records = _cache_render_score_records(cache)
+    admitted: set[tuple[str, str]] = set()
+    for raw_key, artifact in records.items():
+        if not isinstance(artifact, Mapping):
+            raise ValueError(f"malformed transient CB artifact {raw_key!r}")
+        identity = artifact.get("identity")
+        tensor = artifact.get("tensor")
+        render_score = artifact.get("render_score")
+        receipt = artifact.get("consumer_receipt")
+        if not all(isinstance(value, Mapping) for value in (
+            identity, tensor, render_score, receipt,
+        )):
+            raise ValueError(
+                f"transient CB artifact {raw_key!r} is not value-bearing"
+            )
+        qname = canonical_cost_name(str(identity.get("qname", "")))
+        fmt = fr.canonical_format_name(str(identity.get("format", "")))
+        expected_binding = {
+            "schema": CB_TRANSIENT_CONSUMER_RECEIPT_SCHEMA,
+            "qname": str(identity.get("qname", "")),
+            "format": fmt,
+            "consumer_identity": dict(consumer_identity),
+            "tensor": dict(tensor),
+            "render_score_sha256": _canonical_json_sha256(
+                render_score,
+                where=f"transient CB render score {raw_key}",
+            ),
+        }
+        observed_binding = {
+            field: receipt.get(field) for field in expected_binding
+        }
+        if first_identity_difference(
+            observed_binding,
+            expected_binding,
+            path="consumer_receipt",
+        ) is not None:
+            raise ValueError(
+                f"transient CB consumer receipt differs for {raw_key}"
+            )
+        result = receipt.get("result")
+        if not isinstance(result, Mapping) or receipt.get(
+            "result_sha256"
+        ) != _canonical_json_sha256(
+            result,
+            where=f"transient CB consumer result {raw_key}",
+        ):
+            raise ValueError(
+                f"transient CB consumer result digest differs for {raw_key}"
+            )
+        manifest_score = score_records.get((qname, fmt))
+        if (
+            manifest_score is None
+            or _canonical_json_sha256(
+                manifest_score,
+                where=f"cache render score {raw_key}",
+            )
+            != expected_binding["render_score_sha256"]
+        ):
+            raise ValueError(
+                f"transient CB render score manifest differs for {raw_key}"
+            )
+        admitted.add((qname, fmt))
+    return admitted
+
+
+def _calibration_hashes(*sources: object) -> list[str]:
+    """Union of R14 calibration identities carried by upstream artifacts.
+
+    This module never sees calibration text — its cost comes from render
+    scores the production cache already recorded — so the hash it stamps is
+    inherited from the cache metadata (stamped by ``build_production_cache``)
+    and from the baseline cost payload's meta/provenance. Returns ``[]`` when
+    no upstream stamped one, which keeps the downstream disjointness check
+    inert on pre-R14 artifacts rather than guessing.
+    """
+    found: set[str] = set()
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        single = source.get("calib_hash")
+        if isinstance(single, str) and single:
+            found.add(single)
+        many = source.get("calib_hashes")
+        if isinstance(many, Sequence) and not isinstance(many, (str, bytes)):
+            found.update(str(item) for item in many if item)
+    return sorted(found)
+
+
 def _lookup_record(
     records: Mapping[tuple[str, str], Mapping],
     qname: str,
@@ -97,16 +242,6 @@ def _score_value(record: Mapping, field: str) -> float | None:
     if not math.isfinite(out) or out < 0.0:
         return None
     return out
-
-
-def load_qnames_file(path: str | Path | None) -> set[str] | None:
-    if path is None:
-        return None
-    return {
-        canonical_cost_name(line.strip())
-        for line in Path(path).read_text().splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
 
 
 def _production_cost_entry(
@@ -193,6 +328,97 @@ def _production_cost_entry(
     }
 
 
+def _validated_format_plan_scope(
+    production_cache: object,
+    baseline_costs: Mapping[str, object],
+    output_formats: Sequence[str],
+    format_plan: "SourceClassFormatPlan",
+) -> tuple[dict[str, frozenset[str]], frozenset[str]]:
+    """Bind pricing to the exact source-class plan used by the renderer.
+
+    The format plan partitions only its declared family. Formats outside that
+    family (for example BF16/source terminals or a separately declared family)
+    remain global. Within the planned family, every baseline unit receives
+    exactly its declared menu: no illegal higher-rate cell and no
+    demand-truncated legal rung.
+    """
+    metadata = getattr(production_cache, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            "--format-plan requires cache metadata with a bound plan identity"
+        )
+    expected_identity = str(format_plan.identity_sha256)
+    observed_identity = metadata.get("format_plan_identity_sha256")
+    if observed_identity != expected_identity:
+        raise ValueError(
+            "production cache format-plan identity mismatch: "
+            f"expected={expected_identity!r} observed={observed_identity!r}"
+        )
+
+    scope: dict[str, frozenset[str]] = {}
+    for raw_qname, raw_formats in format_plan.formats_by_qname().items():
+        qname = canonical_cost_name(raw_qname)
+        formats = frozenset(
+            fr.canonical_format_name(str(fmt)) for fmt in raw_formats
+        )
+        previous = scope.setdefault(qname, formats)
+        if previous != formats:
+            raise ValueError(
+                "format plan contains colliding canonical qnames with "
+                f"different menus: {qname}"
+            )
+    planned_universe = frozenset(
+        fmt for formats in scope.values() for fmt in formats
+    )
+    if not planned_universe:
+        raise ValueError("format plan has an empty planned format universe")
+
+    requested_planned = frozenset(
+        fmt for fmt in output_formats if fmt in planned_universe
+    )
+    if requested_planned != planned_universe:
+        raise ValueError(
+            "requested formats truncate the source-class format plan: "
+            f"missing={sorted(planned_universe - requested_planned)}"
+        )
+
+    baseline_names: dict[str, str] = {}
+    for raw_qname in baseline_costs:
+        qname = canonical_cost_name(str(raw_qname))
+        previous = baseline_names.setdefault(qname, str(raw_qname))
+        if previous != str(raw_qname):
+            raise ValueError(
+                "baseline costs contain colliding canonical qnames: "
+                f"{previous!r} and {raw_qname!r}"
+            )
+    missing_baseline = sorted(set(scope) - set(baseline_names))
+    if missing_baseline:
+        raise ValueError(
+            "baseline costs do not cover every format-plan unit; sample="
+            f"{missing_baseline[:8]}"
+        )
+    unplanned_baseline = sorted(set(baseline_names) - set(scope))
+    if unplanned_baseline:
+        raise ValueError(
+            "baseline costs contain units absent from the format plan; "
+            f"sample={unplanned_baseline[:8]}"
+        )
+
+    # Refuse a cache that claims this plan identity but nevertheless recorded
+    # an illegal planned-family render. Ignoring such a row would hide illegal
+    # work and let a future consumer accidentally revive it.
+    for (qname, fmt) in _cache_render_score_records(production_cache):
+        if fmt not in planned_universe:
+            continue
+        allowed = scope.get(qname)
+        if allowed is None or fmt not in allowed:
+            raise ValueError(
+                "production cache contains a render outside its source-class "
+                f"format plan: {qname}@{fmt}"
+            )
+    return scope, planned_universe
+
+
 def synthesize_production_render_cost_payload(
     production_cache: object,
     baseline_cost_payload: Mapping,
@@ -202,11 +428,8 @@ def synthesize_production_render_cost_payload(
     source_label: str | None = None,
     require_render_scores: bool = False,
     require_output_metric: bool = False,
-    missing_render_score_policy: str = "fallback",
-    promotion_qnames: set[str] | None = None,
-    bf16_policy: str = "all",
+    format_plan: "SourceClassFormatPlan | None" = None,
 ) -> dict:
-    records = _cache_render_score_records(production_cache)
     baseline_costs = dict(baseline_cost_payload["costs"])
     output_formats = [
         fr.canonical_format_name(str(fmt))
@@ -218,29 +441,96 @@ def synthesize_production_render_cost_payload(
     ]
     output_formats = list(dict.fromkeys(output_formats))
 
+    planned_scope: dict[str, frozenset[str]] | None = None
+    planned_universe: frozenset[str] = frozenset()
+    if format_plan is not None:
+        planned_scope, planned_universe = _validated_format_plan_scope(
+            production_cache,
+            baseline_costs,
+            output_formats,
+            format_plan,
+        )
+
+    cb_context = None
+    cb_render_provenance: dict[str, object] = {}
+    valid_cb_render_records: set[tuple[str, str]] = set()
+    if any(
+        fr.get_format(fmt).family in {"nvfp4_cb", "fp8_cb"}
+        for fmt in output_formats
+    ):
+        from prismaquant.nvfp4_cb_footprint import validate_cb_cost_provenance
+        from prismaquant.production_weight_cache import (
+            production_cache_cb_render_provenance,
+        )
+
+        cb_render_provenance = production_cache_cb_render_provenance(
+            production_cache,
+            require_for_formats=output_formats,
+            where="production render cost cache",
+        )
+        from prismaquant.nvfp4_cb_footprint import (
+            cb_serialization_context_from_stamp,
+        )
+
+        cb_context = cb_serialization_context_from_stamp(
+            cb_render_provenance["cb_serialized_payload"],
+            where="production render cost cache",
+        )
+        # Fallback rows still come from the baseline table.  Both sources must
+        # describe the same serialized CB artifact before their rows can be
+        # combined under one provenance stamp.
+        validate_cb_cost_provenance(
+            baseline_cost_payload,
+            output_formats,
+            context=cb_context,
+            where="production render baseline cost",
+        )
+        identity_scope = cb_render_provenance[
+            "cb_render_identity"
+        ]["cb_formats_by_qname"]
+        identity_pairs = {
+            (canonical_cost_name(qname), fr.canonical_format_name(fmt))
+            for qname, formats_for_qname in identity_scope.items()
+            for fmt in formats_for_qname
+        }
+        cache_pairs = {
+            (canonical_cost_name(qname), fr.canonical_format_name(fmt))
+            for qname, fmt in (getattr(production_cache, "weights", {}) or {})
+            if fr.get_format(fr.canonical_format_name(fmt)).family
+            in {"nvfp4_cb", "fp8_cb"}
+        }
+        transient_pairs = _attested_transient_cb_pairs(production_cache)
+        # A score is usable only when both the value-bearing identity and an
+        # actual admitted cache tensor cover the row.  This prevents an old
+        # render_scores.json entry (including one left after a failed fresh
+        # render) from being relabeled under today's identity.
+        valid_cb_render_records = identity_pairs & (
+            cache_pairs | transient_pairs
+        )
+
+    records = _cache_render_score_records(production_cache)
+
     output_costs: dict[str, dict[str, dict]] = {}
     render_entries = 0
     fallback_entries = 0
     missing: list[dict[str, str]] = []
     non_output_metric: list[dict[str, str]] = []
+    cb_fallback_scope: dict[str, list[str]] = {}
 
     for qname, per_name_raw in baseline_costs.items():
         cname = canonical_cost_name(str(qname))
         per_name = dict(per_name_raw)
         synthesized: dict[str, dict] = {}
-        for fmt in output_formats:
+        per_qname_formats = output_formats
+        if planned_scope is not None:
+            allowed = planned_scope[cname]
+            per_qname_formats = [
+                fmt for fmt in output_formats
+                if fmt not in planned_universe or fmt in allowed
+            ]
+        for fmt in per_qname_formats:
             fmt_c = fr.canonical_format_name(fmt)
             if fmt_c == "BF16":
-                if (
-                    bf16_policy == "promotion-set"
-                    and promotion_qnames is not None
-                    and cname not in promotion_qnames
-                ):
-                    synthesized[fmt_c] = {
-                        "error": "bf16_not_in_staged_promotion_set",
-                        "cost_source": "unavailable_staged_bf16",
-                    }
-                    continue
                 synthesized[fmt_c] = {
                     "predicted_dloss": 0.0,
                     "weight_mse": 0.0,
@@ -252,6 +542,11 @@ def synthesize_production_render_cost_payload(
                 continue
 
             record = _lookup_record(records, qname, fmt_c)
+            if (
+                fr.get_format(fmt_c).family in {"nvfp4_cb", "fp8_cb"}
+                and (cname, fmt_c) not in valid_cb_render_records
+            ):
+                record = None
             if record is not None:
                 metric = str(record.get("metric", ""))
                 if require_output_metric and metric not in {
@@ -274,13 +569,6 @@ def synthesize_production_render_cost_payload(
                         continue
 
             missing.append({"qname": str(qname), "format": fmt_c})
-            if missing_render_score_policy == "unavailable":
-                synthesized[fmt_c] = {
-                    "error": "missing production render score",
-                    "cost_source": "unavailable_missing_render_score",
-                }
-                fallback_entries += 1
-                continue
             fallback = None
             for alias in fr.aliases_for(fmt_c):
                 if alias in per_name:
@@ -291,6 +579,8 @@ def synthesize_production_render_cost_payload(
             if fallback is None:
                 fallback = {"error": "missing production render score"}
             else:
+                if fr.get_format(fmt_c).family in {"nvfp4_cb", "fp8_cb"}:
+                    cb_fallback_scope.setdefault(str(qname), []).append(fmt_c)
                 fallback["cost_source"] = fallback.get(
                     "cost_source",
                     "fallback_baseline",
@@ -299,7 +589,30 @@ def synthesize_production_render_cost_payload(
             fallback_entries += 1
         output_costs[str(qname)] = synthesized
 
-    if (require_render_scores or missing_render_score_policy == "error") and missing:
+    if cb_fallback_scope:
+        # A context-only match is insufficient: a baseline measured with
+        # imatrix A cannot be relabeled as cache/imatrix B merely because both
+        # used layout v2.  Require value-bearing provenance and compare every
+        # CB row actually consumed as a fallback.
+        from prismaquant.production_weight_cache import (
+            validate_cb_render_provenance,
+            validate_matching_cb_render_identities,
+        )
+
+        _baseline_context, baseline_identity = validate_cb_render_provenance(
+            baseline_cost_payload,
+            expected_context=cb_context,
+            expected_formats_by_qname=cb_fallback_scope,
+            where="production render baseline CB fallback",
+        )
+        validate_matching_cb_render_identities(
+            cb_render_provenance["cb_render_identity"],
+            baseline_identity,
+            cb_fallback_scope,
+            where="production render baseline CB fallback",
+        )
+
+    if require_render_scores and missing:
         sample = ", ".join(
             f"{row['qname']}@{row['format']}" for row in missing[:8]
         )
@@ -316,21 +629,79 @@ def synthesize_production_render_cost_payload(
             f"{len(non_output_metric)} entries; sample={sample}"
         )
 
+    calib_hashes = _calibration_hashes(
+        getattr(production_cache, "metadata", None),
+        baseline_cost_payload.get("meta"),
+        baseline_cost_payload.get("provenance"),
+    )
+    baseline_provenance = baseline_cost_payload.get("provenance")
+    inherited_provenance = (
+        dict(baseline_provenance)
+        if isinstance(baseline_provenance, Mapping)
+        else {}
+    )
+    if cb_context is not None:
+        # The rendered rows came from the cache. Carry the complete persisted
+        # value-bearing identity; reconstructing a fresh stamp here would lose
+        # the exact imatrix qname scope/content binding.
+        inherited_provenance.update(cb_render_provenance)
+    if format_plan is not None:
+        inherited_provenance["source_format_plan_identity_sha256"] = (
+            format_plan.identity_sha256
+        )
+    # Cost/export pair (#147, consumer 2): on the shipping default the AURA
+    # dW cache is built format-menu and the export cache assignment-scoped,
+    # and #135's whole point is that these must be the same rendering. The
+    # priced contract therefore records the hook enumeration it was priced
+    # from, and synthesis refuses a baseline priced from a different
+    # rendering instead of letting the next narrowing regress silently.
+    from prismaquant.production_weight_cache import (
+        ACTIVATION_HOOK_SCOPE_KEY,
+        activation_hook_scope_of,
+        assert_same_activation_hook_scope,
+    )
+
+    cache_hook_scope = activation_hook_scope_of(production_cache)
+    baseline_hook_scope = (
+        activation_hook_scope_of(baseline_provenance)
+        if isinstance(baseline_provenance, Mapping)
+        else None
+    )
+    if cache_hook_scope is not None and baseline_hook_scope is not None:
+        assert_same_activation_hook_scope(
+            baseline_hook_scope,
+            cache_hook_scope,
+            where="production render cost baseline vs production cache",
+        )
+    if baseline_hook_scope is not None and cache_hook_scope is None:
+        raise ValueError(
+            "production render cost baseline records an activation hook "
+            "rendering but the production cache carries no "
+            "activation_hook_scope; cannot prove the same rendering"
+        )
+    if cache_hook_scope is not None:
+        inherited_provenance[ACTIVATION_HOOK_SCOPE_KEY] = cache_hook_scope
     return {
         "schema": SCHEMA,
         "costs": output_costs,
         "formats": output_formats,
+        # The synthesized table consumes the baseline render for every
+        # fallback and the production cache was built under the same guarded
+        # stage settings. Preserve the CB serialization identity so the
+        # allocator can reject an unknown/stale v1-v2 cache.
+        "provenance": inherited_provenance,
         "meta": {
+            # R14: inherited calibration identity — see _calibration_hashes.
+            "calib_hashes": calib_hashes,
+            "calib_hash": calib_hashes[0] if len(calib_hashes) == 1 else None,
             "production_cache_source": source_label,
             "baseline_schema": baseline_cost_payload.get("schema"),
             "baseline_meta": baseline_cost_payload.get("meta"),
-            "score_field": score_field,
-            "missing_render_score_policy": missing_render_score_policy,
-            "bf16_policy": bf16_policy,
-            "promotion_qnames": (
-                int(len(promotion_qnames))
-                if promotion_qnames is not None else None
+            "source_format_plan_identity_sha256": (
+                format_plan.identity_sha256
+                if format_plan is not None else None
             ),
+            "score_field": score_field,
             "render_score_entries": int(render_entries),
             "fallback_entries": int(fallback_entries),
             "available_render_scores": int(len(records)),
@@ -344,70 +715,6 @@ def synthesize_production_render_cost_payload(
     }
 
 
-def select_tail_from_render_scores(
-    production_cache: object,
-    *,
-    fmt: str = "NVFP4",
-    score_field: str = "score_sum",
-    top_fraction: float = 0.30,
-    min_score: float | None = None,
-    min_count: int = 1,
-    max_count: int | None = None,
-) -> tuple[list[str], dict[str, object]]:
-    records = _cache_render_score_records(production_cache)
-    fmt_c = fr.canonical_format_name(fmt)
-    rows: list[tuple[str, float]] = []
-    skipped = 0
-    for (qname, record_fmt), record in records.items():
-        if fr.canonical_format_name(record_fmt) != fmt_c:
-            continue
-        score = _score_value(record, score_field)
-        if score is None:
-            skipped += 1
-            continue
-        rows.append((qname, score))
-    rows.sort(key=lambda item: item[1], reverse=True)
-    if not rows:
-        return [], {
-            "format": fmt_c,
-            "score_field": score_field,
-            "available": 0,
-            "selected": 0,
-            "skipped": int(skipped),
-        }
-
-    frac = max(0.0, min(1.0, float(top_fraction)))
-    target = max(int(math.ceil(len(rows) * frac)), int(min_count))
-    if max_count is not None and max_count > 0:
-        target = min(target, int(max_count))
-    selected_rows = rows[:target]
-    if min_score is not None:
-        selected_rows = [
-            row for row in selected_rows
-            if float(row[1]) >= float(min_score)
-        ]
-    selected = [qname for qname, _score in selected_rows]
-    scores = [score for _qname, score in rows]
-    summary = {
-        "format": fmt_c,
-        "score_field": score_field,
-        "available": int(len(rows)),
-        "selected": int(len(selected)),
-        "skipped": int(skipped),
-        "top_fraction": float(frac),
-        "min_score": min_score,
-        "min_count": int(min_count),
-        "max_count": max_count,
-        "threshold_score": (
-            float(selected_rows[-1][1]) if selected_rows else None
-        ),
-        "max_score": float(scores[0]),
-        "min_score_available": float(scores[-1]),
-        "selected_qnames_sample": selected[:8],
-    }
-    return selected, summary
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Synthesize allocator costs from ProductionWeightCache render scores",
@@ -415,10 +722,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--production-cache", required=True)
     parser.add_argument("--baseline-cost", default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--cost-mode", default="",
+                        help="Pipeline COST_MODE stamped into "
+                             "provenance['cost_mode'] (re-vet R2).")
     parser.add_argument(
         "--formats",
         default=None,
         help="Comma-separated formats. Defaults to baseline cost formats.",
+    )
+    parser.add_argument(
+        "--format-plan",
+        default=None,
+        help="Identity-bound source-class format plan used to build the "
+        "production cache. Planned-family rows are priced only within each "
+        "qname's exact legal menu; identity drift and truncation are fatal.",
     )
     parser.add_argument(
         "--score-field",
@@ -445,76 +762,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Fail if any consumed render score is a weight_mse fallback "
         "instead of output_mse/fisher_output_mse.",
     )
-    parser.add_argument(
-        "--missing-render-score-policy",
-        choices=("fallback", "unavailable", "error"),
-        default="fallback",
-        help="How to handle non-BF16 formats without production render "
-        "scores. staged mode should use unavailable so unmeasured promotions "
-        "do not fall back to proxy costs.",
-    )
-    parser.add_argument(
-        "--promotion-qnames-file",
-        default=None,
-        help="Optional qname allowlist for staged promotions. Used with "
-        "--bf16-policy=promotion-set.",
-    )
-    parser.add_argument(
-        "--bf16-policy",
-        choices=("all", "promotion-set"),
-        default="all",
-        help="Whether BF16 is available for every qname or only qnames listed "
-        "in --promotion-qnames-file.",
-    )
-    parser.add_argument(
-        "--select-tail-output",
-        default=None,
-        help="Write a newline-delimited high-error qname tail selected from "
-        "the input production cache.",
-    )
-    parser.add_argument("--select-tail-summary", default=None)
-    parser.add_argument("--select-tail-format", default="NVFP4")
-    parser.add_argument("--select-tail-top-fraction", type=float, default=0.30)
-    parser.add_argument("--select-tail-min-score", type=float, default=None)
-    parser.add_argument("--select-tail-min-count", type=int, default=1)
-    parser.add_argument("--select-tail-max-count", type=int, default=None)
     args = parser.parse_args(argv)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("production_render_cost")
 
+    # The staged (two-pass NVFP4-then-promote) surface — --select-tail-*,
+    # --promotion-qnames-file, --bf16-policy, --missing-render-score-policy —
+    # was walled 2026-07-30 with COST_MODE=production-render-staged
+    # (re-vet R17). See archive/production_render_staged_2026-07-30/.
     cache = _load_pickle(args.production_cache)
-    if args.select_tail_output:
-        selected, summary = select_tail_from_render_scores(
-            cache,
-            fmt=args.select_tail_format,
-            score_field=args.score_field,
-            top_fraction=args.select_tail_top_fraction,
-            min_score=args.select_tail_min_score,
-            min_count=args.select_tail_min_count,
-            max_count=args.select_tail_max_count,
-        )
-        tail_path = Path(args.select_tail_output)
-        tail_path.parent.mkdir(parents=True, exist_ok=True)
-        tail_path.write_text("".join(f"{qname}\n" for qname in selected))
-        print(
-            f"[production-render-cost] selected {len(selected)} "
-            f"{args.select_tail_format} high-error qnames -> {tail_path}",
-            flush=True,
-        )
-        if args.select_tail_summary:
-            summary_path = Path(args.select_tail_summary)
-            summary_path.parent.mkdir(parents=True, exist_ok=True)
-            summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
-        if not args.output:
-            return 0
-
     if not args.baseline_cost:
-        raise SystemExit("--baseline-cost is required when writing --output")
+        raise SystemExit("--baseline-cost is required")
     if not args.output:
-        raise SystemExit("--output is required unless only selecting a tail")
+        raise SystemExit("--output is required")
     baseline = _load_pickle(args.baseline_cost)
     formats = (
         [fmt.strip() for fmt in args.formats.split(",") if fmt.strip()]
         if args.formats else None
     )
+    format_plan = None
+    if args.format_plan:
+        from prismaquant.source_class_format_plan import load_format_plan
+
+        format_plan = load_format_plan(args.format_plan)
     payload = synthesize_production_render_cost_payload(
         cache,
         baseline,
@@ -523,10 +793,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_label=str(args.production_cache),
         require_render_scores=bool(args.require_render_scores),
         require_output_metric=bool(args.require_output_metric),
-        missing_render_score_policy=str(args.missing_render_score_policy),
-        promotion_qnames=load_qnames_file(args.promotion_qnames_file),
-        bf16_policy=str(args.bf16_policy),
+        format_plan=format_plan,
     )
+    # Stamp the pipeline COST_MODE (re-vet R2 precondition (i)): cost.pkl is
+    # the same path under every mode, so reuse must be conditional on it.
+    prov = dict(payload.get("provenance") or {})
+    prov["cost_mode"] = str(args.cost_mode or "")
+    payload["provenance"] = prov
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as fh:

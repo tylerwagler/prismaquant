@@ -2,23 +2,516 @@
 from __future__ import annotations
 
 import json
+import math
+import operator
 import os
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .lane_eligibility import ServingContext
 
 from . import format_registry as fr
-from .allocator_solver import Candidate, _shape_from_stats, predicted_dloss
+from .activation_fair_pricing import (
+    APPLIED_MARKER_KEY,
+    BRANCH_ACTIVATION_IDENTITY,
+    BRANCH_BIT_EXACT,
+    BRANCH_CALIBRATED,
+    BRANCH_INTERPOLATED_OUTPUT,
+    BRANCH_MEASURED,
+    BRANCH_SOURCE_PASSTHROUGH,
+    BRANCH_UNCALIBRATED,
+    ActivationFairPricing,
+    CalibrationRow,
+)
+from .activation_fair_pricing import calibrate as _calibrate_activation_pricing
+from .allocator_solver import (
+    Candidate,
+    PackedExpertRoleUnknown,
+    _shape_from_stats,
+    predicted_dloss,
+)
+from .nvfp4_cb_footprint import (
+    CBSerializationContext,
+    cb_breakdown_identity_is_materialized,
+    is_cb_format,
+)
+from .footprint import (
+    format_tensor_payload_breakdown,
+    plain_source_dtype_tensor_payload_breakdown,
+)
+# ``trellis_menu`` stood here on the PR's base and does not follow it in: the
+# Gridbook trellis rate surface was archived on 2026-09-02 and this file's
+# reference to it is now a refusal, not a call.
+from .name_projection import (
+    MAPPED,
+    NameProjection,
+)
 from .serving_profiles import (
+    SERVING_LANE_SCHEMA,
     check_serving_format,
     check_serving_shape,
+    serving_runtime_version,
+    serving_lane_route,
 )
 
+# The provenance string a source-passthrough candidate carries in place of a
+# measured cost. It is NOT an estimator name like ``output_mse`` or
+# ``weight_mse``: it says the row was never measured because there is nothing
+# to measure.
+SOURCE_PASSTHROUGH_COST_SOURCE = "source_passthrough"
 
-PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
-    "FP8_SOURCE": "fp8",
-    "BF16": "bf16",
+# ---------------------------------------------------------------------------
+# Anchored-AURA supersurrogate admission (P0)
+#
+# ``anchored_cost`` prices a whole menu from one production-arm render per
+# unit: ``cost(i,K) = predicted_dloss(i,K̂) x [g(K)/g(K̂)]``. Those rows are a
+# distinct provenance from every other weight-only row the allocator reads,
+# and the three stamps below are what identify them. Defined HERE, not in
+# ``anchored_cost``, because that module imports this one — one definition,
+# no cycle.
+ANCHORED_AURA_COST_CURRENCY = "aura_predicted_dloss"
+ANCHORED_AURA_COST_SOURCE = "production_arm_render"
+# The activation-pricing branch label such a row is stamped with.
+ANCHORED_AURA_BRANCH = "anchored_aura_extrapolation"
+
+# The allocator has an explicit branch for anchored-AURA rows: it reads
+# ``predicted_dloss`` directly, keeps them out of the P5a calibration sample,
+# and admits a measured zero instead of removing it as
+# ``activation_cost_unmeasured``.
+#
+# ⚠ WHAT THIS FLAG DOES **NOT** CLAIM. "Supersurrogate" is a statement about
+# the CURRENCY — one KL-adjoint projection replaced the two-factor magnitude
+# score (``h_trace x output_mse`` / ``h_trace x cw_m2``) that preceded it. It
+# is NOT a claim that AURA models activation-QUANTIZATION error. It does not:
+# ``aura_cost.py`` runs its adjoint on unquantized boundary activations and
+# ``dW`` is a weight delta, so no A-side error enters. AURA is
+# activation-WEIGHTED (``gW`` carries X — that is the alignment term its win
+# lives in) and activation-quantization-BLIND. See
+# ``cost_entry_is_anchored_aura_supersurrogate`` for the standing limitation
+# this leaves open, and why it is reported rather than gated.
+AURA_SUPERSURROGATE_ALLOCATOR_SEMANTICS = True
+
+# Serving-route token for a passthrough whose bytes the model's OWN loader
+# consumes, with no Gridbook codec in the path.
+ROUTE_DELEGATED_NATIVE = "delegated_native"
+# The name of the route that USED to execute a raw-resident block-128 source
+# plane: Gridbook's ``Fp8SourceW8A16LinearMethod``, which consumed BF16
+# activations unchanged.  The lane was retired on 2026-09-02
+# (archive/gridbook_lane_2026-09-02/) and this constant is kept BECAUSE it is
+# retired: it is the ``serving_route`` on the FP8_BLOCK_UE8M0_SOURCE row below,
+# whose ``route_status`` is now BLOCKED, and that row's whole job is to say
+# which route died. Renaming it to something lane-neutral would erase the scope
+# of the measurement the row carries (principle 14's corollary: a recorded
+# capability claim inherits the scope of the artifact it was measured on).
+#
+# ``ROUTE_GRIDBOOK_MXFP8_DENSE = "gridbook_mxfp8_dense"`` sat here until
+# 2026-09-02.  It named ``Mxfp8DenseLinearMethod`` and had no reader anywhere
+# in the tree -- no contract row, no test, no consumer of the string -- so it
+# was a dangling name rather than a record of anything, and it is deleted
+# rather than archived.
+ROUTE_GRIDBOOK_FP8_SOURCE_W8A16 = "gridbook_fp8_source_w8a16"
+
+# What a MEASUREMENT says about serving a passthrough's bytes. These are
+# verdicts from a real serve attempt on real hardware, not design intent —
+# which matters, because on DSv4-Flash/GB10 the measured answers came out the
+# OPPOSITE way round from the obvious guess.
+ROUTE_STATUS_BACKED = "backed"          # measured serving, possibly with a requirement
+ROUTE_STATUS_PENDING = "pending"        # no verdict yet; unaudited
+ROUTE_STATUS_BLOCKED = "blocked"        # measured, every known route dead
+
+
+@dataclass(frozen=True)
+class SourcePassthroughContract:
+    """One native source format the producer can ship back UNCHANGED.
+
+    Keeping a native source format always preserves its stored weight plane;
+    it is an allocator option only when the serving activation contract is
+    also priced honestly. This table records the source/storage contract, one
+    entry per
+    (source format, unit contract) the census finds, so adding a newly
+    encountered native format is a data change rather than a new code path.
+
+    Fields:
+      ``source_kind``  the token ``_scan_source_dtype_manifest`` stamps on a
+        unit whose stored bytes ARE this format. It is the whole legality
+        gate: the format is legal exactly where the source already is it, in
+        both directions — BF16 is masked on mxfp4 experts and MXFP4_SOURCE is
+        masked on the bf16 embedding by the identical rule.
+      ``zero_cost_by_construction`` whether the allocator SYNTHESIZES the
+        candidate rather than requiring a cost-table column. True for formats
+        no cost run will ever have a column for.
+      ``serving_route``  the P5b lane route id.
+      ``wire_format_id``  the closed-enum spelling the artifact declares and
+        the serving side reads (quant_config.json ``source_passthrough``).
+        Distinct from ``format_name``: the producer's registry name is ours to
+        rename, the wire id is a cross-repo contract.
+      ``route_status``  what a MEASUREMENT says about serving these bytes, per
+        ``ROUTE_STATUS_*``. Route status alone never removes an honestly
+        priced rung from the menu — an allocator that wants an unservable
+        passthrough is reporting a serving gap — but anything other than
+        ``backed`` makes export fail closed without an explicit override.
+        This is orthogonal to cost admission: a terminal whose activation-side
+        loss has no currency must stay out of that allocator campaign even if
+        the serving route itself exists.
+      ``route_requirement``  the serving-side condition that makes a BACKED
+        route actually fire (e.g. a non-default vLLM MoE backend). Belongs in
+        the artifact's serving notes; a backed route with an unmet
+        requirement serves no better than a blocked one.
+      ``route_evidence``  what was measured, and on what hardware. A route
+        verdict without its evidence is a rumour.
+      ``detail``  why this entry exists, for the mask/provenance records.
+    """
+
+    format_name: str
+    source_kind: str
+    zero_cost_by_construction: bool
+    serving_route: str
+    route_status: str
+    detail: str
+    wire_format_id: str | None = None
+    route_requirement: str | None = None
+    route_evidence: str | None = None
+
+    @property
+    def route_backed(self) -> bool:
+        """Whether a serve route for these bytes is known to exist."""
+        return self.route_status == ROUTE_STATUS_BACKED
+
+
+SOURCE_PASSTHROUGH_CONTRACTS: dict[str, SourcePassthroughContract] = {
+    contract.format_name: contract
+    for contract in (
+        # Legacy DeepSeek-V3 / MiniMax block-FP8: FP32 ``weight_scale_inv``.
+        # Serves through stock compressed-tensors block-fp8 today.
+        SourcePassthroughContract(
+            format_name="FP8_SOURCE",
+            source_kind="fp8",
+            zero_cost_by_construction=False,
+            serving_route=f"{ROUTE_DELEGATED_NATIVE}_fp8_block",
+            route_status=ROUTE_STATUS_BACKED,
+            detail=(
+                "native block-FP8 with an FP32 weight_scale_inv plane; the "
+                "cost pipeline emits real rows for it, so its candidate is "
+                "not synthesized"
+            ),
+            route_evidence=(
+                "stock compressed-tensors block-fp8; served on the "
+                "checkpoints this format was written for (MiniMax M2, "
+                "DeepSeek-V3)"
+            ),
+        ),
+        # DeepSeek-V3.1/V4 block-FP8: one-byte UE8M0 block exponents. Same
+        # element grid as FP8_SOURCE, different scale plane and different
+        # byte count — see the FormatSpec comment.
+        SourcePassthroughContract(
+            format_name="FP8_BLOCK_UE8M0_SOURCE",
+            source_kind="fp8_ue8m0",
+            wire_format_id="fp8_e4m3_ue8m0_block128",
+            zero_cost_by_construction=True,
+            serving_route=ROUTE_GRIDBOOK_FP8_SOURCE_W8A16,
+            # BLOCKED since 2026-09-02, and by a measurement rather than by an
+            # opinion: the only route that ever executed these bytes was the
+            # Gridbook plugin's Fp8SourceW8A16LinearMethod, and that lane was
+            # retired (archive/gridbook_lane_2026-09-02/). No sanctioned
+            # runtime -- vanilla vLLM, llama.cpp/vLLM-GGUF, the Tessera plugin
+            # -- reads a block-128 UE8M0 source plane. The rung stays PRICED
+            # (principle 1: an allocator that wants it is reporting a serving
+            # gap, and that signal is the point) and the exporter now refuses
+            # a selection containing it without an explicit override, via
+            # ROUTE_PENDING_PASSTHROUGH_FORMATS. The evidence below is kept
+            # verbatim because it is a real measurement whose SCOPE is the
+            # retired runtime -- it says what was true, not what is.
+            route_status=ROUTE_STATUS_BLOCKED,
+            route_requirement=(
+                "a Gridbook release attesting "
+                "abi_features.source_fp8_block128_w8a16=1; first released in "
+                "0.8.5 commit e992e5980c96333a48149f96392d6cff56ae9e3f under "
+                "runtime-contract v3, carried unchanged by 0.8.11 under v4, "
+                "and carried unchanged again by the currently pinned 0.9.1 "
+                "commit 227420f9821bab7089632ee914f0ba050f82b817 under v12 "
+                "(the two packaged contracts' abi_features maps are equal; "
+                "v12 changes formats and adds lane_eligibility, not this)"
+            ),
+            detail=(
+                "block-FP8 with UE8M0 block exponents, consumed by "
+                "Gridbook's dedicated Fp8SourceW8A16LinearMethod. Both "
+                "source planes stay resident and byte-verbatim and BF16 "
+                "activations are unchanged. The numerical terminal is exact "
+                "by construction. Full-artifact served parity remains a "
+                "separate ship gate, not an exporter route override."
+            ),
+            route_evidence=(
+                "measured on Gridbook 0.8.5 commit "
+                "e992e5980c96333a48149f96392d6cff56ae9e3f; "
+                "installed-wheel GPU gate on GB10/sm121: 91 passed, 0 skipped. "
+                "Fp8SourceW8A16LinearMethod keeps raw E4M3/UE8M0 planes "
+                "resident, dispatches decode to native GEMV and prefill to "
+                "the owned grouped BF16 CUTLASS bridge, and attests the exact "
+                "JIT extension identity/capability. Carried forward to the "
+                "pinned 0.9.1 on the packaged contract's unchanged "
+                "source_fp8_block128_w8a16 attestation; the GPU gate has not "
+                "been re-run on 0.8.11 or on 0.9.1, so the measurement's scope "
+                "is still 0.8.5 and this row says so rather than inheriting a "
+                "claim it did not make."
+            ),
+        ),
+        # DeepSeek-V4 routed experts: nibble-packed E2M1 + E8M0 group scales.
+        SourcePassthroughContract(
+            format_name="MXFP4_SOURCE",
+            source_kind="mxfp4",
+            wire_format_id="mxfp4_e2m1_ue8m0_g32",
+            zero_cost_by_construction=True,
+            serving_route=f"{ROUTE_DELEGATED_NATIVE}_mxfp4",
+            route_status=ROUTE_STATUS_BACKED,
+            route_requirement="vllm --moe-backend marlin",
+            detail=(
+                "native packed MXFP4 routed experts, served by the model's "
+                "own path rather than a codebook decoder. BACKED, but only "
+                "off the default: the auto-selected backend is broken on our "
+                "target, so the requirement below is part of the contract, "
+                "not a tuning hint."
+            ),
+            route_evidence=(
+                "sm121 measured 2026-08-03: native-confirmed via vLLM Marlin "
+                "MoE (--moe-backend marlin). The AUTO default DeepGEMM_MXFP4 "
+                "asserts on the SF transformation; FlashInfer is gated to "
+                "capability family 100; the OAI Triton path is hard-excluded "
+                "on SM12x (0/15 kernels)."
+            ),
+        ),
+        # Unquantized passthrough. Not a "source format" in the census sense,
+        # but it obeys the same rule and predates this table.
+        SourcePassthroughContract(
+            format_name="BF16",
+            source_kind="bf16",
+            zero_cost_by_construction=False,
+            serving_route=f"{ROUTE_DELEGATED_NATIVE}_bf16",
+            route_status=ROUTE_STATUS_BACKED,
+            detail="unquantized passthrough on a bf16 source",
+            route_evidence="plain container floats; no kernel required",
+        ),
+    )
 }
+
+# Kept as the flat {format: required_kind} view every existing consumer
+# (allocator promotion legality, export defensive checks, the visual
+# passthrough contract) already imports. DERIVED from the table above so a new
+# census format cannot be legal in one place and unknown in the other.
+PASSTHROUGH_SOURCE_REQUIREMENTS: dict[str, str] = {
+    name: contract.source_kind
+    for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+}
+
+# An allocator candidate may never carry more serialized tensor payload than
+# the representation already stored for that unit.  Source kinds are resolved
+# through the passthrough contracts rather than through a numeric bpp table:
+# the registered source FormatSpec owns the exact weight/scale footprint.
+SOURCE_BPP_EXCEEDED_REASON = "candidate_exceeds_source_bpp"
+SOURCE_BPP_UNKNOWN_REASON = "source_bpp_unknown"
+SOURCE_BPP_POLICY_SCHEMA = "prismaquant.source_bpp_legality.v1"
+
+_source_kinds = [
+    contract.source_kind
+    for contract in SOURCE_PASSTHROUGH_CONTRACTS.values()
+]
+if len(set(_source_kinds)) != len(_source_kinds):
+    duplicates = sorted(
+        kind for kind, count in Counter(_source_kinds).items() if count > 1
+    )
+    raise RuntimeError(
+        "SOURCE_PASSTHROUGH_CONTRACTS has ambiguous source footprint "
+        f"owners for source kinds {duplicates}"
+    )
+SOURCE_FORMAT_BY_KIND: dict[str, str] = {
+    contract.source_kind: name
+    for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+}
+
+
+@dataclass(frozen=True)
+class SourceFootprintOwner:
+    """Exact source-payload authority selected by a census kind."""
+
+    source_kind: str
+    format_name: str | None = None
+    safetensors_dtype: str | None = None
+
+
+def source_footprint_owner_for_kind(
+    source_kind: str,
+) -> SourceFootprintOwner | None:
+    """Resolve special scaled formats or an ordinary safetensors dtype.
+
+    Scale-bearing native formats are owned by their registered producer
+    ``FormatSpec``.  Every other supported dtype is derived through
+    ``footprint``'s safetensors storage-width authority.  Sentinels such as
+    ``unknown``/``heterogeneous`` have neither owner and therefore fail closed.
+    """
+    kind = str(source_kind)
+    format_name = SOURCE_FORMAT_BY_KIND.get(kind)
+    if format_name is not None:
+        return SourceFootprintOwner(kind, format_name=format_name)
+    try:
+        item = plain_source_dtype_tensor_payload_breakdown(kind, (1,))
+    except ValueError:
+        return None
+    return SourceFootprintOwner(
+        kind,
+        safetensors_dtype=str(item["source_dtype"]),
+    )
+
+
+def source_format_for_kind(source_kind: str) -> fr.FormatSpec | None:
+    """Resolve a census source kind to its registered footprint owner.
+
+    ``SOURCE_FORMAT_BY_KIND`` is derived from
+    ``SOURCE_PASSTHROUGH_CONTRACTS`` and validated one-to-one at import time.
+    Adding a future source representation to that contract table automatically
+    subjects every candidate to its exact registered footprint; there is no
+    parallel numeric source-bpp lookup to update or drift.
+    """
+    owner = source_footprint_owner_for_kind(source_kind)
+    if owner is None or owner.format_name is None:
+        return None
+    return fr.get_format(owner.format_name)
+
+# Passthrough formats whose Δloss is EXACT BY CONSTRUCTION, so the allocator
+# synthesizes their candidate instead of requiring a cost-table column.
+#
+# Every cost in this pipeline is measured against the DEQUANTIZED SOURCE. A
+# format that ships the source bytes UNCHANGED is therefore the identity
+# transform on the reference: its Δloss is 0.0 as a matter of arithmetic, not
+# of measurement, and no cost run can ever produce a more accurate number for
+# it. FP8_SOURCE and BF16 are deliberately NOT members: the cost pipeline
+# already emits real rows for them on the checkpoints where they are legal,
+# and synthesizing over a table that has an entry would hide a disagreement.
+# A byte-copy contract belongs here only when BOTH its W and A paths are the
+# identity. ``FP8_BLOCK_UE8M0_SOURCE`` qualifies because its contract declares
+# exactly that (resident E4M3 + UE8M0 planes, BF16 activations unchanged);
+# whether any runtime serves it is a separate fact, and since the Gridbook
+# lane's retirement (2026-09-02) none does -- its row below is
+# ``ROUTE_STATUS_BLOCKED`` and stays fail-closed independently of membership.
+#
+# Membership is not self-certifying: ``cost_entry_is_source_passthrough``
+# additionally requires the format to be a registered passthrough format whose
+# activation path is the identity, so a stray ``cost_source`` string in a
+# hand-written table cannot claim exactness for an activation-quantizing rung.
+SOURCE_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
+    name for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+    if contract.zero_cost_by_construction
+)
+
+# Passthrough formats with no DEMONSTRATED serve route on the target — either
+# unaudited (pending) or measured dead (blocked). An otherwise honestly priced
+# candidate remains useful serving-gap evidence, but the exporter refuses to
+# ship a selection containing one without an explicit override.  This set does
+# not override independent cost-currency admission for activation-changing
+# re-quantization routes such as direct G32 MXFP8 W8A8; the raw block-128
+# source route is W8A16 and preserves A.
+ROUTE_PENDING_PASSTHROUGH_FORMATS: frozenset[str] = frozenset(
+    name for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+    if not contract.route_backed
+)
+
+# The closed wire enum the artifact declares and the serving side reads
+# (quant_config.json "source_passthrough"). Registry names are ours to rename;
+# these are a cross-repo contract, so they are declared once here and the
+# exporter maps through this table rather than spelling them again.
+PASSTHROUGH_WIRE_FORMAT_IDS: dict[str, str] = {
+    name: contract.wire_format_id
+    for name, contract in SOURCE_PASSTHROUGH_CONTRACTS.items()
+    if contract.wire_format_id is not None
+}
+
+# The same cross-repo wire enum, for formats this producer RE-ENCODES rather
+# than copies. Kept as its own table beside the passthrough ids rather than
+# folded into SOURCE_PASSTHROUGH_CONTRACTS, because that table means something
+# specific and load-bearing: every member copies the source WEIGHT payload
+# exactly and is source-kind gated. End-to-end Δloss is zero only for the
+# derived ``SOURCE_PASSTHROUGH_FORMATS`` subset whose activation path is also
+# identity. A re-quantization rung has a real weight encoder, so declaring it
+# here would still falsely claim byte-copy provenance
+# (tests/test_source_passthrough_family.py pins that invariant).
+#
+# What the two tables DO share is that the id is a contract with the consumer:
+# the registry name is ours to rename, the wire id is not.
+#
+# NOTE FOR ORCHESTRATOR RECONCILIATION: ``mxfp8_e4m3_e8m0_g32`` is the
+# spelling the Gridbook consumer side proposed before the lane's retirement
+# (2026-09-02; the wire id is kept as the persisted spelling). It diverges from this repo's
+# own convention, which spells the unsigned-E8M0 scale plane ``ue8m0``
+# (``mxfp4_e2m1_ue8m0_g32``, ``fp8_e4m3_ue8m0_block128``). The consumer's
+# spelling is used verbatim here rather than guessed at; if the two repos
+# settle on ``mxfp8_e4m3_ue8m0_g32`` instead, this one string is the only
+# producer-side edit.
+REQUANT_WIRE_FORMAT_IDS: dict[str, str] = {
+    "MXFP8_UE8M0_G32": "mxfp8_e4m3_e8m0_g32",
+}
+
+# Every wire id this producer can declare, from either table. Ids must be
+# globally unique: the consumer dispatches on the id alone and cannot tell
+# which producer-side table it came from.
+WIRE_FORMAT_IDS: dict[str, str] = {
+    **PASSTHROUGH_WIRE_FORMAT_IDS,
+    **REQUANT_WIRE_FORMAT_IDS,
+}
+
+
+def passthrough_serving_notes() -> dict[str, dict[str, str]]:
+    """Per-format serving requirements/evidence for the artifact's notes.
+
+    A BACKED route with an unmet requirement serves no better than a blocked
+    one, so the requirement travels with the artifact rather than living in a
+    run book.
+    """
+    return {
+        name: {
+            key: value
+            for key, value in (
+                ("route_status", contract.route_status),
+                ("route", contract.serving_route),
+                ("requirement", contract.route_requirement),
+                ("evidence", contract.route_evidence),
+            )
+            if value is not None
+        }
+        for name, contract in sorted(SOURCE_PASSTHROUGH_CONTRACTS.items())
+    }
+
+
+def serialized_candidate_payload(
+    spec: fr.FormatSpec,
+    shape: tuple[int, ...],
+    *,
+    qname: str,
+    cb_serialization_context: CBSerializationContext | None,
+) -> tuple[int, str | None, str | None]:
+    """Return producer payload bytes + identity for one candidate tensor.
+
+    A CB FormatSpec intentionally describes only the historical nominal body;
+    it cannot encode layout-v1/v2, FP8 row scales, or shared codebook identity.
+    Those formats must use the versioned producer accountant.  Refusing a
+    missing context prevents an old ``4k+16`` estimate from silently leaking
+    back into a production-v2 allocation.
+    """
+    item = format_tensor_payload_breakdown(
+        spec,
+        shape,
+        qname=qname,
+        cb_serialization_context=cb_serialization_context,
+    )
+    return (
+        int(item["tensor_payload_bytes"]),
+        (str(item["identity_key"])
+         if item.get("identity_key") is not None else None),
+        (str(item["sidecar_identity_key"])
+         if item.get("sidecar_identity_key") is not None else None),
+    )
+
 
 def _is_passthrough_format(format_name: str) -> bool:
     return format_name in PASSTHROUGH_SOURCE_REQUIREMENTS
@@ -41,14 +534,146 @@ class FormatApplicability:
     legal: bool
     reason: str | None = None
     detail: str = ""
+    provenance: dict[str, object] | None = None
+
+
+def _source_bpp_applicability(
+    shape: tuple[int, ...],
+    spec: fr.FormatSpec,
+    *,
+    qname: str,
+    source_kind: str | None,
+    cb_serialization_context: CBSerializationContext | None,
+) -> FormatApplicability:
+    """Apply the exact candidate-payload <= source-payload legality rule.
+
+    Both payloads describe the same shape, so comparing their integer byte
+    counts is exactly equivalent to comparing bpp and cannot accidentally
+    admit a candidate through a floating-point tolerance.  ``None`` means the
+    caller supplied no source census at all (legacy/offline analysis); an
+    explicit but unrecognized census kind fails closed.
+    """
+    if source_kind is None:
+        return FormatApplicability(True)
+    source_owner = source_footprint_owner_for_kind(source_kind)
+    if source_owner is None:
+        provenance = {
+            "policy_schema": SOURCE_BPP_POLICY_SCHEMA,
+            "source_kind": str(source_kind),
+            "candidate_format": fr.canonical_format_name(spec.name),
+            "comparison": "candidate_payload_bytes <= source_payload_bytes",
+        }
+        return FormatApplicability(
+            False,
+            SOURCE_BPP_UNKNOWN_REASON,
+            f"{qname}: source_kind={source_kind!r} has no exact source "
+            "footprint owner (registered scaled format or safetensors dtype); "
+            "refusing to admit a candidate whose source bpp cannot be derived",
+            provenance,
+        )
+
+    # Structural-only callers historically use this helper without a CB
+    # producer context.  They cannot price a versioned CB layout exactly, so
+    # leave the rate verdict to ``build_candidates`` / allocator preflight,
+    # both of which own and pass the mandatory context.  Non-CB formats need
+    # no such deferral.
+    if is_cb_format(spec.name) and cb_serialization_context is None:
+        return FormatApplicability(True)
+
+    # Rate first, identity second.  A learned CB book is banked only for the
+    # rungs a unit may actually use, so demanding a materialized codebook here
+    # would make "is this rung legal?" depend on which books happen to exist:
+    # a routed expert that the source-payload ceiling already excludes at K36
+    # would raise instead of returning EXCEEDED, and the exact same menu would
+    # answer differently before and after a bundle rebuild.  Bytes are
+    # identical in both modes, so the verdict below is unchanged; identity is
+    # then re-asserted for the candidates that survive, which are exactly the
+    # ones a render can be asked for.
+    candidate_item = format_tensor_payload_breakdown(
+        spec,
+        shape,
+        qname=qname,
+        cb_serialization_context=cb_serialization_context,
+        require_materialized_codebook_identity=False,
+    )
+    if source_owner.format_name is not None:
+        source_item = format_tensor_payload_breakdown(
+            source_owner.format_name,
+            shape,
+            qname=qname,
+            cb_serialization_context=cb_serialization_context,
+        )
+        source_label = source_owner.format_name
+        source_owner_provenance = {
+            "source_footprint_owner": "registered_format",
+            "source_format": source_owner.format_name,
+        }
+    else:
+        assert source_owner.safetensors_dtype is not None
+        source_item = plain_source_dtype_tensor_payload_breakdown(
+            source_owner.safetensors_dtype,
+            shape,
+        )
+        source_label = source_owner.safetensors_dtype
+        source_owner_provenance = {
+            "source_footprint_owner": "safetensors_dtype",
+            "source_dtype": source_owner.safetensors_dtype,
+        }
+    candidate_bytes = int(candidate_item["tensor_payload_bytes"])
+    source_bytes = int(source_item["tensor_payload_bytes"])
+    n_params = max(int(math.prod(shape)), 1)
+    provenance = {
+        "policy_schema": SOURCE_BPP_POLICY_SCHEMA,
+        "source_kind": str(source_kind),
+        **source_owner_provenance,
+        "candidate_format": fr.canonical_format_name(spec.name),
+        "shape": [int(dim) for dim in shape],
+        "params": n_params,
+        "source_payload_bytes": source_bytes,
+        "candidate_payload_bytes": candidate_bytes,
+        "source_bpp": 8.0 * source_bytes / n_params,
+        "candidate_bpp": 8.0 * candidate_bytes / n_params,
+        "source_bpp_numerator_bits": 8 * source_bytes,
+        "candidate_bpp_numerator_bits": 8 * candidate_bytes,
+        "bpp_denominator_params": n_params,
+        "comparison": "candidate_payload_bytes <= source_payload_bytes",
+    }
+    if candidate_bytes > source_bytes:
+        return FormatApplicability(
+            False,
+            SOURCE_BPP_EXCEEDED_REASON,
+            f"{qname}: {spec.name} payload {candidate_bytes} bytes "
+            f"({provenance['candidate_bpp']:.10g} bpp) exceeds "
+            f"source_kind={source_kind!r} / {source_label} payload "
+            f"{source_bytes} bytes ({provenance['source_bpp']:.10g} bpp); "
+            "comparison is exact integer bytes with no tolerance",
+            provenance,
+        )
+    if is_cb_format(spec.name) and not cb_breakdown_identity_is_materialized(
+        candidate_item
+    ):
+        # Survived the rate gate, so this cell is one the pipeline may be
+        # asked to render, and its book is missing.  Re-price with identity
+        # required so the real diagnostic is raised here, at the gate, and not
+        # first at export.  A banked cell already carries its proof and pays
+        # nothing for this check.
+        format_tensor_payload_breakdown(
+            spec,
+            shape,
+            qname=qname,
+            cb_serialization_context=cb_serialization_context,
+        )
+    return FormatApplicability(True, provenance=provenance)
 
 
 def _profile_allows_format(
     target_profile: str | None,
     name: str | None,
     fmt: str,
+    packed_expert: bool | None = None,
 ) -> FormatApplicability:
-    decision = check_serving_format(target_profile, name, fmt)
+    decision = check_serving_format(target_profile, name, fmt,
+                                    packed_expert=packed_expert)
     return FormatApplicability(
         decision.legal,
         decision.reason,
@@ -67,6 +692,91 @@ def _format_kernel_supports_shape(fmt_name: str, in_features: int,
     ).legal
 
 
+#: The reason string a tensor-parallel shard refusal carries.  New reasons flow
+#: through ``summarize_applicability_masks``'s ``summary`` and ``by_shape``
+#: unchanged, so a TP refusal is countable per format without touching it.
+TP_SHARD_REASON = "tensor_parallel_shard"
+
+
+def _tensor_parallel_applicability(
+    fmt: str,
+    *,
+    qname: str | None,
+    target_profile: str | None,
+    in_features: int,
+    out_features: int,
+    packed_expert: bool,
+) -> FormatApplicability:
+    """Is this format legal on the SHARD each rank will hold?
+
+    ``check_serving_shape`` already applies the profile's declared world size
+    to the shape before asking the profile's own kernel-shape rules, which is
+    what a rule like NVFP4's ``in_features_multiple_of: 16`` needs.  This is the
+    second half, for a format whose *layout* has its own shard granularity that
+    no JSON rule can state: a Tessera unit's trellis runs across ``arity x
+    span`` row periods and its block scale plane tiles the input axis on 16 or
+    32, and its rate schedule is realisable only over column counts the
+    Bresenham root divides.  A rung can therefore be legal on a tensor and
+    illegal on an Nth of it.
+
+    The granularity is read through ONE function,
+    ``tessera_menu.tessera_shard_granularity``, which asks
+    ``tessera.layout.shard_granularity`` -- Tessera's own derivation from the
+    checks ``slice_unit`` applies, so a period it reports is one that slices.
+    A format with no declared granularity is legal here by construction --
+    this gate adds a refusal, it never invents one -- so every non-Tessera
+    format is unchanged.
+    """
+    if not str(fmt).startswith("TESSERA_"):
+        return FormatApplicability(True)
+    from .serving_profiles import load_serving_profile
+    from .tessera_menu import (
+        MENU_ATTESTED, PARALLEL_NONE, TesseraMenuError, menu_mode,
+        tessera_tp_legal,
+    )
+    from .tessera_formats import parse_tessera_format_name
+
+    try:
+        profile = load_serving_profile(target_profile)
+    except FileNotFoundError:
+        # ``None`` is the research spelling and loads above.  A *string* that
+        # names no profile is a typo, and a typo is not a research run: the
+        # same ``profile_mismatch`` ``check_serving_format`` answers one seam
+        # over (#120).  Loading ``research`` here priced Tessera rungs under
+        # the research world size for a profile the export would then refuse.
+        return FormatApplicability(
+            False,
+            reason="profile_mismatch",
+            detail=f"unknown target profile {target_profile!r}",
+            provenance={"target_profile": target_profile},
+        )
+    world = int(profile.tensor_parallel.world_size)
+    kind = (
+        PARALLEL_NONE if packed_expert
+        else profile.tensor_parallel.kind_for(qname)
+    )
+    provenance = {"tp_degree": world, "tp_parallel_kind": kind}
+    try:
+        parsed = parse_tessera_format_name(fmt)
+    except Exception as exc:
+        return FormatApplicability(
+            False, "unknown_format", str(exc), provenance)
+    if parsed is None:
+        return FormatApplicability(True)
+    family, rung = parsed
+    try:
+        legal, reason = tessera_tp_legal(
+            family, rung, (out_features, in_features),
+            tp_degree=world, parallel_kind=kind,
+            require_attested_world=(menu_mode() == MENU_ATTESTED),
+        )
+    except TesseraMenuError as exc:
+        return FormatApplicability(False, TP_SHARD_REASON, str(exc), provenance)
+    if legal:
+        return FormatApplicability(True, None, "", provenance)
+    return FormatApplicability(False, TP_SHARD_REASON, reason, provenance)
+
+
 def check_format_applicability(
     linear_shape: tuple[int, ...],
     format_spec_or_name: fr.FormatSpec | str,
@@ -74,13 +784,15 @@ def check_format_applicability(
     qname: str | None = None,
     source_kind: str | None = None,
     target_profile: str | None = None,
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> FormatApplicability:
     """Return whether a Linear shape can legally use a format.
 
     The verdict captures all cheap preflight constraints that otherwise show
     up later as allocator-invalid choices or RTN/kernel crashes: source
     passthrough integrity, serving profile restrictions, group divisibility,
-    and known runtime kernel shape rules.
+    known runtime kernel shape rules, and (when an exact producer context is
+    available for CB) the source bit-rate ceiling.
     """
     try:
         spec = (
@@ -112,7 +824,10 @@ def check_format_applicability(
             f"{fmt} requires source_kind={required!r}, got {source_kind!r}",
         )
 
-    profile_verdict = _profile_allows_format(target_profile, qname, fmt)
+    # Rank-3 shapes ARE packed expert stacks — the profile can scope rules
+    # to them (containers whose stock-CT delegation is dense-only).
+    profile_verdict = _profile_allows_format(
+        target_profile, qname, fmt, packed_expert=len(shape) >= 3)
     if not profile_verdict.legal:
         return profile_verdict
 
@@ -137,12 +852,14 @@ def check_format_applicability(
                 f"(out_features={out_features}, in_features={in_features})",
             )
 
+    packed_expert = len(shape) >= 3
     shape_decision = check_serving_shape(
         target_profile,
         fmt,
         qname=qname,
         in_features=in_features,
         out_features=out_features,
+        packed_expert=packed_expert,
     )
     if not shape_decision.legal:
         return FormatApplicability(
@@ -150,7 +867,23 @@ def check_format_applicability(
             shape_decision.reason or "kernel_shape",
             shape_decision.detail,
         )
-    return FormatApplicability(True)
+    tp_verdict = _tensor_parallel_applicability(
+        fmt,
+        qname=qname,
+        target_profile=target_profile,
+        in_features=in_features,
+        out_features=out_features,
+        packed_expert=packed_expert,
+    )
+    if not tp_verdict.legal:
+        return tp_verdict
+    return _source_bpp_applicability(
+        shape,
+        spec,
+        qname=str(qname or "<unnamed Linear>"),
+        source_kind=source_kind,
+        cb_serialization_context=cb_serialization_context,
+    )
 
 
 def check_stats_format_applicability(
@@ -160,6 +893,7 @@ def check_stats_format_applicability(
     qname: str | None = None,
     source_kind: str | None = None,
     target_profile: str | None = None,
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> FormatApplicability:
     """Stats-entry wrapper for ``check_format_applicability``.
 
@@ -177,6 +911,7 @@ def check_stats_format_applicability(
         qname=qname,
         source_kind=source_kind,
         target_profile=target_profile,
+        cb_serialization_context=cb_serialization_context,
     )
 
 
@@ -202,11 +937,15 @@ def _stats_indicates_packed_expert(stats_entry: dict) -> bool:
 
 
 def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
-    """Whether ``output_mse`` is a real joint-output measurement.
+    """Whether ``output_mse`` is a real joint-output MEASUREMENT.
 
     Packed experts historically stored ``output_mse=0.0`` as a placeholder
     because the routed expert forward was not reconstructed offline. That
     placeholder must not outrank the scalar predicted_dloss / weight_mse path.
+
+    This answers the PROVENANCE question — "was this number observed?" — and
+    is deliberately NOT the question pricing asks. See
+    ``_prices_from_output_mse``.
     """
     if "output_mse" not in cost_entry:
         return False
@@ -219,22 +958,117 @@ def _has_measured_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
     return True
 
 
-def cost_entry_is_bit_exact(cost_entry: dict) -> bool:
-    """Whether a measured ``weight_mse`` of exactly 0.0 proves a lossless
-    re-encode.
+def _has_interpolated_output_mse(cost_entry: dict) -> bool:
+    """Whether this row carries a USABLE band-interpolated ``output_mse``.
+
+    A band-interpolated row (``cost_source: band_interpolated``/``mixed``) is
+    stamped ``output_mse_measured=False`` and its ``output_mse`` is the
+    tensor's own holdout-gated ladder fit rather than an observation. It is
+    still an output-space number, which is what makes it usable as a price.
+
+    Strict positivity is load-bearing, not a defensive nicety — it is what
+    keeps the two placeholder classes on the weight-only branch, where they
+    belong:
+
+      * the PACKED-expert ladder path (``measure_quant_cost``, the mixed
+        accepted/rejected slice fallback) accumulates
+        ``output_mse=0.0, rel_output_mse=0.0`` alongside
+        ``cost_source=band_interpolated``/``mixed``, because that path fits in
+        WEIGHT space only and never produced an output number at all;
+      * the dense ladder path writes ``float(fills["output_mse"] or 0.0)``, so
+        a row whose output_mse fit could not be made (a non-positive anchor)
+        also lands at exactly 0.0.
+
+    In both cases there is no output-space information in the row, and a 0.0
+    price would be the DP's global optimum — precisely what
+    ``cost_entry_prices_unmeasured_activation_at_zero`` exists to catch. A
+    non-finite value is rejected for the same reason: it is not a price.
+    """
+    if not cost_entry_is_band_interpolated(cost_entry):
+        return False
+    try:
+        value = float(cost_entry.get("output_mse", 0.0))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and value > 0.0
+
+
+def _prices_from_output_mse(stats_entry: dict, cost_entry: dict) -> bool:
+    """Whether PRICING should read this row's ``output_mse``.
+
+    Deliberately a different question from ``_has_measured_output_mse``, and
+    the two must not be collapsed back together:
+
+      * *"Is this ``output_mse`` an observation?"* decides whether the row may
+        enter the P5a calibration SAMPLE
+        (``collect_activation_calibration_rows``). A band-interpolated row's
+        output_mse is derived from the family's own measured anchors, so
+        admitting it would fit the transfer constant partly on its own output
+        — circular. It stays out.
+      * *"Is this ``output_mse`` the best price available for this row?"*
+        decides which branch prices it. Here the answer for a band-interpolated
+        row is yes: its value is the tensor's OWN holdout-gated interpolation
+        in output space, while the alternative is its weight_mse scaled by a
+        family-wide geometric-mean constant. The row's own output-space number
+        beats a family aggregate — and, decisively, mixing the two bases
+        WITHIN one family reorders that family's rungs, which is the failure
+        ``activation_fair_pricing``'s design explicitly ruled out and which
+        shipped anyway (see that module's 2026-08-07 correction: NVFP4-CB
+        K13/K14/K17 priced 12x high on down_proj and 1.6x low on gate/up_proj,
+        because the family constant 112.5 spans a per-projection ratio range
+        of 9.4-320).
+
+    Nothing about the row's own claims changes: ``cost_source`` and
+    ``output_mse_measured`` keep their values and their meanings, the
+    candidate is stamped ``BRANCH_INTERPOLATED_OUTPUT`` rather than
+    ``BRANCH_MEASURED``, and ``cost_entry_is_band_interpolated`` /
+    ``drop_interpolated_candidates_dominated_by_measured`` keep full strength
+    as the provenance and noise-band guards. Only the number's USE changes.
+
+    Not gated on ``act_quant_changes_input``: the measured branch is not
+    gated either, and gating this one would re-create exactly the same
+    measured/weight-only basis mix inside an identity-activation family (at
+    penalty 1.0, but weight-space vs output-space all the same). No such row
+    exists today — only the two CB-ladder sites stamp ``band_interpolated``,
+    and every format of ``nvfp4_cb`` and ``fp8_cb`` quantizes activations — so
+    this is a statement about the rule, not a live code path.
+    """
+    return (
+        _has_measured_output_mse(stats_entry, cost_entry)
+        or _has_interpolated_output_mse(cost_entry)
+    )
+
+
+def cost_entry_is_bit_exact(
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this entry proves a LOSSLESS re-encode end to end: measured
+    ``weight_mse`` of exactly 0.0 AND a format whose activation path is the
+    identity.
 
     ``weight_mse`` is a mean of squared per-element deltas: it is exactly
     zero only when the format stores the source weights verbatim (W' == W)
-    — e.g. MXFP8 over an FP8 128-block source, or MXFP4/MXFP6/MXFP8 over
-    an MXFP4-packed QAT source. A bit-identical weight tensor cannot
-    perturb the layer output, so an accompanying positive ``output_mse``
-    is measurement-pipeline noise (kernel dequant dtype, activation
-    sampling), not signal. Pricing a bit-exact format from that noise
-    inverts dominance: a menu-union solve can price MXFP4 (weight_mse 0,
-    output_mse of pure noise) ABOVE lossy Q4_K on every expert row and
-    never select an MX format at all. Measured zero is a valid,
-    indeed optimal, cost (see ``_log_error_values`` in allocator.py):
-    bit-exact entries short-circuit to predicted dloss 0.0.
+    — e.g. MXFP8 over an FP8 128-block source, or MXFP4/MXFP8 over
+    an MXFP4-packed QAT source. But W' == W only silences the WEIGHT side.
+    For W·A· formats (``FormatSpec.act_quant_changes_input`` — NVFP4,
+    FP8 dynamic, the MX family, GGUF Q8_1 compute) the cost pipeline
+    applies ``activation_quantize_dequantize(X)`` before measuring
+    ``output_mse`` (measure_quant_cost), so a weight-lossless entry's
+    output_mse is REAL A-side error, not noise — on an MXFP4-packed
+    source, an MXFP4 re-encode priced from weight_mse alone would cost
+    dloss 0.0, the unbeatable global minimum at any budget, while its
+    served activations are still 4-bit. The short-circuit therefore
+    requires the format's activation quantization to be the identity — a
+    dtype-level fact (``FormatSpec.act_quant_changes_input``, i.e. ``act_bits``
+    absent or >= 16: BF16, FP8_SOURCE, NVFP4A16, MXFP8A16, INT-W·A16), not a
+    heuristic. Formats we cannot identify
+    (``format_name`` None or unregistered) never short-circuit.
+
+    For qualifying passthrough-activation formats, measured zero is a
+    valid, indeed optimal, cost (see ``_log_error_values`` in
+    allocator.py): the entry short-circuits to predicted dloss 0.0 ahead
+    of any noisy output_mse measurement.
 
     Entries that declare an explicit ``cost_source`` (e.g. the
     production-render score pipeline) carry their own authoritative
@@ -245,6 +1079,14 @@ def cost_entry_is_bit_exact(cost_entry: dict) -> bool:
     explicit = cost_entry.get("cost_source")
     if isinstance(explicit, str) and explicit:
         return False
+    if format_name is None:
+        return False
+    try:
+        spec = fr.get_format(str(format_name))
+    except KeyError:
+        return False
+    if spec.act_quant_changes_input:
+        return False
     weight_mse = cost_entry.get("weight_mse")
     try:
         return weight_mse is not None and float(weight_mse) == 0.0
@@ -252,22 +1094,208 @@ def cost_entry_is_bit_exact(cost_entry: dict) -> bool:
         return False
 
 
+def cost_entry_is_source_passthrough(
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this entry ships the SOURCE bytes and is therefore exact.
+
+    The dual of ``cost_entry_is_bit_exact``. That predicate proves exactness
+    from a MEASUREMENT (``weight_mse == 0.0`` recorded by a real cost run);
+    this one proves it from a CONTRACT — the exporter copies the source slice
+    verbatim, so the re-encode error is not small, it does not exist.
+
+    Three independent conditions, all required, so the claim cannot be forged
+    by writing a string into a cost table:
+
+      * the entry declares ``cost_source="source_passthrough"``;
+      * the format is a declared member of ``SOURCE_PASSTHROUGH_FORMATS``;
+      * the format's activation path is the identity
+        (``FormatSpec.act_quant_changes_input`` is False) — the same
+        dtype-level gate ``cost_entry_is_bit_exact`` applies, because
+        shipping the weights verbatim only silences the W side.
+
+    ``cost_entry_is_bit_exact`` deliberately refuses ANY entry carrying an
+    explicit ``cost_source``, since those normally mean "an upstream pipeline
+    priced this row and defaulted weight_mse to a placeholder 0.0". A
+    source-passthrough entry is the one case where the explicit provenance is
+    itself the proof, which is why it gets a predicate of its own rather than
+    a hole punched in that rule.
+    """
+    if cost_entry.get("cost_source") != SOURCE_PASSTHROUGH_COST_SOURCE:
+        return False
+    if format_name is None:
+        return False
+    canonical = fr.canonical_format_name(str(format_name))
+    if canonical not in SOURCE_PASSTHROUGH_FORMATS:
+        return False
+    try:
+        spec = fr.get_format(canonical)
+    except KeyError:
+        return False
+    return not spec.act_quant_changes_input
+
+
+BAND_INTERPOLATED_COST_SOURCE = "band_interpolated"
+MIXED_COST_SOURCE = "mixed"
+#: The Tessera anchor campaign's fitted rows (``tessera_campaign.py``). Kept
+#: as its own spelling rather than reusing ``band_interpolated`` because the
+#: MECHANISM differs and a shipped artifact has to be able to say which one
+#: priced it: the CB ladder fits a per-tensor law over a handful of declared
+#: rungs, while the campaign fits a monotone piecewise-linear surface in
+#: (q256, log2 dloss) over measured anchors of ONE family on ONE unit and
+#: refuses to extrapolate past them. What the two share is the property this
+#: module's predicates actually key on -- an output-space number that is a
+#: holdout-gated PREDICTION rather than an observation -- so it joins the same
+#: branch (see ``cost_entry_is_band_interpolated``) and inherits the same
+#: guard, ``drop_interpolated_candidates_dominated_by_measured``, which is
+#: what stops an unmeasured rung displacing a measured one on noise.
+TESSERA_INTERPOLATED_COST_SOURCE = "tessera_campaign_interpolated"
+
+
+def cost_entry_is_band_interpolated(cost_entry: dict) -> bool:
+    """Whether this row's cost was FITTED from ladder anchors, not measured.
+
+    Stamped by the cost stage's RD-ladder interpolation
+    (``measure_quant_cost``, ``PRISMAQUANT_CB_LADDER_INTERP=1``). Such a row
+    is not a guess — the tensor's own law had to clear a holdout gate before
+    the fit was accepted, and a tensor whose law was rejected had its rungs
+    measured instead — but it IS a prediction, and a shipped artifact must be
+    able to say which of its selected prices were predictions.
+    """
+    return cost_entry.get("cost_source") in {
+        BAND_INTERPOLATED_COST_SOURCE,
+        MIXED_COST_SOURCE,
+        TESSERA_INTERPOLATED_COST_SOURCE,
+    }
+
+
+def drop_interpolated_candidates_dominated_by_measured(
+    candidates: dict[str, list[Candidate]],
+    costs: dict,
+    *,
+    band: float,
+) -> tuple[dict[str, list[Candidate]], int]:
+    """Remove interpolated candidates a measured one already beats.
+
+    The DP optimizes over estimates, so a Δloss gap SMALLER than the
+    interpolator's own validated error is not evidence — it is a coin flip,
+    and letting it decide means an unmeasured rung can displace a measured one
+    on noise alone. This drops an interpolated candidate only when a measured
+    candidate for the SAME unit is both
+
+      * within ``band`` relative Δloss (i.e. indistinguishable at the
+        interpolator's demonstrated resolution), and
+      * no more expensive in bytes.
+
+    Both conditions are required, so a genuine trade survives: an interpolated
+    rung that is materially cheaper in bytes, or materially better in Δloss,
+    is still on the menu. Only the strictly-dominated-within-noise case is
+    removed. ``band`` must be the MEASURED holdout error from this run's own
+    validation, not a taste constant.
+
+    Returns the filtered candidates and the number dropped.
+    """
+    if band <= 0.0:
+        return candidates, 0
+    out: dict[str, list[Candidate]] = {}
+    dropped = 0
+    for name, cands in candidates.items():
+        rows = costs.get(name, {})
+        measured = [
+            c for c in cands
+            if not cost_entry_is_band_interpolated(rows.get(c.fmt, {}))
+        ]
+        kept = []
+        for cand in cands:
+            if not cost_entry_is_band_interpolated(rows.get(cand.fmt, {})):
+                kept.append(cand)
+                continue
+            scale = max(abs(cand.predicted_dloss), 1e-30)
+            if any(
+                other.memory_bytes <= cand.memory_bytes
+                and abs(other.predicted_dloss - cand.predicted_dloss) / scale
+                <= band
+                for other in measured
+            ):
+                dropped += 1
+                continue
+            kept.append(cand)
+        out[name] = kept or cands
+    return out, dropped
+
+
+def cost_entry_is_exact_by_construction(
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this row's Δloss is exactly 0.0 with no measurement involved.
+
+    The union of the two ways a row can be free: a measured lossless
+    re-encode (``cost_entry_is_bit_exact``) and a byte-verbatim source
+    passthrough (``cost_entry_is_source_passthrough``). Pricing, the measured
+    branch test and the P5a branch label all key off THIS predicate so the two
+    cannot drift apart; ``cost_entry_source`` still reports which of the two
+    it was.
+    """
+    return (
+        cost_entry_is_bit_exact(cost_entry, format_name)
+        or cost_entry_is_source_passthrough(cost_entry, format_name)
+    )
+
+
+def synthesized_source_passthrough_cost_entry(format_name: str) -> dict:
+    """The cost row for a passthrough candidate the cost table cannot hold.
+
+    Not a placeholder and not an estimate: ``predicted_dloss`` is 0.0 because
+    the exporter ships the source slice unchanged, and the explicit
+    ``cost_source`` records that provenance so no downstream reader mistakes
+    the zero for an unmeasured activation cost (the failure mode
+    ``cost_entry_prices_unmeasured_activation_at_zero`` exists to catch).
+    ``output_mse_measured=False`` states plainly that no output measurement
+    was taken — because none was needed.
+    """
+    return {
+        "cost_source": SOURCE_PASSTHROUGH_COST_SOURCE,
+        "predicted_dloss": 0.0,
+        "weight_mse": 0.0,
+        "output_mse": 0.0,
+        "output_mse_measured": False,
+        "source_passthrough_format": fr.canonical_format_name(
+            str(format_name)
+        ),
+    }
+
+
 def cost_entry_uses_measured_output_mse(
     stats_entry: dict,
     cost_entry: dict,
+    format_name: str | None = None,
 ) -> bool:
-    """Whether ``cost_entry_predicted_dloss`` will read ``output_mse``."""
-    if cost_entry_is_bit_exact(cost_entry):
+    """Whether ``cost_entry_predicted_dloss`` will read a MEASURED
+    ``output_mse``.
+
+    Not the same as "will read ``output_mse``": the band-interpolated branch
+    (``_prices_from_output_mse``) reads it too, from a row whose value is a
+    ladder fit rather than an observation. This predicate keeps the narrower,
+    measurement-only meaning its name states — it is what callers asking "does
+    a real output-side observation back this row" want.
+    """
+    if cost_entry_is_exact_by_construction(cost_entry, format_name):
         return False
     return _has_measured_output_mse(stats_entry, cost_entry)
 
 
-def cost_entry_source(stats_entry: dict, cost_entry: dict) -> str:
+def cost_entry_source(
+    stats_entry: dict,
+    cost_entry: dict,
+    format_name: str | None = None,
+) -> str:
     """Return the named cost source the allocator will use for one row."""
     explicit = cost_entry.get("cost_source")
     if isinstance(explicit, str) and explicit:
         return explicit
-    if cost_entry_is_bit_exact(cost_entry):
+    if cost_entry_is_bit_exact(cost_entry, format_name):
         return "bit_exact"
     if _has_measured_output_mse(stats_entry, cost_entry):
         if (
@@ -288,32 +1316,56 @@ def _fisher_output_mse_allocator_enabled() -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
-def cost_entry_predicted_dloss(
+def cost_entry_measured_activation_dloss(
     stats_entry: dict,
     cost_entry: dict,
     *,
     gain: float = 1.0,
 ) -> float:
-    """Return the allocator's authoritative Δloss for one cost entry."""
-    if cost_entry_is_bit_exact(cost_entry):
-        # Lossless re-encode: zero cost by construction, regardless of any
-        # noisy output_mse measurement (see cost_entry_is_bit_exact).
-        return 0.0
-    if _has_measured_output_mse(stats_entry, cost_entry):
-        if (
-            _fisher_output_mse_allocator_enabled()
-            and "fisher_output_mse" in cost_entry
-        ):
-            return predicted_dloss(
-                stats_entry["h_trace"],
-                float(cost_entry["fisher_output_mse"]),
-                gain=gain,
-            )
+    """The ACTIVATION-INCLUSIVE price of one row, or 0.0 when unmeasured.
+
+    Split out of ``cost_entry_predicted_dloss`` so the P5a calibration reads
+    exactly the number the measured branch would have priced — one
+    implementation of "what does the output_mse branch say", not a second
+    copy that can drift from the precedence chain it calibrates against.
+    ``measure_quant_cost`` applies ``activation_quantize_dequantize(X)``
+    before measuring ``output_mse``, which is why this branch — and only this
+    branch — carries the A side.
+
+    Both output-space provenances go through here — a measured row and a
+    band-interpolated one (whose fit interpolates between activation-inclusive
+    measured anchors, so it carries the A side too) — so gain, Fisher-variant
+    selection and the ½·h_trace algebra stay in one place. WHICH rows qualify
+    is ``_prices_from_output_mse``'s decision, not this function's; the
+    calibration still admits only measured ones.
+    """
+    if (
+        _fisher_output_mse_allocator_enabled()
+        and "fisher_output_mse" in cost_entry
+    ):
         return predicted_dloss(
             stats_entry["h_trace"],
-            float(cost_entry["output_mse"]),
+            float(cost_entry["fisher_output_mse"]),
             gain=gain,
         )
+    return predicted_dloss(
+        stats_entry["h_trace"],
+        float(cost_entry.get("output_mse", 0.0)),
+        gain=gain,
+    )
+
+
+def cost_entry_weight_only_dloss(
+    stats_entry: dict,
+    cost_entry: dict,
+    *,
+    gain: float = 1.0,
+) -> float:
+    """The WEIGHT-ONLY price of one row (``predicted_dloss``/``weight_mse``).
+
+    Uncorrected by any activation calibration — this is the number the
+    calibration divides into, and the number the correction multiplies.
+    """
     if "predicted_dloss" in cost_entry:
         base = float(cost_entry["predicted_dloss"])
         # Uncertainty-aware allocation (opt-in): charge z·stderr on top of the
@@ -335,6 +1387,487 @@ def cost_entry_predicted_dloss(
     )
 
 
+def cost_entry_is_joint_aura(cost_entry: dict) -> bool:
+    """Validate any joint claim before interpreting generic cost fields."""
+    from .joint_aura import validate_joint_aura_entry
+
+    return validate_joint_aura_entry(cost_entry)
+
+
+def cost_entry_is_anchored_aura_supersurrogate(cost_entry: dict) -> bool:
+    """Whether one row was priced by the anchored-AURA campaign.
+
+    Three independent stamps, ALL required, in the same forgery-refusing style
+    as ``cost_entry_is_source_passthrough`` — a hand-written table cannot claim
+    this provenance by writing one string:
+
+      * ``cost_currency`` is the AURA projection currency, so the number is
+        ``0.5*mean_k<gW,dW>^2`` and not an MSE wearing the same field name;
+      * ``cost_source`` says a PRODUCTION-ARM render produced the anchor.
+        RTN-vs-rendered ``dW`` is result-changing (+36% at fp8), and the
+        byte-verbatim terminals carry ``SOURCE_PASSTHROUGH_COST_SOURCE``
+        instead, so they are excluded here and handled by the exact branch;
+      * ``fisher_application_count == 1`` — the h^2 guard. ``predicted_dloss``
+        already contains the KL-Fisher; extrapolation multiplies by a ratio of
+        ``g``, never by a sensitivity a second time.
+
+    **The standing limitation this admission accepts.** Every rung in the CB
+    menus quantizes activations (``act_quant_changes_input`` is True for all of
+    ``nvfp4_cb`` and ``fp8_cb``), while AURA's ``dW`` is weights-only. So these
+    prices are activation-quantization-blind, and the P5a penalty cannot fix it
+    here: an anchored table carries no measured ``output_mse`` rows at all, so
+    every family is uncalibrated and ``penalty_for`` already returns exactly
+    1.0. Skipping the penalty is a provenance statement, not a number change.
+
+    The exposure remains explicitly bounded by its measurement scope:
+
+      * a constant activation operator across K does not make the joint
+        residual constant: its cross terms depend on each rendered weight and
+        can reorder rungs inside a family. The opt-in joint AURA path prices
+        those terms; these legacy weight-only rows retain that limitation;
+      * AURA's validated wins (-38%/-39.5% @4B, -17.9% @27B on served KL) were
+        measured against ``h_trace x output_mse``, and THAT baseline carried
+        the A side (``measure_quant_cost`` applies
+        ``activation_quantize_dequantize(X)``). The activation-blind projection
+        beat an activation-inclusive cost, on menus already mixing W4A4 NVFP4,
+        W8A8 FP8 and BF16 — the same family-choice margin.
+
+    This is the route-flip pattern (``expert_empirical_cost`` module contract):
+    a named limitation carried forward, with the served A/B as the arbiter.
+    """
+    if not isinstance(cost_entry, dict):
+        return False
+    if cost_entry.get("cost_currency") != ANCHORED_AURA_COST_CURRENCY:
+        return False
+    if cost_entry.get("cost_source") != ANCHORED_AURA_COST_SOURCE:
+        return False
+    applications = cost_entry.get("fisher_application_count")
+    if isinstance(applications, bool):
+        # ``True == 1``; a boolean is not a count and must not forge one.
+        return False
+    try:
+        # ``__index__`` rather than ``int()``: it admits the numpy integers a
+        # pickled cost table really carries, and refuses the string "1" and
+        # the float 1.0, neither of which any writer of this stamp emits.
+        applications = operator.index(applications)
+    except TypeError:
+        return False
+    return applications == 1
+
+
+def cost_entry_activation_pricing_branch(
+    stats_entry: dict,
+    cost_entry: dict,
+    format_name: str | None = None,
+    activation_pricing: ActivationFairPricing | None = None,
+) -> str:
+    """Name the estimator that priced one row's ACTIVATION contract.
+
+    Orthogonal to ``cost_entry_source`` (which names the cost *field*): this
+    answers the audit's question — did this row's price ever see the A side,
+    and if not, was it corrected? Stamped on every ``Candidate`` so the
+    question is answerable from the artifact rather than from the code
+    version that produced it.
+    """
+    if cost_entry_is_joint_aura(cost_entry):
+        return "joint_aura"
+    if cost_entry_is_source_passthrough(cost_entry, format_name):
+        # Neither measured nor weight-only: the row was never priced from an
+        # error estimate at all. It gets its own label so the artifact can
+        # tell "shipped the source bytes" apart from "measured a lossless
+        # re-encode" — both are free, but only one of them ran an encoder.
+        return BRANCH_SOURCE_PASSTHROUGH
+    if cost_entry_is_bit_exact(cost_entry, format_name):
+        return BRANCH_BIT_EXACT
+    if _has_measured_output_mse(stats_entry, cost_entry):
+        return BRANCH_MEASURED
+    if _has_interpolated_output_mse(cost_entry):
+        # Same output-space branch as BRANCH_MEASURED, different label: the
+        # price is real information in the right units, but it is a PREDICTION,
+        # and "which of the selected prices were predicted" has to survive into
+        # the artifact. Ordered after the measured test, and after the two
+        # exact-by-construction tests above it, so this label is only ever
+        # claimed by a row that nothing stronger already explained — the same
+        # precedence ``cost_entry_predicted_dloss`` applies.
+        return BRANCH_INTERPOLATED_OUTPUT
+    if cost_entry.get(APPLIED_MARKER_KEY) is True:
+        # An aggregated super-item entry: the members' penalties are already
+        # folded into its predicted_dloss (aggregate_* below).
+        return BRANCH_CALIBRATED
+    if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
+        # Its own label rather than BRANCH_UNCALIBRATED: both are priced at a
+        # 1.0 multiplier, but "no calibration sample was found for this family"
+        # and "this row is an anchored KL-adjoint projection that the P5a
+        # transfer does not apply to" are different audit answers, and the
+        # artifact has to be able to tell them apart.
+        return ANCHORED_AURA_BRANCH
+    act_changes = _format_act_quant_changes_input(format_name)
+    if activation_pricing is None:
+        return (
+            BRANCH_ACTIVATION_IDENTITY if not act_changes
+            else BRANCH_UNCALIBRATED
+        )
+    return activation_pricing.penalty_for(format_name, act_changes)[1]
+
+
+def _format_act_quant_changes_input(format_name: str | None) -> bool:
+    if format_name is None:
+        return False
+    try:
+        return bool(fr.get_format(str(format_name)).act_quant_changes_input)
+    except KeyError:
+        return False
+
+
+def _activation_penalty(
+    format_name: str | None,
+    activation_pricing: ActivationFairPricing | None,
+) -> float:
+    if activation_pricing is None:
+        return 1.0
+    return activation_pricing.penalty_for(
+        format_name, _format_act_quant_changes_input(format_name))[0]
+
+
+def cost_entry_predicted_dloss(
+    stats_entry: dict,
+    cost_entry: dict,
+    *,
+    gain: float = 1.0,
+    format_name: str | None = None,
+    activation_pricing: ActivationFairPricing | None = None,
+) -> float:
+    """Return the allocator's authoritative Δloss for one cost entry.
+
+    ``activation_pricing`` (P5a) applies the per-family activation calibration
+    to the WEIGHT-ONLY branches only — the measured branch is already
+    activation-inclusive and the bit-exact branch is, by construction, an
+    identity activation path. ``None`` (the default) is bit-for-bit the
+    pre-P5a precedence, which is what ``kl_measurement`` and every direct
+    caller outside candidate construction still want.
+
+    The correction is multiplicative, so it scales the UCB hedge with the
+    point estimate (both are in the same weight-only units and the transfer
+    to the measured scale applies to both), and it cannot lift an exactly-0.0
+    price off zero — ``cost_entry_prices_unmeasured_activation_at_zero``
+    keeps its full strength.
+    """
+    if cost_entry_is_joint_aura(cost_entry):
+        if float(gain) != 1.0 or cost_entry.get(APPLIED_MARKER_KEY) is True:
+            raise ValueError("joint AURA refuses calibrated gain or a second activation transfer")
+        if (format_name is not None and
+                cost_entry["joint_operator_identity"]["format"] != format_name):
+            raise ValueError("joint AURA row cannot price a different format")
+        # Its signed full residual already contains weight, activation and
+        # mixed terms under one downstream KL Fisher. Only probe uncertainty
+        # may change the proposal price; no scalar sensitivity is applied.
+        return cost_entry_weight_only_dloss(stats_entry, cost_entry, gain=1.0)
+    if cost_entry_is_exact_by_construction(cost_entry, format_name):
+        # Zero cost by construction, in one of two ways: a lossless re-encode
+        # END TO END (weights verbatim AND identity activation path,
+        # ``cost_entry_is_bit_exact``), or a byte-verbatim source passthrough
+        # whose exporter never re-encodes at all
+        # (``cost_entry_is_source_passthrough``). Either way the answer does
+        # not depend on a measurement, so it outranks any noisy output_mse.
+        return 0.0
+    if _prices_from_output_mse(stats_entry, cost_entry):
+        # The row's own OUTPUT-space number, whether measured or the tensor's
+        # band-interpolated fit (``_prices_from_output_mse`` explains why those
+        # two provenances share one branch while only the first may calibrate).
+        # The per-family penalty is NOT applied here: it exists to move a
+        # WEIGHT-space number onto the output scale, and this number is already
+        # on it. Applying it would double-count, and applying it to only some
+        # rungs of a family is the mispricing this branch was split out to fix.
+        return cost_entry_measured_activation_dloss(
+            stats_entry, cost_entry, gain=gain)
+    base = cost_entry_weight_only_dloss(stats_entry, cost_entry, gain=gain)
+    if cost_entry.get(APPLIED_MARKER_KEY) is True:
+        # Aggregated super item: its members were penalized individually and
+        # the result summed. Re-applying here would square the correction. The
+        # same reasoning covers the AQUA A-side: a super item prices a format as
+        # the SUM of its members' cost_entry_predicted_dloss, so every member's
+        # act_dloss is already inside ``base``.
+        return base
+    if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
+        # Read the anchored projection directly. The P5a penalty transfers a
+        # weight-SPACE number onto the measured output scale using a constant
+        # fitted from that family's own measured/weight-only row pairs; an
+        # anchored table has no measured rows, so there is no such constant to
+        # apply (``penalty_for`` already returns 1.0 via BRANCH_UNCALIBRATED).
+        # Naming the branch instead of falling through keeps the artifact
+        # honest about WHY the multiplier was 1.0. Numerically identical today
+        # — and it stays correct if a future run mixes an anchored table with a
+        # measured one, where falling through would silently apply another
+        # family's transfer constant to a projection that is not in its units.
+        return base + cost_entry_act_dloss(cost_entry)
+    # The A-side rides the SAME per-family transfer as the W-side. Adding it
+    # OUTSIDE the multiply puts the two halves of one unit's price on two
+    # scales, and P5a's fitted constants are large: measured on Qwen3.8-27B the
+    # NVFP4 family fit was x8103, which diluted an A-side worth 6x the W-side
+    # down to 0.07% of the total and produced an allocation byte-identical to
+    # the weight-only one. Multiplying the sum preserves the A:W ratio, which is
+    # the quantity the DP actually ranks on, and is exactly ``base + act`` when
+    # P5a is inert (penalty 1.0) -- so it cannot change a run that has no
+    # measured rows to calibrate from.
+    return ((base + cost_entry_act_dloss(cost_entry))
+            * _activation_penalty(format_name, activation_pricing))
+
+
+#: AQUA-AURA: the A-side Δloss of a (unit, format), written into the cost row by
+#: ``aqua_activation_cost``. Absent on every pre-AQUA cost artifact, which is
+#: why every read goes through ``cost_entry_act_dloss`` and defaults to 0.0.
+ACT_DLOSS_KEY = "act_dloss"
+
+
+def cost_entry_act_dloss(cost_entry: dict) -> float:
+    """AQUA-AURA: the row's ACTIVATION-side Δloss, or 0.0 when absent.
+
+    WHY THIS IS ADDED, NOT MULTIPLIED, AND ONLY HERE
+    ------------------------------------------------
+    Choosing NVFP4 commits the Linear's ACTIVATIONS to 4 bits as well as its
+    weights; choosing FP8 commits them to 8; BF16 leaves them alone. A
+    weight-only surrogate cannot see any of that -- NVFP4 and NVFP4A16 render
+    weights BIT-IDENTICALLY (T1) -- so the DP was pricing a W4A4 format as if it
+    were weight-only and systematically over-buying 4-bit.
+
+    The term is a diagonal activation Δloss approximation derived from the
+    layer's own activation statistics and is added to the weight estimate.
+    A shared Δloss label does not establish equivalence to AURA's KL-adjoint
+    currency or capture weight/activation cross terms (PrismaQuant #237).
+    It is deliberately not a multiplicative penalty:
+    ``ActivationFairPricing`` (P5a) is the multiplicative, per-FAMILY, fitted
+    transfer of a weight-space number onto the measured output scale, and this
+    is a per-UNIT, mechanistic, already-output-space quantity. The current
+    weight-only branches add this term before applying the family penalty.
+
+    It is added ONLY on the weight-only branches. The ``_prices_from_output_mse``
+    branch is already activation-inclusive by construction (the row's own
+    output-space measurement saw the activation path), and adding here would
+    double-count it. ``cost_entry_is_exact_by_construction`` returns 0.0 for a
+    row whose activation path is an identity, so there is nothing to add there
+    either; a lossless re-encode whose SERVED activations are 4-bit is excluded
+    from the menu by ``cost_entry_prices_unmeasured_activation_at_zero`` rather
+    than priced at all.
+
+    Defaults to 0.0 rather than raising because every cost artifact written
+    before AQUA lacks the key, and those runs must remain bit-for-bit
+    reproducible. An unmeasured A-side on an activation-quantizing format is a
+    HOLE, not a zero, and is reported as such by the writer -- it is not this
+    function's job to guess.
+    """
+    try:
+        return float(cost_entry.get(ACT_DLOSS_KEY, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+ACTIVATION_COST_UNMEASURED_REASON = "activation_cost_unmeasured"
+
+
+def cost_entry_prices_unmeasured_activation_at_zero(
+    stats_entry: dict,
+    cost_entry: dict,
+    priced_dloss: float,
+    format_name: str | None = None,
+) -> bool:
+    """Whether this row prices a W-and-A format's UNKNOWN cost at the global
+    optimum (Δloss exactly 0.0).
+
+    ``cost_entry_is_bit_exact`` closed this for the ``output_mse`` branch: a
+    weight-lossless entry on an activation-quantizing format keeps its measured
+    A-side output_mse instead of short-circuiting to 0.0. But that branch is
+    only taken when output_mse is a real measurement. Packed-expert rows whose
+    routed forward could not be reconstructed (``can_measure_output`` false),
+    and EVERY row in a run with ``PRISMAQUANT_EXPERT_COST_SAMPLE`` set, are
+    written with ``output_mse_measured=False`` (measure_quant_cost), so pricing
+    falls through to ``predicted_dloss``/``weight_mse`` — both of which are
+    exactly 0.0 for a weight-lossless re-encode (the source is already in that
+    format: MXFP4 over an MXFP4-packed source, NVFP4 over an NVFP4-CB source).
+    Nothing in that row ever looked at the activation path, yet the DP reads a
+    cost of 0.0: the unbeatable global minimum at any budget, for an assignment
+    whose served activations are 4-bit.
+
+    This is not a mis-estimate to be corrected — a positive weight-side
+    surrogate is the accepted L1 design, biased but tradeable — it is a cost the
+    optimizer CANNOT trade off: zero is the argmin, so the format is selected at
+    every target, unconditionally. The unknown must therefore be excluded from
+    the menu (``build_candidates``, counted and logged like any other
+    inapplicable format) rather than priced.
+
+    The predicate is exact, not thresholded:
+
+      * the format's activation path is provably non-identity
+        (``FormatSpec.act_quant_changes_input`` — a dtype-level fact);
+      * no measured output-side evidence exists for this row
+        (``_has_measured_output_mse``), so the A-side error is unknown
+        whatever produced the number;
+      * the resulting price is exactly 0.0 — the DP's global optimum;
+      * the row's measured sensitivity is POSITIVE. ``h_trace == 0`` prices
+        every format at 0.0 including the passthrough ones, which is a measured
+        statement that no perturbation of this Linear's output moves the loss —
+        W-side or A-side, since the same Fisher expansion multiplies both. A
+        zero-token expert at thin calibration is exactly that row, and it must
+        stay free to take the cheapest format instead of being forced onto
+        BF16.
+    """
+    if cost_entry_is_joint_aura(cost_entry):
+        return False
+    if format_name is None:
+        return False
+    if cost_entry_is_anchored_aura_supersurrogate(cost_entry):
+        # An anchored-AURA zero is a MEASUREMENT, not the absence of one, and
+        # this guard exists for the absence. The zeros it was built to catch
+        # are placeholders — a band-interpolated row that never produced an
+        # output number, a dense-ladder fit that could not be made — and an
+        # anchored table cannot contain those: ``assert_aura_only_cost_table``
+        # refuses any row carrying output_mse/weight_mse/h_trace at all, and
+        # per-unit checkpoint completeness refuses a missing anchor rather than
+        # defaulting it to zero.
+        #
+        # It is also very nearly vacuous, which is the point: 0.5*mean_k<gW,dW>^2
+        # is exactly 0.0 only if dW is exactly zero (a byte-identical render —
+        # the exact-by-construction branch above already owns that) or gW is
+        # exactly zero (h_trace == 0 — the positive-sensitivity condition below
+        # already exempts that). The bypass is scoped to rows this predicate
+        # matches, so every other cost table keeps the guard at full strength.
+        return False
+    try:
+        spec = fr.get_format(str(format_name))
+    except KeyError:
+        return False
+    if not spec.act_quant_changes_input:
+        return False
+    if _has_measured_output_mse(stats_entry, cost_entry):
+        return False
+    try:
+        if float(priced_dloss) != 0.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        h_trace = float(stats_entry.get("h_trace", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return h_trace > 0.0
+
+
+def collect_activation_calibration_rows(
+    stats: dict,
+    costs: dict,
+    formats: list[fr.FormatSpec],
+) -> tuple[list[CalibrationRow], dict[str, int], dict[str, int]]:
+    """Extract the P5a calibration sample from the run's own cost tables.
+
+    Returns ``(rows, measured_rows_by_family, weight_only_rows_by_family)``
+    over ACTIVATION-QUANTIZING formats only (``act_quant_changes_input``): a
+    passthrough/A16 rung has no A side to transfer, and its measured-vs-
+    weight-only disagreement is a different question.
+
+    A row joins the calibration sample when it carries BOTH estimators —
+    a real measured ``output_mse`` (``_has_measured_output_mse``) AND a
+    weight-only field, both strictly positive. Exactly-zero prices are
+    excluded on both sides: a zero denominator has no ratio, and a zero
+    measured price is the lossless-re-encode case the bit-exact
+    short-circuit and ``cost_entry_prices_unmeasured_activation_at_zero``
+    already own.
+
+    The membership test here is ``_has_measured_output_mse`` and must STAY
+    that, even though pricing now asks the broader ``_prices_from_output_mse``.
+    The two questions genuinely differ: a band-interpolated row's
+    ``output_mse`` is a fit THROUGH this family's own measured anchors, so
+    letting it into the sample would fit the measured-over-weight-only
+    transfer constant partly on its own output — circular, and it would pull
+    the constant toward whatever the interpolator already assumed. It is good
+    enough to price the row it belongs to and not good enough to define the
+    constant other rows are priced by; those are different bars, and this is
+    the one place that has to hold the higher one.
+
+    Consequence worth naming: ``weight_only_rows_by_family`` now counts some
+    rows that pricing sends down the output-space branch, so it slightly
+    OVER-counts the population the family penalty is actually applied to. That
+    count only feeds ``calibrate``'s fail-closed refusal, where over-counting
+    can make the run refuse more eagerly but never less — the safe direction —
+    so it is left alone rather than split into a third census that would have
+    to be kept in sync with the pricing precedence.
+
+    Everything is computed at ``gain=1.0`` (the ratio is gain-invariant) and
+    the iteration order is the sorted cost table, so the sample — and its
+    digest — is deterministic.
+    """
+    rows: list[CalibrationRow] = []
+    measured_by_family: dict[str, int] = {}
+    weight_only_by_family: dict[str, int] = {}
+    for spec in formats:
+        if not spec.act_quant_changes_input:
+            continue
+        family = str(spec.family)
+        measured_by_family.setdefault(family, 0)
+        weight_only_by_family.setdefault(family, 0)
+        for name in sorted(costs):
+            stats_entry = stats.get(name)
+            if not isinstance(stats_entry, dict):
+                continue
+            entry, _entry_fmt = _resolve_cost_entry(costs[name], spec.name)
+            if entry is None or "error" in entry:
+                continue
+            if cost_entry_is_joint_aura(entry):
+                continue
+            if cost_entry_is_bit_exact(entry, spec.name):
+                continue
+            if cost_entry_is_anchored_aura_supersurrogate(entry):
+                # Never a calibration observation on either side. The sample
+                # fits a measured-over-weight-only RATIO, and an anchored row
+                # has no measured side to be the numerator; counting it in
+                # ``weight_only_by_family`` would inflate the census that
+                # ``calibrate`` fail-closes on, making a run refuse for a
+                # population the penalty is never applied to. Structurally
+                # already excluded (no output_mse), stated explicitly so it
+                # stays excluded if the membership test is ever widened.
+                continue
+            if _has_measured_output_mse(stats_entry, entry):
+                measured_by_family[family] += 1
+                if not ("predicted_dloss" in entry or "weight_mse" in entry):
+                    continue
+                measured = cost_entry_measured_activation_dloss(
+                    stats_entry, entry)
+                weight_only = cost_entry_weight_only_dloss(stats_entry, entry)
+                if measured > 0.0 and weight_only > 0.0:
+                    rows.append(CalibrationRow(
+                        qname=str(name),
+                        fmt=spec.name,
+                        family=family,
+                        measured_dloss=float(measured),
+                        weight_only_dloss=float(weight_only),
+                    ))
+            else:
+                weight_only_by_family[family] += 1
+    return rows, measured_by_family, weight_only_by_family
+
+
+def calibrate_activation_fair_pricing(
+    stats: dict,
+    costs: dict,
+    formats: list[fr.FormatSpec],
+    *,
+    enabled: bool | None = None,
+) -> ActivationFairPricing:
+    """Calibrate the per-family activation penalty ONCE for a run.
+
+    The allocator calls this before ``build_candidates`` and threads the
+    result through every candidate-construction path, so body, MTP and visual
+    menus share one fit (the audit's "calibrated once per model") instead of
+    three menu-dependent ones.
+    """
+    rows, measured, weight_only = collect_activation_calibration_rows(
+        stats, costs, formats)
+    return _calibrate_activation_pricing(
+        rows,
+        measured_rows_by_family=measured,
+        weight_only_rows_by_family=weight_only,
+        enabled=enabled,
+    )
+
+
 def _cost_ucb_z() -> float:
     """PRISMAQUANT_COST_UCB_Z: stderr multiples added to predicted_dloss."""
     try:
@@ -343,25 +1876,291 @@ def _cost_ucb_z() -> float:
         return 0.0
 
 
+def _resolve_cost_entry(cost_rows: dict, fmt_name: str) -> tuple[dict | None, str]:
+    """Resolve one Linear's cost row for ``fmt_name``, alias-aware.
+
+    Returns ``(entry, entry_fmt)`` where ``entry_fmt`` is the alias actually
+    present in the cost table (what ``calibrated_gains`` may be keyed by), or
+    ``(None, fmt_name)`` when the format was never measured.
+    """
+    for candidate_name in fr.aliases_for(fmt_name):
+        if candidate_name in cost_rows:
+            return cost_rows[candidate_name], candidate_name
+    return None, fmt_name
+
+
+def _super_item_ucb_hedge(member_terms, ucb_z: float) -> tuple[float, float]:
+    """Separate member hedges and retain a conservative group stderr bound.
+
+    AURA rows share probe samples, so distinct members do not establish
+    independent estimator errors. Without verified joint sample identities
+    or an explicit independence contract, the standard deviation of a sum is
+    bounded by the SUM of its scaled standard deviations. Quadrature can
+    underprice positive covariance; physical perturbation additivity does not
+    establish independence of the cost estimates.
+
+    ``member_terms`` yields ``(stats_entry, cost_entry, member_dloss, scale)``.
+    The scale includes calibrated gain and activation penalty already applied
+    to the member price. Only terms priced with a stderr hedge contribute.
+    Raw per-probe arrays alone do not establish alignment here.
+
+    Returns ``(hedge_linear, stderr_bound)``: remove the member hedges to
+    recover the base cost, and retain the conservative bound in the grouped
+    cost row for repricing. At ``ucb_z == 0`` the removed hedge is exactly
+    zero, preserving the accumulated candidate price bit for bit. Both fused
+    and packed aggregation use this same policy.
+    """
+    stderr_bound = 0.0
+    hedge_linear = 0.0
+    for stats_entry, cost_entry, member_dloss, gain in member_terms:
+        if float(member_dloss) <= 0.0:
+            # Bit-exact re-encode / clamped-at-zero member: contributed no
+            # dloss (and no hedge) to the sum; skip it symmetrically.
+            continue
+        if cost_entry is None or "error" in cost_entry:
+            continue
+        if cost_entry_is_joint_aura(cost_entry):
+            # The family transfer never scaled the full-residual member, so
+            # it must not scale the hedge removed from that member either.
+            gain = 1.0
+        # Mirror cost_entry_predicted_dloss: the stderr hedge is only applied
+        # on the explicit predicted_dloss branch. This must track the PRICING
+        # predicate, not the provenance one — a band-interpolated member priced
+        # from its own output_mse never had a hedge added to its dloss, so
+        # subtracting one here would over-subtract the linear hedge this
+        # conversion exists to undo.
+        if _prices_from_output_mse(stats_entry, cost_entry):
+            continue
+        if "predicted_dloss" not in cost_entry:
+            continue
+        try:
+            stderr = float(cost_entry.get("predicted_dloss_stderr", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            stderr = 0.0
+        if stderr <= 0.0:
+            continue
+        stderr_bound += abs(stderr * float(gain))
+        hedge_linear += ucb_z * stderr * float(gain)
+    return hedge_linear, stderr_bound
+
+
+def reduce_continuous_menu(
+    candidates: dict[str, list[Candidate]],
+    stats: dict,
+    *,
+    bit_precision: float | None = None,
+    report: dict | None = None,
+    preserve_runtime_frontier: bool = False,
+) -> dict[str, list[Candidate]]:
+    """Shrink a continuous per-unit menu without changing the DP's answer.
+
+    A Tessera family addresses a rate axis at a 1/256-bpp quantum, so one unit
+    can carry thousands of legal rungs where a stock menu carries five. Two
+    reductions apply, and they are kept apart because they license different
+    claims and a receipt has to be able to say which one made a result look
+    coarse:
+
+    * **dominance** (``tessera_menu.prune_dominated``) drops a rung only when
+      another is no larger in BYTES and no larger in COST. Exact for any
+      knapsack whatsoever. Explicitly not a convex hull: the budget is
+      discrete, so a point strictly inside the hull can still be the optimum
+      at one particular remaining capacity, and hull pruning drops exactly
+      those points.
+    * **bin collapse** (``tessera_menu.collapse_to_dp_bins``) drops a rung
+      only when another lands in the same charged bin of THIS DP
+      (``_charged_bins`` at ``bit_precision``, against the unit's own cheapest
+      candidate, which is the baseline ``solve_allocation`` uses). Exact for
+      this solver at this precision and no stronger; skipped entirely when
+      ``bit_precision`` is None.
+
+    Non-Tessera candidates are never touched -- they are partitioned out
+    before either reduction and concatenated back after -- so a run with no
+    Tessera rung on the menu is byte-identical to one built before this
+    function existed.
+    """
+    # Until whole-operator measurements are attached, no byte/loss comparison
+    # can prove runtime dominance. The measured solver owns that reduction.
+    if preserve_runtime_frontier:
+        if report is not None:
+            report.update({
+                "runtime_frontier_preserved": True,
+                "reduction": "deferred_to_measured_runtime_solver",
+                "bit_precision": None,
+                "units": len(candidates),
+                "rungs_menu": sum(map(len, candidates.values())),
+            })
+        return {name: list(rows) for name, rows in candidates.items()}
+    from .tessera_formats import format_promotion_class
+    from .tessera_menu import collapse_to_dp_bins, prune_dominated
+
+    per_unit: dict[str, dict] = {}
+    total_params = sum(
+        int(stats.get(name, {}).get("n_params", 0) or 0)
+        for name in candidates
+    )
+    out: dict[str, list[Candidate]] = {}
+    for name, cands in candidates.items():
+        tessera = [c for c in cands if format_promotion_class(c.fmt) != c.fmt]
+        if not tessera:
+            out[name] = cands
+            continue
+        others = [c for c in cands if format_promotion_class(c.fmt) == c.fmt]
+        rows = [(int(c.memory_bytes), float(c.predicted_dloss), c) for c in tessera]
+        n_menu = len(rows)
+        rows = prune_dominated(rows)
+        n_dom = len(rows)
+        n_params = int(stats.get(name, {}).get("n_params", 0) or 0)
+        if bit_precision is not None and n_params > 0 and total_params > 0:
+            baseline = min(
+                (c.bits_per_param for c in cands),
+                default=0.0,
+            )
+            rows = collapse_to_dp_bins(
+                rows,
+                baseline_bits_per_param=float(baseline),
+                n_params=n_params,
+                total_params=total_params,
+                bit_precision=float(bit_precision),
+            )
+        n_bins = len(rows)
+        kept = [row[2] for row in rows]
+        out[name] = others + kept
+        per_unit[name] = {
+            "menu": n_menu,
+            "after_dominance": n_dom,
+            "after_bin_collapse": n_bins,
+            "non_tessera": len(others),
+            "n_params": n_params,
+        }
+    if per_unit:
+        menu_total = sum(v["menu"] for v in per_unit.values())
+        dom_total = sum(v["after_dominance"] for v in per_unit.values())
+        bin_total = sum(v["after_bin_collapse"] for v in per_unit.values())
+        print(
+            f"[alloc] tessera menu: {len(per_unit)} unit(s), "
+            f"{menu_total} rung(s) -> {dom_total} after dominance -> "
+            f"{bin_total} after bin collapse "
+            f"(bit_precision={bit_precision})",
+            flush=True,
+        )
+        if report is not None:
+            report.update({
+                "units": len(per_unit),
+                "bit_precision": bit_precision,
+                "total_params": total_params,
+                "rungs_menu": menu_total,
+                "rungs_after_dominance": dom_total,
+                "rungs_after_bin_collapse": bin_total,
+                "per_unit": per_unit,
+            })
+    return out
+
+
+RETIRED_TRELLIS_SURFACE_ENV = "PRISMAQUANT_TRELLIS_SURFACE"
+
+
+def refuse_retired_trellis_surface(env: Mapping[str, str] | None = None) -> None:
+    """Refuse a run that still asks for the retired Gridbook trellis surface.
+
+    ``PRISMAQUANT_TRELLIS_SURFACE`` used to point at a manifest of trellis
+    rungs priced on the ``gridbook.trellis.wire.v1`` byte model, offered to
+    the DP through an opt-in seam that itself refused (the eight unwired
+    links). Robert retired the Gridbook lane on 2026-09-02, so the wire, its
+    menu and that seam were archived under
+    ``archive/trellis_wire_2026-09-02/``.
+
+    Dropping the variable instead of refusing on it would let a stale driver
+    keep exporting it and get a *different* allocation with no diagnostic --
+    a gate that fails open, which is the failure class of prismaquant#120.
+    The rungs no longer exist, so a run that asks for them cannot be honoured
+    at any level; it has to stop here rather than silently allocate on the
+    stock menu and look successful.
+
+    Tessera's continuous surface is the successor and needs no flag: it is
+    reduced into every menu unconditionally by
+    :func:`reduce_continuous_menu`. Its wire is ``prismaquant.tessera.v1``,
+    a different plane set, deliberately not a port of the Gridbook one.
+    """
+
+    src = os.environ if env is None else env
+    value = src.get(RETIRED_TRELLIS_SURFACE_ENV)
+    if not value:
+        return
+    raise ValueError(
+        f"{RETIRED_TRELLIS_SURFACE_ENV}={value!r} is set, but the Gridbook "
+        f"trellis rate surface it names has been retired. Its wire "
+        f"(gridbook.trellis.wire.v1), its rung vocabulary (TCQ_*_R256) and "
+        f"its menu seam were archived under "
+        f"archive/trellis_wire_2026-09-02/ when Robert retired the Gridbook "
+        f"lane on 2026-09-02 (RobTand/prismaquant#118); the sanctioned "
+        f"containers are compressed-tensors, GGUF and Tessera. This run is "
+        f"refused rather than ignoring the flag, because ignoring it would "
+        f"hand a stale manifest a DIFFERENT allocation with no diagnostic. "
+        f"Unset {RETIRED_TRELLIS_SURFACE_ENV} to solve on the stock menu; "
+        f"Tessera's continuous rungs (wire prismaquant.tessera.v1) are the "
+        f"successor surface and are already reduced into every menu with no "
+        f"flag at all."
+    )
+
+
 def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                      calibrated_gains: dict[str, float] | None = None,
                      source_manifest: dict[str, str] | None = None,
                      target_profile: str | None = None,
                      mask_records: list[dict] | None = None,
+                     cb_serialization_context: CBSerializationContext | None = None,
+                     activation_pricing: ActivationFairPricing | None = None,
+                     bit_precision: float | None = None,
+                     tessera_menu_report: dict | None = None,
+                     context_by_unit: Mapping[str, ServingContext] | None = None,
+                     preserve_runtime_frontier: bool = False,
                      ) -> dict[str, list[Candidate]]:
     """Build runtime-legal format candidates for every measured Linear.
 
     This is the optimizer's first legality gate. Export keeps a final
     defensive check for stale or hand-written recipes, but the DP must never
     see choices that the selected serving profile cannot run.
+
+    When ``source_manifest`` is present, every census kind must resolve to a
+    registered source footprint owner and each candidate's exact additive
+    tensor payload must be no larger than that source payload.  An absent
+    manifest is the explicit legacy/offline mode; a partial or unknown
+    manifest fails rather than silently omitting an unpriceable unit.
+
+    ``activation_pricing`` (ultraplan P5a) is the run's ONE per-family
+    activation calibration; it corrects the weight-only branches and stamps
+    the branch that priced every candidate. ``target_profile``'s declared
+    serving lanes (P5b) are resolved once per format and explicit serving
+    context, then attached to every candidate, so the concrete route —
+    activation contract, whether the
+    consumer's fused mid-M kernel backs this rung, fallback — travels WITH
+    the choice instead of being reconstructed from the format name later.
+    A v5 contract requires each unit's context from ``context_by_unit``; an
+    absent entry remains unbound and cannot borrow another unit's attestation.
+    An explicit context also binds a legacy lookup: a schema without runtime
+    scope cannot admit that query merely because it does not require one.
+    The existing research menu may still price an unattested writable rung.
     """
+    refuse_retired_trellis_surface()
     gains = calibrated_gains or {}
     out: dict[str, list[Candidate]] = {}
     masked: dict[tuple[str, str], list[str]] = {}
     source_counts: Counter[str] = Counter()
+    activation_branch_counts: Counter[str] = Counter()
+    unpriceable: dict[str, list[str]] = {}
+    unserved: dict[str, list[str]] = {}
+    lane_cache: dict[tuple, object] = {}
+    admission_cache: dict[tuple, object] = {}
     for name, s in stats.items():
         if name not in costs:
             continue
+        serving_context = (
+            context_by_unit.get(name) if context_by_unit is not None else None
+        )
+        context_key = None if serving_context is None else serving_context.key()
+        scope_kwargs = (
+            {} if serving_context is None else {"serving_context": serving_context}
+        )
         shape = _shape_from_stats(s)
         in_features = int(s.get("in_features", 0) or 0)
         out_features = int(s.get("out_features", 0) or 0)
@@ -369,6 +2168,24 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             source_manifest.get(name, "unknown")
             if source_manifest is not None else None
         )
+        if (
+            source_manifest is not None
+            and len(shape) < 2
+        ):
+            raise ValueError(
+                f"{name}: source-bpp legality needs an exact rank>=2 Linear "
+                f"shape, got {shape}; refusing to price row/scale overhead"
+            )
+        if (
+            source_manifest is not None
+            and source_footprint_owner_for_kind(str(source_kind)) is None
+        ):
+            raise ValueError(
+                f"{name}: source_kind={source_kind!r} has no exact source "
+                "footprint owner (registered scaled format or safetensors "
+                "dtype); source-bpp legality cannot be established, so "
+                "refusing to build allocator candidates"
+            )
         cands = []
         for spec in formats:
             entry = None
@@ -378,6 +2195,15 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                     entry = costs[name][candidate_name]
                     entry_fmt = candidate_name
                     break
+            if entry is None and spec.name in SOURCE_PASSTHROUGH_FORMATS:
+                # No cost table will ever carry a column for a byte-copy
+                # contract. Synthesize the row rather than dropping the
+                # candidate: silently omitting it would take the unit's
+                # CHEAPEST ZERO-ERROR option off the menu and leave the DP
+                # choosing only among lossy re-encodes. The legality gate
+                # below still has to agree the source IS this format.
+                entry = synthesized_source_passthrough_cost_entry(spec.name)
+                entry_fmt = spec.name
             if entry is None or "error" in entry:
                 continue
             verdict = check_stats_format_applicability(
@@ -386,6 +2212,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                 qname=name,
                 source_kind=source_kind,
                 target_profile=target_profile,
+                cb_serialization_context=cb_serialization_context,
             )
             if not verdict.legal:
                 if mask_records is not None:
@@ -398,24 +2225,132 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
                         "out_features": out_features,
                         "in_features": in_features,
                         "source_kind": source_kind,
+                        **(verdict.provenance or {}),
                     })
                 masked.setdefault(
                     (spec.name, verdict.reason or "not_applicable"),
                     [],
                 ).append(name)
                 continue
+            if spec.name.startswith("TESSERA_"):
+                from . import tessera_menu
+
+                cache_key = (spec.name, context_key)
+                if cache_key not in admission_cache:
+                    admission_cache[cache_key] = tessera_menu.route_admission(
+                        spec.name, **scope_kwargs
+                    )
+                admission = admission_cache[cache_key]
+                if (
+                    (admission.requires_serving_context or serving_context is not None)
+                    and not admission.admits(tessera_menu.menu_mode())
+                ):
+                    reason = "tessera_serving_context"
+                    if mask_records is not None:
+                        mask_records.append({
+                            "qname": name,
+                            "format": spec.name,
+                            "reason": reason,
+                            "detail": admission.detail,
+                            "shape": [out_features, in_features],
+                            "out_features": out_features,
+                            "in_features": in_features,
+                            "source_kind": source_kind,
+                            "serving_context": (
+                                None if serving_context is None
+                                else serving_context.as_dict()
+                            ),
+                        })
+                    masked.setdefault((spec.name, reason), []).append(name)
+                    unserved.setdefault(name, []).append(spec.name)
+                    continue
             gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
             # Always use measured joint output perturbation when available.
             # Packed experts can carry an unmeasured output_mse placeholder;
             # cost_entry_predicted_dloss falls back to predicted_dloss or
             # weight_mse for those entries.
-            predicted = cost_entry_predicted_dloss(s, entry, gain=gain)
-            source_counts[cost_entry_source(s, entry)] += 1
+            predicted = cost_entry_predicted_dloss(
+                s, entry, gain=gain, format_name=spec.name,
+                activation_pricing=activation_pricing)
+            priced = max(predicted, 0.0)
+            if cost_entry_prices_unmeasured_activation_at_zero(
+                    s, entry, priced, spec.name):
+                # The A-side cost of this W-and-A format was never measured for
+                # this row, and the W side is lossless, so the only price the
+                # cost table can offer is 0.0 — the DP's global optimum. An
+                # unknown priced at the optimum is always selected: exclude the
+                # candidate (counted + logged, exactly like an inapplicable
+                # format) instead of letting the optimizer read a cost that no
+                # measurement supports. See
+                # cost_entry_prices_unmeasured_activation_at_zero.
+                h_trace = float(s.get("h_trace", 0.0) or 0.0)
+                detail = (
+                    f"{spec.name} quantizes activations (act_bits="
+                    f"{spec.act_bits}) but this row has no measured "
+                    "output_mse, and its weight-side error is exactly 0.0 "
+                    "(lossless re-encode of an already-"
+                    f"{spec.name}-shaped source), so the only available "
+                    f"price is dloss 0.0 with h_trace={h_trace:.6g} > 0: an "
+                    "unmeasured activation cost at the DP's global minimum "
+                    f"(cost_source="
+                    f"{cost_entry_source(s, entry, spec.name)})"
+                )
+                if mask_records is not None:
+                    mask_records.append({
+                        "qname": name,
+                        "format": spec.name,
+                        "reason": ACTIVATION_COST_UNMEASURED_REASON,
+                        "detail": detail,
+                        "shape": [out_features, in_features],
+                        "out_features": out_features,
+                        "in_features": in_features,
+                        "source_kind": source_kind,
+                    })
+                masked.setdefault(
+                    (spec.name, ACTIVATION_COST_UNMEASURED_REASON),
+                    [],
+                ).append(name)
+                unpriceable.setdefault(name, []).append(spec.name)
+                continue
+            source_counts[cost_entry_source(s, entry, spec.name)] += 1
+            activation_branch = cost_entry_activation_pricing_branch(
+                s, entry, spec.name, activation_pricing)
+            activation_branch_counts[activation_branch] += 1
+            (
+                memory_bytes,
+                serialized_identity,
+                serialized_sidecar_identity,
+            ) = serialized_candidate_payload(
+                spec,
+                shape,
+                qname=name,
+                cb_serialization_context=cb_serialization_context,
+            )
+            s.setdefault("_memory_bytes_by_format", {})[spec.name] = memory_bytes
+            if serialized_identity is not None:
+                s.setdefault("_serialized_identity_by_format", {})[
+                    spec.name
+                ] = serialized_identity
+                s.setdefault("_serialized_sidecar_identity_by_format", {})[
+                    spec.name
+                ] = serialized_sidecar_identity
+            cache_key = (spec.name, context_key)
+            if cache_key not in lane_cache:
+                lane_cache[cache_key] = serving_lane_route(
+                    target_profile, spec.name, **scope_kwargs
+                )
+            lane = lane_cache[cache_key]
+            if lane is not None:
+                s.setdefault("_serving_lane_by_format", {})[spec.name] = lane
             cands.append(Candidate(
                 fmt=spec.name,
-                bits_per_param=spec.effective_bits_for_shape(shape),
-                memory_bytes=spec.memory_bytes_for_shape(shape),
-                predicted_dloss=max(predicted, 0.0),
+                bits_per_param=8.0 * memory_bytes / max(int(math.prod(shape)), 1),
+                memory_bytes=memory_bytes,
+                predicted_dloss=priced,
+                serialized_identity=serialized_identity,
+                serialized_sidecar_identity=serialized_sidecar_identity,
+                activation_pricing=activation_branch,
+                serving_lane=lane,
             ))
         if cands:
             out[name] = cands
@@ -431,10 +2366,209 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
             f"{source}={count}" for source, count in sorted(source_counts.items())
         )
         print(f"[alloc] cost-source usage: {summary}", flush=True)
+    if activation_branch_counts:
+        # The audit's core complaint made visible per run: how many priced
+        # rows never saw an activation measurement, and of those how many the
+        # per-family calibration corrected.
+        summary = ", ".join(
+            f"{branch}={count}"
+            for branch, count in sorted(activation_branch_counts.items())
+        )
+        print(f"[alloc] activation-pricing branch: {summary}", flush=True)
+    unserved_units = sorted(name for name in unserved if name not in out)
+    if unserved_units:
+        detail = "\n".join(
+            f"    {name}: unattested formats={sorted(unserved[name])}"
+            for name in unserved_units
+        )
+        raise ValueError(
+            f"{len(unserved_units)} Linear(s) have no serving-eligible format "
+            "left after Tessera serving-context admission:\n"
+            f"{detail}\n"
+            "Provide each unit's explicit attested serving context or a legal "
+            "fallback format. Refusing to omit these units from the allocation."
+        )
+    starved = sorted(n for n in unpriceable if n not in out)
+    if starved:
+        # Excluding the unmeasured-activation candidates left these Linears
+        # with NO candidate at all. Dropping them is worse than the bug we just
+        # fixed: a name absent from `out` never reaches the DP, so its bits and
+        # bytes vanish from the bpp/footprint accounting and from serving-unit
+        # membership — silently, with the export still emitting the tensor.
+        # The allocator cannot price these rows, so it must not pretend to.
+        detail = "\n".join(
+            f"    {n}: unpriceable={sorted(unpriceable[n])} (other cost rows: "
+            f"{sorted(set(costs.get(n, {})) - set(unpriceable[n]))})"
+            for n in starved[:8]
+        )
+        raise AssertionError(
+            f"{len(starved)} Linear(s) have no priceable format left after "
+            "excluding activation-quantizing formats whose activation-side "
+            "cost was never measured and whose weight-side error is exactly "
+            f"0.0:\n{detail}\n"
+            "Every legal format for these rows would have been priced at "
+            "dloss 0.0 (the DP's global minimum) on no activation-path "
+            "evidence, and omitting the rows would silently shrink the "
+            "allocator's bit/disk accounting and serving-unit membership. "
+            "Close the measurement gap instead: unset "
+            "PRISMAQUANT_EXPERT_COST_SAMPLE (and make the expert activation "
+            "cache available) so measure_quant_cost records output_mse with "
+            "activation_quantize_dequantize applied, or include a rung whose "
+            "activation path is the identity (BF16, FP8_SOURCE, NVFP4A16, "
+            "MXFP8A16) in the format menu."
+        )
+    # Continuous Tessera rungs, reduced to what this DP can distinguish. A
+    # no-op on a menu with no Tessera rung in it (see reduce_continuous_menu).
+    out = reduce_continuous_menu(
+        out,
+        stats,
+        bit_precision=bit_precision,
+        report=tessera_menu_report,
+        preserve_runtime_frontier=preserve_runtime_frontier,
+    )
     return out
 
 
-def summarize_applicability_masks(records: list[dict]) -> dict:
+def selection_serving_lane_provenance(
+    assignment: dict[str, str],
+    candidates: dict[str, list[Candidate]] | None = None,
+    target_profile: str | None = None,
+    context_by_unit: Mapping[str, ServingContext] | None = None,
+) -> dict:
+    """Per-selected-unit serving-route + activation-pricing provenance (P5b).
+
+    "Neither repo can price an unbacked lane" only holds if the shipped
+    artifact says which lane every selected unit actually rides. This walks
+    the FINAL (expanded) assignment and reports, per unit, format and in aggregate:
+    the activation contract, whether the consumer's fused mid-M kernel backs
+    that rung, the fallback route it takes when it does not, and which
+    estimator priced the unit's activation cost.
+
+    Routes are read from the chosen ``Candidate`` where one exists — the
+    candidate is the object the DP actually saw — and re-resolved from the
+    target profile for expanded members of aggregated super items, which have
+    no candidate of their own. Resolution is scoped by the unit's explicit
+    serving context; equal format names need not have equal routes. A format
+    summary carries one route only when all its selected units agree, while
+    ``by_unit`` preserves each route when contexts or conflicting routes exist.
+    """
+    lane_cache: dict[tuple, object] = {}
+    by_format: dict[str, dict] = {}
+    by_unit: dict[str, dict] = {}
+    include_by_unit = context_by_unit is not None
+    branch_counts: Counter[str] = Counter()
+    contract_counts: Counter[str] = Counter()
+    route_status_counts: Counter[str] = Counter()
+    backed_rungs: set[int] = set()
+    fallback_rungs: set[int] = set()
+    n_backed = n_fallback = n_no_lane = 0
+
+    for name in sorted(assignment):
+        fmt = str(assignment[name])
+        serving_context = (
+            context_by_unit.get(name) if context_by_unit is not None else None
+        )
+        lane = None
+        branch = None
+        for cand in (candidates or {}).get(name, ()):
+            if cand.fmt == fmt:
+                lane = cand.serving_lane
+                branch = cand.activation_pricing
+                break
+        if lane is None:
+            context_key = None if serving_context is None else serving_context.key()
+            cache_key = (fmt, context_key)
+            if cache_key not in lane_cache:
+                scope_kwargs = (
+                    {} if serving_context is None
+                    else {"serving_context": serving_context}
+                )
+                lane_cache[cache_key] = serving_lane_route(
+                    target_profile, fmt, **scope_kwargs
+                )
+            lane = lane_cache[cache_key]
+        route = None if lane is None else lane.as_dict()
+        unit_row = {"format": fmt, "route": route}
+        lane_context = getattr(lane, "serving_context", None)
+        if lane_context is not None:
+            # The chosen candidate's recorded context owns its route even if
+            # a caller now supplies a different context for the same unit.
+            serving_context = lane_context
+            include_by_unit = True
+        if serving_context is not None:
+            unit_row["serving_context"] = serving_context.as_dict()
+        by_unit[name] = unit_row
+        if fmt not in by_format:
+            by_format[fmt] = {"format": fmt, "units": 0, "route": route}
+        row = by_format[fmt]
+        if row["route"] != route:
+            row["route"] = None
+            include_by_unit = True
+        row["units"] += 1
+        branch_counts[str(branch) if branch else "unrecorded"] += 1
+        if lane is None:
+            n_no_lane += 1
+            # A unit whose profile declares no lane has no route status either.
+            # "no_declared_lane" is NOT "backed" and NOT a zero: it is the
+            # vanilla-vLLM state, where absence of evidence was being rendered
+            # as evidence of absence (units_on_fallback_route = 0 was reachable
+            # only by never having looked).
+            route_status_counts["no_declared_lane"] += 1
+            continue
+        contract_counts[lane.activation_contract or "unspecified"] += 1
+        route_status_counts[
+            getattr(lane, "route_status", None) or "no_declared_lane"] += 1
+        if lane.fused_mid_m_backed:
+            n_backed += 1
+            if lane.rung is not None:
+                backed_rungs.add(int(lane.rung))
+        else:
+            n_fallback += 1
+            if lane.rung is not None:
+                fallback_rungs.add(int(lane.rung))
+
+    report = {
+        "schema": SERVING_LANE_SCHEMA,
+        "target_profile": str(target_profile or "research"),
+        "serving_runtime_version": serving_runtime_version(),
+        "units_total": len(assignment),
+        "units_on_backed_fused_mid_m_lane": n_backed,
+        "units_on_fallback_route": n_fallback,
+        "units_without_declared_lane": n_no_lane,
+        # --- Structured route status (campaign rule R3, principle 9). -------
+        # READ THIS BEFORE QUOTING units_on_fallback_route. That counter is
+        # about the FUSED MID-M lane only, and a zero there means "no unit
+        # selected an off-law rung", not "every route is native". The route
+        # status census below is the field that answers the route question,
+        # and its ``unattested`` / ``no_declared_lane`` buckets are how a
+        # lane that has never been looked at is told apart from one that was
+        # looked at and came back clean. Principle 12 requires whichever of
+        # the two is true to travel next to any bpp or KL claim.
+        "route_status_counts": dict(sorted(route_status_counts.items())),
+        "route_status_attested": bool(
+            route_status_counts
+            and not (route_status_counts.keys() & {
+                "unattested", "no_declared_lane"})
+        ),
+        "selected_rungs_fused_mid_m_backed": sorted(backed_rungs),
+        "selected_rungs_on_fallback_route": sorted(fallback_rungs),
+        "activation_contracts": dict(sorted(contract_counts.items())),
+        "activation_pricing_branches": dict(sorted(branch_counts.items())),
+        "by_format": {
+            fmt: row for fmt, row in sorted(by_format.items())
+        },
+    }
+    if include_by_unit:
+        report["by_unit"] = by_unit
+    return report
+
+
+def summarize_applicability_masks(
+    records: list[dict],
+    *,
+    source_census_present: bool | None = None,
+    source_census_units: int | None = None,
+) -> dict:
     """Summarize format candidates removed before the optimizer sees them.
 
     The allocator's legality gate is part of the optimization layer: illegal
@@ -469,6 +2603,24 @@ def summarize_applicability_masks(records: list[dict]) -> dict:
             key=lambda row: (-int(row["count"]), row["shape"]),
         )
 
+    sorted_records = sorted(
+        records,
+        key=lambda row: (
+            str(row.get("format", "")),
+            str(row.get("reason", "")),
+            int(row.get("out_features", 0) or 0),
+            int(row.get("in_features", 0) or 0),
+            str(row.get("qname", "")),
+        ),
+    )
+    source_bpp_eliminations = [
+        row for row in sorted_records
+        if row.get("reason") in {
+            SOURCE_BPP_EXCEEDED_REASON,
+            SOURCE_BPP_UNKNOWN_REASON,
+        }
+    ]
+
     return {
         "summary": {
             fmt: dict(sorted(reason_counts.items()))
@@ -481,20 +2633,460 @@ def summarize_applicability_masks(records: list[dict]) -> dict:
             }
             for fmt, reason_map in sorted(shape_payload.items())
         },
-        "records": sorted(
-            records,
-            key=lambda row: (
-                str(row.get("format", "")),
-                str(row.get("reason", "")),
-                int(row.get("out_features", 0) or 0),
-                int(row.get("in_features", 0) or 0),
-                str(row.get("qname", "")),
+        "records": sorted_records,
+        "source_bpp_legality": {
+            "schema": SOURCE_BPP_POLICY_SCHEMA,
+            "enabled": True,
+            "evaluated": (
+                source_census_present
+                if source_census_present is not None else None
             ),
-        ),
+            "evaluation_status": (
+                "evaluated"
+                if source_census_present is True
+                else "not_evaluated_no_source_census"
+                if source_census_present is False
+                else "unspecified_by_summary_caller"
+            ),
+            "source_census_units": (
+                int(source_census_units)
+                if source_census_units is not None else None
+            ),
+            "comparison": (
+                "candidate_payload_bytes <= source_payload_bytes"
+            ),
+            "comparison_arithmetic": (
+                "exact_integer_bytes_no_float_tolerance"
+            ),
+            "source_footprint_derivation": (
+                "source_kind -> (SOURCE_PASSTHROUGH_CONTRACTS -> "
+                "registered FormatSpec, or safetensors dtype -> existing "
+                "storage-width authority) -> footprint tensor payload"
+            ),
+            "candidate_footprint_derivation": (
+                "footprint.format_tensor_payload_breakdown"
+            ),
+            "no_source_census_policy": "not_evaluated",
+            "unknown_source_kind_policy": "abort_allocator",
+            "eliminated_count": len(source_bpp_eliminations),
+            "eliminated_candidates": source_bpp_eliminations,
+        },
     }
 
 
+def _member_activation_branch(
+    member_candidates: dict[str, dict[str, Candidate]],
+    members: list[str],
+    fmt: "str | None",
+    *,
+    member_formats: dict[str, str] | None = None,
+) -> str | None:
+    """The activation-pricing branch of an AGGREGATED super item.
+
+    A super item's Δloss is the SUM of its members', so a single member
+    priced on an uncalibrated weight-only branch taints the whole unit's
+    claim. Unanimity reports the branch; disagreement is reported as
+    ``mixed:<a>+<b>`` rather than collapsed to the majority, because "some
+    rows of this serving unit never saw an activation measurement" is
+    precisely the fact the stamp exists to preserve.
+    """
+    # ``member_formats`` is the whole-GROUP option's per-member rung map; the
+    # scalar ``fmt`` is the uniform case. Same rule either way: unanimity
+    # reports the branch, disagreement is reported as mixed.
+    picked = (
+        member_formats if member_formats is not None
+        else {m: fmt for m in members}
+    )
+    branches = sorted({
+        str(member_candidates[m][picked[m]].activation_pricing)
+        for m in members
+        if picked.get(m) in member_candidates.get(m, {})
+        and member_candidates[m][picked[m]].activation_pricing is not None
+    })
+    if not branches:
+        return None
+    if len(branches) == 1:
+        return branches[0]
+    return "mixed:" + "+".join(branches)
+
+
+def _member_serving_lane(
+    member_candidates: dict[str, dict[str, Candidate]],
+    members: list[str],
+    fmt: str,
+) -> object | None:
+    """The serving-lane route of an aggregated super item.
+
+    Every member of a fused-sibling / packed serving group loads under ONE
+    format, and the lane is a function of the format and the target profile,
+    so the members' routes are identical by construction.
+    """
+    for m in members:
+        lane = member_candidates[m][fmt].serving_lane
+        if lane is not None:
+            return lane
+    return None
+
+
 _FUSED_SIBLING_MARKER = ".__siblings__."
+
+
+def _pareto_frontier(rows):
+    """``rows`` -> the Pareto set on (bytes ascending, cost descending).
+
+    Dominance only: a point is dropped when another is no larger in BYTES and
+    no larger in COST. This is exact for any knapsack whatsoever, and it is
+    explicitly NOT a convex hull -- the budget is discrete, so a point strictly
+    inside the hull can still be the optimum at one particular remaining
+    capacity, and hull pruning drops exactly those points.
+    """
+    ordered = sorted(rows, key=lambda r: (r[0], r[1]))
+    out = []
+    best = None
+    for row in ordered:
+        if best is None or row[1] < best:
+            out.append(row)
+            best = row[1]
+    return out
+
+
+#: Guard on the intermediate cross product of one fold step. A group whose
+#: members carry thousands of reduced rungs each would otherwise build a
+#: multi-gigabyte intermediate; refusing is right because the exact answer is
+#: the whole point of this path and a truncated one would be a silent
+#: approximation wearing an exactness claim.
+_GROUP_FOLD_MAX_PAIRS = 8_000_000
+
+
+#: The licence a group knapsack has when no Tessera runtime contract is
+#: pinned: none.  Not ``"shared"`` and not ``"per_member"`` -- the *absence*
+#: of a statement, which is a third state a receipt has to be able to tell
+#: from the other two.
+FUSED_LICENCE_UNPINNED = "unpinned"
+
+
+def _fused_group_licence(licence) -> "tuple[str, frozenset[str]]":
+    """``(the q256 licence, the shared fields this fold can hold fixed)``.
+
+    ``licence`` is a
+    :class:`~prismaquant.tessera_runtime_contract.FusedModuleLicence` or
+    ``None``.  Every field is looked up through
+    :meth:`FusedModuleLicence.licence_for`, which RAISES when the contract is
+    silent about it -- silence is not permission, and a block that stopped
+    publishing ``body`` would otherwise quietly stop partitioning on it.
+
+    A ``shared`` field this allocator cannot evaluate refuses outright: the
+    fold cannot hold fixed a thing it cannot compute, and enumerating as
+    though the field were not there is exactly the assertion reading a table
+    exists to avoid.  Which fields those are is a rule, not a roster --
+    ``tessera_formats.FUSED_MODULE_RUNG_FIELDS`` are the ones a rung decides
+    and ``FUSED_MODULE_SHAPE_FIELDS`` the ones fixed before the allocator
+    chooses anything -- so a field outside both is an unknown vocabulary.
+    """
+    from .tessera_formats import (
+        FUSED_MODULE_RATE_FIELD, FUSED_MODULE_RUNG_FIELDS,
+        FUSED_MODULE_SHAPE_FIELDS,
+    )
+
+    if licence is None:
+        return FUSED_LICENCE_UNPINNED, frozenset()
+    known = {*FUSED_MODULE_RUNG_FIELDS, *FUSED_MODULE_SHAPE_FIELDS,
+             FUSED_MODULE_RATE_FIELD}
+    unknown = sorted(licence.shared_fields() - known)
+    if unknown:
+        raise NotImplementedError(
+            "the pinned Tessera contract's fused_module block marks "
+            f"{unknown} as fields one fused module's roles must SHARE, and "
+            "this allocator cannot evaluate them, so it cannot hold them "
+            "fixed across a group. Map them in "
+            "tessera_formats.FUSED_MODULE_RUNG_FIELDS (a rung decides it) or "
+            "FUSED_MODULE_SHAPE_FIELDS (it is fixed before the allocator "
+            "chooses) and say which; folding as though the field were absent "
+            "would be the assertion reading the contract exists to prevent."
+        )
+    shared = frozenset(
+        field for field in FUSED_MODULE_RUNG_FIELDS
+        if licence.licence_for(field) == "shared"
+    )
+    rate = str(licence.licence_for(FUSED_MODULE_RATE_FIELD))
+    if rate == "shared":
+        shared = shared | {FUSED_MODULE_RATE_FIELD}
+    return rate, shared
+
+
+def _fold_cell_label(family: str, signature: "tuple[tuple[str, str], ...]"
+                     ) -> str:
+    """A report key for one ``(family, shared-signature)`` fold cell."""
+    tail = ",".join(f"{k}={v}" for k, v in signature if k != "family")
+    return f"{family}[{tail}]" if tail else str(family)
+
+
+def _fused_licence_stamp(licence, rate: str, shared: "frozenset[str]",
+                         *, folded: bool, note: str,
+                         declined_reason: "str | None" = None) -> dict:
+    """The ``__licence__`` row: what was read, and what it licensed.
+
+    Written for every group with a Tessera rung on a member's menu, folded or
+    not -- a receipt kept only on success cannot record WHY a group has one
+    rung, which is the one case it has to be able to answer. A group whose
+    members carry only stock formats never asks the licence question and gets
+    no receipt.  Every value the reader parsed out
+    of the block appears here, so a field that reaches a gate is a field this
+    receipt names (``fields`` verbatim, plus the two adjacent statements the
+    same read picks up).
+    """
+    stamp = {
+        "source": "tessera_runtime_contract:fused_module",
+        "q256": rate,
+        # What the CONTRACT marks shared, and the subset of it this fold
+        # evaluates from a rung. The two differ on purpose: ``columns`` and
+        # ``structure`` are shared and no rung can move them, so the partition
+        # does not carry them and the stamp must not imply the contract was
+        # silent about them.
+        "contract_shared_fields": sorted(
+            () if licence is None else licence.shared_fields()),
+        "partitioned_on": sorted(shared),
+        "folded": bool(folded),
+        "fields": ({} if licence is None
+                   else {str(k): str(v) for k, v in sorted(
+                       licence.fields.items())}),
+        "schema": "" if licence is None else str(licence.schema),
+        "sidecar_q256": ("" if licence is None
+                         else str(licence.sidecar_q256)),
+        "mixed_rung_receipt": (False if licence is None
+                               else bool(licence.mixed_rung_receipt)),
+        "note": note,
+    }
+    if declined_reason is not None:
+        stamp["declined"] = declined_reason
+    return stamp
+
+
+def tessera_group_composites(
+    members: list[str],
+    candidates: dict[str, list["Candidate"]],
+    n_params: int,
+    *,
+    licence,
+    ucb_z: float = 0.0,
+    report: dict | None = None,
+    preserve_runtime_frontier: bool = False,
+) -> list["Candidate"]:
+    """The group's exact knapsack, over the fields the CONTRACT frees (#132).
+
+    A fused group is ONE module to the runtime, so what its members may
+    disagree about is a fact about that runtime, and it arrives here as
+    ``licence`` -- the pinned Tessera contract's ``fused_module`` block,
+    parsed (``tessera_runtime_contract.FusedModuleLicence``), read through
+    ``tessera_menu.fused_module_licence`` and checked on the Tessera side
+    against the loader's own ``scheme.FUSED_MODULE_FIELDS``.  It is **never** a
+    literal in this file. ``None`` means no applicable licence was supplied,
+    rather than a permissive default. Production can supply the licence from
+    the reviewed commit-and-contract pin; a release tag is not required.
+    This function used to assert the licence in its own docstring ("they can
+    disagree about the rate"), which is the field shape principle 14 forbids:
+    no gate can read a docstring, so nothing refused when the runtime changed
+    its mind, and a contract that re-tightened ``q256`` would have left the
+    fold enumerating rungs the exporter refuses with nothing raising until
+    export.
+
+    Two things follow from reading it rather than asserting it, and they point
+    in opposite directions:
+
+    * ``q256: per_member`` is the licence for the fold at all.  Withdraw it --
+      ``licence`` absent, or ``q256`` marked ``shared`` -- and this returns no
+      options, so the group keeps the per-NAME intersection the caller already
+      built, which asserts nothing per member.  A ``shared`` field the fold
+      cannot evaluate is a refusal, not a skip
+      (:func:`_fused_group_licence`).
+    * the ``shared`` fields **narrow the fold**, and holding the family fixed
+      is not enough to honour them.  The wire is
+      ``tessera.export.wire_recipe(grid, q256)``: a function of the rung, not
+      of the family.  On ``E2M1x2`` it flips at the TCQ cap -- rungs below 896
+      write a WINDOW body, 896 writes TCQ -- so a family-only fold could put
+      two ``body`` values in one module, and ``body`` is ``shared``.  The fold
+      therefore runs per **coherence class**: the members' menus are keyed by
+      :func:`tessera_formats.fused_shared_signature`, which evaluates exactly
+      the shared fields a rung decides, and only rungs in one class are summed.
+      A contract that later frees ``body`` widens the classes on its own.
+
+    Why the fold, once a class is fixed: ``q_proj`` (2048x1024) and ``k_proj``
+    (1024x1024) are different tensors with different sensitivities fused into
+    one ``qkv_proj``, and a continuous rate axis whose group units are pinned
+    to one shared rung throws that away.  The old aggregation intersected the
+    members' menus by format NAME, which forces exactly that: on a
+    measured-only Tessera table the qkv E4M3 intersection was a single rung.
+    For each class, the group's option set is the **Minkowski sum** of its
+    members' (bytes, cost) menus restricted to that class -- the group's own
+    multi-choice knapsack -- kept as a Pareto set.  The outer DP then chooses
+    among those options exactly as it chooses among rungs of a single unit.
+
+    Exact, not approximate:
+
+    * the fold is a full cross product at each step, Pareto-pruned by
+      **dominance** (never a hull -- see ``_pareto_frontier``), so no option
+      the DP could have wanted is discarded;
+    * costs are summed from the members' own ``Candidate.predicted_dloss``,
+      the same numbers the DP would charge if the members were separate units,
+      so a uniform-rung option prices identically to the old per-NAME
+      aggregation (asserted by the caller);
+    * mixed-rung composites retain their existing ``z > 0`` refusal. The
+      conservative uncertainty bound on uniform groups does not establish
+      support for uncertainty repricing across this separate option path.
+    """
+    from .tessera_formats import (
+        format_promotion_class, fused_shared_signature,
+        tessera_group_option_name,
+    )
+
+    if len(members) < 2:
+        return []
+
+    rate_licence, shared = _fused_group_licence(licence)
+
+    # A "cell" is one (family, shared-signature) pair: the set of rungs that
+    # may sit together in one fused module.  Under the published licence the
+    # signature is the decoder identity a rung commits to -- grid, body,
+    # plane -- and NOT the family alone, because the recipe is a function of
+    # (grid, q256).
+    by_member: list[dict[tuple, list[tuple[int, float, str]]]] = []
+    for member in members:
+        cells: dict[tuple, list[tuple[int, float, str]]] = {}
+        for cand in candidates.get(member, []):
+            family = format_promotion_class(cand.fmt)
+            if family == cand.fmt:
+                continue          # a stock format; the per-NAME path owns it
+            signature = fused_shared_signature(cand.fmt, shared)
+            if signature is None:
+                # Not a rung name, yet its promotion class differs from it --
+                # a whole-group option fed back in, which is not a member menu
+                # entry. Refuse rather than fold an option of an option.
+                raise AssertionError(
+                    f"{member} carries {cand.fmt!r}, which is not a Tessera "
+                    "rung name but does not promote to itself either; the "
+                    "group knapsack folds member RUNGS."
+                )
+            cells.setdefault((family, signature), []).append(
+                (int(cand.memory_bytes), float(cand.predicted_dloss), cand.fmt))
+        by_member.append(cells)
+
+    if not any(by_member):
+        # No member's menu carries a Tessera rung at all, so the licence
+        # question never arises here: this group belongs entirely to the
+        # per-NAME path, which is production today and every stock model. It
+        # matters that this returns BEFORE the stamp: a receipt written here
+        # would put a licence nobody read (and, unpinned, one that does not
+        # exist) on every fused group of every run, and the caller would hang
+        # a ``_tessera_group_menu`` off a super item that has no Tessera
+        # option in it.
+        return []
+
+    shared_classes = set(by_member[0])
+    for cells in by_member[1:]:
+        shared_classes &= set(cells)
+
+    if rate_licence != "per_member":
+        # The licence for the one field this fold varies. Asked whenever a
+        # member carries a rung, whether or not the members happen to share a
+        # class: the answer is a property of the contract, and a group that is
+        # refused the licence must say so even when it would also have had
+        # nothing to fold. Withdrawn (or never
+        # published, i.e. no contract pinned) means there is no per-member rung
+        # to enumerate: decline, stamp why, and let the per-NAME path's uniform
+        # options stand.
+        if report is not None:
+            report["__licence__"] = _fused_licence_stamp(
+                licence, rate_licence, shared, folded=False,
+                note=(
+                    "the pinned Tessera contract does not license a rate per "
+                    "member (fused_module.fields.q256 = "
+                    f"{rate_licence!r}), so this group keeps one rung per "
+                    "option"
+                    if rate_licence != FUSED_LICENCE_UNPINNED else
+                    "no Tessera runtime contract is pinned, so there is no "
+                    "fused_module licence to read and the fold declines "
+                    "rather than assert one"))
+        return []
+
+    # Checked HERE, not on entry: a stock-only group under a hedge has no
+    # classes to fold and must be untouched by this path.
+    if shared_classes and float(ucb_z) > 0.0:
+        raise NotImplementedError(
+            "Tessera mixed-rung group composites do not support UCB pricing: "
+            f"PRISMAQUANT_COST_UCB_Z={ucb_z}. Set the hedge to 0 for a "
+            "Tessera group run; uniform-group uncertainty support does not "
+            "enable uncertainty repricing for mixed-rung options."
+        )
+
+    # A fused runtime measurement prices the complete member recipe. Without
+    # that measurement even an intermediate byte/loss-dominated combination
+    # may be uniquely fastest. Preserve all coherent combinations, with the
+    # existing explicit memory guard, until the runtime solver can price them.
+    reduce_rows = (
+        (lambda rows: sorted(rows, key=lambda row: (row[0], row[1], row[2])))
+        if preserve_runtime_frontier else _pareto_frontier
+    )
+    out: list["Candidate"] = []
+    index = 0
+    for cell in sorted(shared_classes):
+        family, signature = cell
+        frontier = [
+            (bytes_, cost, (fmt,))
+            for bytes_, cost, fmt in reduce_rows(by_member[0][cell])
+        ]
+        sizes = [len(frontier)]
+        for cells in by_member[1:]:
+            member_rows = reduce_rows(cells[cell])
+            pairs = len(frontier) * len(member_rows)
+            if pairs > _GROUP_FOLD_MAX_PAIRS:
+                raise AssertionError(
+                    f"group fold for {_fold_cell_label(family, signature)} "
+                    f"would build {pairs:,} "
+                    f"intermediate options ({len(frontier):,} x "
+                    f"{len(member_rows):,}), over the "
+                    f"{_GROUP_FOLD_MAX_PAIRS:,} guard. Reduce the per-unit "
+                    "menu first (reduce_continuous_menu) -- truncating here "
+                    "would make an exact construction silently approximate."
+                )
+            frontier = reduce_rows([
+                (a_bytes + b_bytes, a_cost + b_cost, a_fmts + (b_fmt,))
+                for a_bytes, a_cost, a_fmts in frontier
+                for b_bytes, b_cost, b_fmt in member_rows
+            ])
+            sizes.append(len(frontier))
+        for total_bytes, total_cost, fmts in frontier:
+            member_formats = dict(zip(members, fmts))
+            out.append(Candidate(
+                fmt=tessera_group_option_name(family, index),
+                bits_per_param=8.0 * total_bytes / max(int(n_params), 1),
+                memory_bytes=int(total_bytes),
+                predicted_dloss=max(float(total_cost), 0.0),
+                member_formats=member_formats,
+            ))
+            index += 1
+        if report is not None:
+            # Keyed by the CELL, not the family: one family can carry more than
+            # one shared signature, and reporting them under one key would hide
+            # the partition the licence forced.
+            report[_fold_cell_label(family, signature)] = {
+                "member_menu": [len(c[cell]) for c in by_member],
+                "fold_frontier": sizes,
+                "options": len(frontier),
+                **({"runtime_frontier_preserved": True}
+                   if preserve_runtime_frontier else {}),
+            }
+    if report is not None:
+        report["__licence__"] = _fused_licence_stamp(
+            licence, rate_licence, shared, folded=bool(out),
+            note=(
+                "a rate per member is licensed by the pinned contract's "
+                "fused_module block; mixed_rung_receipt says whether any "
+                "SERVE has covered such a module"
+                if shared_classes else
+                "a rate per member is licensed, but the members share no "
+                "coherence class under the contract's shared fields, so "
+                "there is nothing to fold"))
+    return out
 
 
 def aggregate_fused_siblings(
@@ -504,16 +3096,64 @@ def aggregate_fused_siblings(
     candidates: dict[str, list[Candidate]],
     profile,
     calibrated_gains: dict[str, float] | None = None,
+    activation_pricing: ActivationFairPricing | None = None,
+    preserve_runtime_frontier: bool = False,
 ) -> tuple[dict, dict, dict]:
-    """Aggregate fused siblings into single DP items."""
+    """Aggregate fused siblings into single DP items.
+
+    Each group gets one super item carrying two kinds of option: one per stock
+    format NAME, from the intersection of the members' menus (a stock format
+    is one thing to the runtime, so the members must share it); and, for each
+    Tessera coherence class the members share, the group's own exact
+    multi-choice knapsack over their rungs
+    (:func:`tessera_group_composites`) -- one decoder across the group, a rate
+    per member. The second kind exists because a Tessera rung is a family and
+    a rate glued into one name and only the first is a dispatch property;
+    intersecting by name forced a shared rate that no runtime asks for, and on
+    a continuous axis that collapsed a group's whole menu to whatever single
+    rung its members happened to share.
+
+    **Which fields the members may disagree about is READ, not assumed**
+    (prismaquant #132): the pinned Tessera contract's ``fused_module`` block
+    is loaded once per aggregation, through ``tessera_menu``'s declared one
+    read, and passed down. ``None`` -- no contract pinned, which is production
+    -- means the second kind of option does not exist at all, and a class the
+    members share only rescues an empty NAME intersection while the contract
+    frees the rate per member.
+
+    A group whose members share neither a legal format NOR a Tessera coherence
+    class the contract frees is a HARD ERROR, not a fallback to individual
+    rows. Fused siblings (q/k/v, gate/up) must load
+    under ONE format — that is a serving invariant, not a preference — so
+    members with disjoint menus cannot be coherently promoted at all: whatever
+    format whole-group promotion lands on is illegal for at least one member,
+    and ``compute_achieved`` now refuses to price that state (AssertionError,
+    at every target) rather than scoring the unpriced member at zero Δloss.
+    Individual rows would therefore only defer the same failure past the solve,
+    while a silently missing ``candidates_ext`` entry (the pre-fix behavior:
+    ``stats_ext``/``costs_ext`` assigned, ``candidates_ext`` not) drops the
+    whole group from the DP with no error at all. The same argument is written
+    out at length in ``aggregate_packed_serving_groups``.
+    """
     if profile is None:
         return stats, costs, candidates
 
     gains = calibrated_gains or {}
+    ucb_z = _cost_ucb_z()
+    # Principle 14: what one fused module's roles may disagree about is a fact
+    # about the serving runtime, so it is read from the table that runtime
+    # publishes -- once per aggregation, not once per group, and through
+    # ``tessera_menu``'s declared one read, so the licence and the route
+    # admission cannot come from two different Tessera builds inside one run.
+    # ``None`` is "no Tessera runtime is pinned", which is production with the
+    # dev pin unset, and the fold declines rather than assuming the licence it
+    # used to assert in a docstring (#132).
+    from .tessera_menu import fused_module_licence as _fused_module_licence
+    fused_licence = _fused_module_licence()
     grouped: dict[str, list[str]] = {}
     ungrouped: list[str] = []
     for name in candidates:
-        if ".__fused__." in name or _PACKED_GROUP_MARKER in name:
+        if _FUSED_SIBLING_MARKER in name or _PACKED_GROUP_MARKER in name:
             ungrouped.append(name)
             continue
         try:
@@ -535,6 +3175,11 @@ def aggregate_fused_siblings(
     stats_ext = {n: stats[n] for n in ungrouped}
     costs_ext = {n: costs.get(n, {}) for n in ungrouped}
     candidates_ext = {n: candidates[n] for n in ungrouped}
+
+    # Evaluated once, above the loop: an unevaluable ``shared`` field is a
+    # refusal about the CONTRACT, and refusing it once per group would report
+    # the same fact as many times as the model has fused groups.
+    _q256_licence, _shared_fields = _fused_group_licence(fused_licence)
 
     for key, members in grouped.items():
         members = sorted(members)
@@ -566,13 +3211,8 @@ def aggregate_fused_siblings(
             resolved_entries: list[tuple[str, dict]] = []
             missing = []
             for m in members:
-                entry = None
-                entry_fmt = spec.name
-                for candidate_name in fr.aliases_for(spec.name):
-                    if candidate_name in costs.get(m, {}):
-                        entry = costs[m][candidate_name]
-                        entry_fmt = candidate_name
-                        break
+                entry, entry_fmt = _resolve_cost_entry(
+                    costs.get(m, {}), spec.name)
                 if entry is None or "error" in entry:
                     missing.append(m)
                 else:
@@ -583,15 +3223,40 @@ def aggregate_fused_siblings(
             if resolved_entries:
                 super_cost_entry_fmt[spec.name] = resolved_entries[0][0]
             sum_pred = 0.0
+            member_terms = []
+            # P5a: the per-family activation penalty is a MULTIPLIER on the
+            # weight-only branch, so it scales the member dloss and the
+            # member stderr identically — passed as the hedge's scale below
+            # (the calibrated gain enters once, later).
+            act_penalty = _activation_penalty(spec.name, activation_pricing)
             for m, (_entry_fmt, c) in zip(members, resolved_entries):
                 # Mirrors build_candidates, including unmeasured packed
-                # output_mse fallback and format-alias lookup.
-                sum_pred += cost_entry_predicted_dloss(stats[m], c)
-            effective_mse = sum_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
+                # output_mse fallback, bit-exact short-circuit, and
+                # format-alias lookup. The calibrated gain is applied ONCE to
+                # the summed super-item dloss (below, at candidate build), so
+                # the per-member terms here — and the hedge conversion — are
+                # un-gained.
+                member_pred = cost_entry_predicted_dloss(
+                    stats[m], c, format_name=spec.name,
+                    activation_pricing=activation_pricing)
+                sum_pred += member_pred
+                member_terms.append((stats[m], c, member_pred, act_penalty))
+            # Recover the unhedged sum for weight_mse, and store the shared
+            # conservative stderr bound so grouped-table consumers preserve
+            # the uncertainty price. Shared probes do not justify quadrature.
+            hedge_linear, stderr_agg = _super_item_ucb_hedge(
+                member_terms, ucb_z)
+            base_pred = sum_pred - hedge_linear
+            effective_mse = base_pred / (0.5 * sum_h) if sum_h > 0 else 0.0
             super_cost[spec.name] = {
                 "weight_mse": effective_mse,
-                "predicted_dloss": sum_pred,
+                "predicted_dloss": base_pred,
+                "predicted_dloss_stderr": stderr_agg,
             }
+            if activation_pricing is not None:
+                # The members' penalties are already inside base_pred; mark
+                # the super entry so a re-price cannot square the correction.
+                super_cost[spec.name][APPLIED_MARKER_KEY] = True
         costs_ext[super_name] = super_cost
 
         member_format_sets = [
@@ -602,7 +3267,57 @@ def aggregate_fused_siblings(
             member_format_intersection = set.intersection(*member_format_sets)
         else:
             member_format_intersection = set()
+        # An empty NAME intersection is no longer fatal on its own: a group
+        # whose members share a Tessera FAMILY but no single rung is a legal,
+        # allocatable state -- one decoder, a rate per member -- and the
+        # composite path below builds exactly those options. It is fatal when
+        # the members share neither.
+        # A shared Tessera FAMILY rescues an empty NAME intersection only when
+        # the pinned contract frees the rate per member: without that licence
+        # the group still needs one rung, and one rung it can all run is
+        # exactly what the NAME intersection is. Counting the family here on
+        # an unpinned run would let the group past this gate on a permission
+        # nothing granted, and it would then reach the fold and get nothing.
+        from .tessera_formats import format_promotion_class as _promo
+        from .tessera_formats import fused_shared_signature as _sig
+        if _q256_licence == "per_member":
+            # The same CELL key the fold uses, so this gate and the fold agree
+            # on what "the members share a foldable class" means.
+            member_class_sets = [
+                {(_promo(c.fmt), _sig(c.fmt, _shared_fields))
+                 for c in candidates.get(m, [])
+                 if _promo(c.fmt) != c.fmt
+                 and _sig(c.fmt, _shared_fields) is not None}
+                for m in members
+            ]
+            shared_classes = (
+                set.intersection(*member_class_sets) if member_class_sets
+                else set()
+            )
+        else:
+            shared_classes = set()
+        if not member_format_intersection and not shared_classes:
+            raise AssertionError(
+                _fused_group_menu_error(
+                    super_name,
+                    key,
+                    members,
+                    candidates,
+                    member_format_intersection,
+                    formats,
+                    "share no legal format and no Tessera coherence class the "
+                    f"pinned runtime contract frees (q256 licence: "
+                    f"{_q256_licence!r})",
+                )
+            )
 
+        member_by_name = {
+            member: {
+                candidate.fmt: candidate for candidate in candidates[member]
+            }
+            for member in members
+        }
+        _ = member_by_name
         cands = []
         for spec in formats:
             if spec.name not in member_format_intersection:
@@ -610,34 +3325,290 @@ def aggregate_fused_siblings(
             entry = super_cost.get(spec.name)
             if entry is None or "error" in entry:
                 continue
-            total_bytes = 0
-            for m in members:
-                shape = _shape_from_stats(stats[m])
-                total_bytes += spec.memory_bytes_for_shape(shape)
+            total_bytes = sum(
+                int(member_by_name[m][spec.name].memory_bytes) for m in members
+            )
+            serialized_identities = sorted({
+                identity
+                for m in members
+                for identity in (member_by_name[m][spec.name].serialized_identity,)
+                if identity is not None
+            })
+            serialized_sidecar_identities = sorted({
+                identity
+                for m in members
+                for identity in (
+                    member_by_name[m][spec.name].serialized_sidecar_identity,
+                )
+                if identity is not None
+            })
             bits_per_param = 8.0 * total_bytes / max(n_params, 1)
             stats_ext[super_name]["_memory_bytes_by_format"][spec.name] = total_bytes
             entry_fmt = super_cost_entry_fmt.get(spec.name, spec.name)
             gain = float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
-            predicted = entry["predicted_dloss"] * gain
+            # gain·(base + z·stderr_agg) == gain·base + z·Σ (stderr·gain)
+            # for the single group-wide gain this path applies, i.e. exactly the
+            # packed path's construction. At z == 0 this is gain·sum_pred,
+            # bit-for-bit what this path produced before the hedge fix.
+            predicted = (
+                entry["predicted_dloss"]
+                + ucb_z * float(entry.get("predicted_dloss_stderr", 0.0))
+            ) * gain
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=bits_per_param,
                 memory_bytes=total_bytes,
                 predicted_dloss=max(predicted, 0.0),
+                activation_pricing=_member_activation_branch(
+                    member_by_name, members, spec.name),
+                serving_lane=_member_serving_lane(
+                    member_by_name, members, spec.name),
+                serialized_identity=(
+                    json.dumps(serialized_identities, separators=(",", ":"))
+                    if serialized_identities else None
+                ),
+                serialized_sidecar_identity=(
+                    json.dumps(
+                        serialized_sidecar_identities,
+                        separators=(",", ":"),
+                    )
+                    if serialized_sidecar_identities else None
+                ),
             ))
-        if cands:
-            candidates_ext[super_name] = cands
+        # One family per group, a rate per member: the group's exact
+        # multi-choice knapsack over its members' Tessera menus, kept as a
+        # Pareto set. See ``tessera_group_composites``. Built AFTER the
+        # per-NAME options above so that a uniform-rung option exists in both
+        # constructions and can be cross-checked.
+        group_report: dict = {}
+        # An ABLATION, opt-in and off by default: with the fold disabled the
+        # group keeps only the per-NAME intersection, which is the one-rung
+        # constraint the plugin does NOT require. It exists so "what did the
+        # wrong decision-unit constraint cost?" can be measured on the same
+        # cost table as the right one instead of across two campaigns. It is
+        # not a production lever -- an allocation built with it is a strictly
+        # worse legal allocation -- and it is stamped into the group report so
+        # a receipt cannot quote an ablated run as a result.
+        fold_enabled = os.environ.get(
+            "PRISMAQUANT_TESSERA_GROUP_KNAPSACK", "1").strip() not in ("0", "off")
+        # ``columns`` is a field the contract marks shared, and the one shared
+        # field no RUNG can move: a fused module's roles all read the same
+        # input. So it is checked where it can actually differ -- on the group
+        # the PROFILE built -- and it is a refusal of the FOLD, not of the run:
+        # the shape of a profile's groups is not this function's to veto, and
+        # the per-NAME path that owns such a group asserts nothing per member.
+        # The named reason travels in the receipt, the way
+        # ``FormatApplicability(False, ..., reason)`` carries one.
+        columns_reason: "str | None" = None
+        if _q256_licence == "per_member" and "columns" in (
+                frozenset() if fused_licence is None
+                else fused_licence.shared_fields()):
+            widths = sorted({
+                int(stats[m]["in_features"]) for m in members
+                if stats[m].get("in_features")
+            })
+            if len(widths) > 1:
+                columns_reason = (
+                    "the pinned contract marks fused_module.columns as shared "
+                    f"across a fused module's roles, and this group's members "
+                    f"read {widths} input columns, so it is not one module to "
+                    "the runtime and its members' rungs must not be folded "
+                    "into one option")
+        composites = (
+            tessera_group_composites(
+                members, candidates, n_params, licence=fused_licence,
+                ucb_z=ucb_z, report=group_report,
+                preserve_runtime_frontier=preserve_runtime_frontier)
+            if fold_enabled and columns_reason is None else []
+        )
+        if columns_reason is not None:
+            group_report["__licence__"] = _fused_licence_stamp(
+                fused_licence, _q256_licence, _shared_fields, folded=False,
+                note="the fold declined on a shared field it could evaluate",
+                declined_reason=columns_reason)
+        if not fold_enabled:
+            group_report["__ablation__"] = {
+                "group_knapsack": False,
+                "note": "PRISMAQUANT_TESSERA_GROUP_KNAPSACK=0: one rung per "
+                        "fused group, which is not the constraint the pinned "
+                        "contract's fused_module block states",
+            }
+        if composites:
+            uniform_by_name = {c.fmt: c for c in cands}
+            member_formats_by_option: dict[str, dict[str, str]] = {}
+            for composite in composites:
+                member_formats = composite.member_formats or {}
+                super_cost[composite.fmt] = {
+                    "predicted_dloss": float(composite.predicted_dloss),
+                    "predicted_dloss_stderr": 0.0,
+                    "weight_mse": (
+                        float(composite.predicted_dloss) / (0.5 * sum_h)
+                        if sum_h > 0 else 0.0),
+                }
+                if activation_pricing is not None:
+                    super_cost[composite.fmt][APPLIED_MARKER_KEY] = True
+                stats_ext[super_name]["_memory_bytes_by_format"][
+                    composite.fmt] = int(composite.memory_bytes)
+                member_formats_by_option[composite.fmt] = dict(member_formats)
+                shared = set(member_formats.values())
+                if len(shared) == 1:
+                    # The same option the per-NAME path built. It must price
+                    # identically -- summing the members' own candidate costs
+                    # is the same arithmetic the per-NAME path does through
+                    # the cost table -- and if it does not, the two
+                    # constructions disagree about what a group costs and one
+                    # of them is wrong. Refuse rather than let the DP arbitrage
+                    # the difference.
+                    twin = uniform_by_name.get(next(iter(shared)))
+                    if twin is not None:
+                        if int(twin.memory_bytes) != int(
+                                composite.memory_bytes):
+                            raise AssertionError(
+                                f"{super_name}: uniform option "
+                                f"{twin.fmt} weighs "
+                                f"{twin.memory_bytes} through the per-NAME "
+                                f"path and {composite.memory_bytes} through "
+                                "the group knapsack")
+                        lhs = float(twin.predicted_dloss)
+                        rhs = float(composite.predicted_dloss)
+                        if abs(lhs - rhs) > 1e-9 * max(abs(lhs), abs(rhs), 1e-12):
+                            raise AssertionError(
+                                f"{super_name}: uniform option {twin.fmt} "
+                                f"costs {lhs!r} through the per-NAME path and "
+                                f"{rhs!r} through the group knapsack. The two "
+                                "constructions must agree on the option they "
+                                "share (calibrated gains keyed per rung, or a "
+                                "non-zero UCB hedge, will do this).")
+                # Provenance is the join of the members', same as the
+                # per-NAME path builds for a shared format.
+                composite.activation_pricing = _member_activation_branch(
+                    {m: {c.fmt: c for c in candidates[m]} for m in members},
+                    members, None, member_formats=member_formats)
+            stats_ext[super_name]["_fused_member_formats"] = (
+                member_formats_by_option)
+            # Runtime binding names the expanded recipe, so its uniform
+            # per-NAME option and the byte/cost-checked composite twin must
+            # not both survive. No distinct member recipe is discarded.
+            cands.extend(
+                composite for composite in composites
+                if not preserve_runtime_frontier
+                or len(set((composite.member_formats or {}).values())) != 1
+                or next(iter(composite.member_formats.values())) not in uniform_by_name
+            )
+        # Written whether or not the fold produced anything. A report kept
+        # only on success cannot record why a group has one rung, which is
+        # the one case a receipt has to be able to read: the ablation stamp
+        # above and the ``__licence__`` stamp the fold writes both live on
+        # exactly the runs that produced no composite, and both were
+        # unreachable while this line sat inside ``if composites``.
+        if group_report:
+            stats_ext[super_name]["_tessera_group_menu"] = dict(group_report)
+
+        if not cands:
+            # Unreachable via the intersection (a common candidate format
+            # implies a non-error cost row for every member), so this catches
+            # the residual case: an aggregation menu that does not contain the
+            # formats the member candidates were built from. Same verdict —
+            # stats_ext/costs_ext are already written, so returning here would
+            # drop the group from the DP silently.
+            reason = (
+                "share legal formats that this aggregation menu does not price"
+            )
+            if shared_classes:
+                reason += (
+                    f" (the members do share the Tessera coherence classes "
+                    f"{sorted(_fold_cell_label(f, sig) for f, sig in shared_classes)}"
+                    ", but the group knapsack produced nothing; the group's "
+                    "_tessera_group_menu __licence__ stamp says which state "
+                    "it was in)"
+                )
+            raise AssertionError(
+                _fused_group_menu_error(
+                    super_name,
+                    key,
+                    members,
+                    candidates,
+                    member_format_intersection,
+                    formats,
+                    reason,
+                )
+            )
+        candidates_ext[super_name] = cands
 
     return stats_ext, costs_ext, candidates_ext
 
 
+def _fused_group_menu_error(
+    super_name: str,
+    key: str,
+    members: list[str],
+    candidates: dict[str, list[Candidate]],
+    intersection: set[str],
+    formats: list[fr.FormatSpec],
+    what: str,
+) -> str:
+    """Diagnostic for a fused-sibling group that cannot be given one format."""
+    member_lines = "\n".join(
+        f"    {m}: legal={sorted(c.fmt for c in candidates.get(m, []))}"
+        for m in members
+    )
+    return (
+        f"fused-sibling group {key!r} (DP unit {super_name!r}) has "
+        f"{len(members)} members that {what}:\n"
+        f"{member_lines}\n"
+        f"    common formats: {sorted(intersection)}\n"
+        f"    aggregation menu: {[s.name for s in formats]}\n"
+        "Fused siblings (q/k/v, gate/up) MUST load under one format, so an "
+        "empty intersection is not an allocatable state: any format whole-"
+        "group promotion picks is illegal for at least one member, and "
+        "compute_achieved refuses to price that (it would otherwise score the "
+        "unpriced member at zero Δloss and bias the min-Δloss ratchet toward "
+        "exactly this state). Falling back to individual rows would only defer "
+        "the same failure past the solve. This is an upstream cost/legality "
+        "bug to fix, not a state to allocate around: a missing cost row for "
+        "one sibling, an over-tight applicability mask (see the "
+        "[alloc] format-applicability log lines and the mask summary JSON), or "
+        "a passthrough-source mismatch (BF16/FP8_SOURCE are legal only where "
+        "the source tensor already has that precision, so a group whose "
+        "members have different source dtypes loses them)."
+    )
+
+
 def expand_fused_sibling_assignment(assignment: dict[str, str],
                                     stats_ext: dict) -> dict[str, str]:
-    """Broadcast a fused-sibling super-item assignment back to members."""
+    """Expand a fused-sibling super-item assignment back to its members.
+
+    A stock format broadcasts: every member takes the one format, which is
+    what the runtime requires of them. A whole-GROUP Tessera option carries a
+    rung per member instead (``_fused_member_formats``, written by
+    ``aggregate_fused_siblings``), because the shared decoder is the serving
+    constraint and the shared rate is not. A group option whose map is missing
+    is a hard error, never a broadcast of a name that is not a rung: the
+    result would be an assignment naming a format no member can build, and
+    ``compute_achieved`` would then price the whole group off a fabricated
+    spec.
+    """
+    from .tessera_formats import is_tessera_group_option
+
     out = {}
     for name, fmt in assignment.items():
         if _FUSED_SIBLING_MARKER in name:
             members = stats_ext[name].get("_fused_siblings", [])
+            if is_tessera_group_option(fmt):
+                member_formats = (
+                    stats_ext[name].get("_fused_member_formats") or {}
+                ).get(fmt)
+                if not member_formats:
+                    raise AssertionError(
+                        f"{name} was assigned the whole-group option {fmt!r} "
+                        "but no per-member rung map was recorded for it. The "
+                        "option is not a rung and cannot be broadcast; the "
+                        "map is written beside the candidate in "
+                        "aggregate_fused_siblings."
+                    )
+                for m in members:
+                    out[m] = member_formats[m]
+                continue
             for m in members:
                 out[m] = fmt
         else:
@@ -654,6 +3625,9 @@ def aggregate_packed_serving_groups(
     formats: list[fr.FormatSpec],
     candidates: dict[str, list[Candidate]],
     profile,
+    calibrated_gains: dict[str, float] | None = None,
+    activation_pricing: ActivationFairPricing | None = None,
+    preserve_runtime_frontier: bool = False,
 ) -> tuple[dict, dict, dict]:
     """Aggregate packed-MoE serving groups into single DP decision units.
 
@@ -673,9 +3647,20 @@ def aggregate_packed_serving_groups(
     and the serving constraint price identical moves and post-DP MoE
     promotion becomes a validated no-op. Only formats legal for EVERY
     member are offered (member candidate sets already encode source /
-    profile / kernel-shape applicability). A group with no common legal
-    format falls back to individual rows so downstream promotion can
-    repair coherence rather than the group silently vanishing from the DP.
+    profile / kernel-shape applicability).
+
+    A group with NO common legal format falls back to individual rows, which
+    keeps it visible and attributable instead of silently vanishing from the
+    DP — but that state is NOT allocatable and the fallback does NOT "repair
+    coherence". Members can only be assigned from their own (by definition
+    disjoint) candidate lists, so whole-group promotion necessarily lands on a
+    format that is illegal for at least one member, and ``compute_achieved``
+    refuses to price it (AssertionError, at every target) rather than scoring
+    the unpriced member at zero Δloss — which would make the illegal state
+    look CHEAPEST to the min-Δloss ratchet. An empty intersection is an
+    upstream cost/legality bug to fix (a missing cost row, an over-tight
+    applicability mask, a passthrough-source mismatch), not a state to
+    allocate around.
 
     Non-grouped rows (attention, shared/dense MLP) pass through untouched.
     Extrapolated expert cost rows are ordinary members. Use
@@ -687,6 +3672,8 @@ def aggregate_packed_serving_groups(
     if not callable(group_fn):
         return stats, costs, candidates
 
+    gains = calibrated_gains or {}
+    ucb_z = _cost_ucb_z()
     grouped: dict[str, list[str]] = {}
     ungrouped: list[str] = []
     for name in candidates:
@@ -695,6 +3682,11 @@ def aggregate_packed_serving_groups(
             continue
         try:
             key = group_fn(name)
+        except PackedExpertRoleUnknown:
+            # An explicit "the profile cannot describe this unit" verdict must
+            # not be swallowed into "this row has no group" (see
+            # PackedExpertRoleUnknown).
+            raise
         except Exception:
             key = None
         if key is None:
@@ -739,30 +3731,107 @@ def aggregate_packed_serving_groups(
                 float(member_cands[m][spec.name].predicted_dloss)
                 for m in members
             )
+            # UCB hedge (PRISMAQUANT_COST_UCB_Z > 0): each member candidate
+            # was priced separately, so the sum above carries a LINEAR
+            # z·Σ(stderr·gain) hedge. Preserve this conservative bound;
+            # shared probes do not justify independence. Store it on the super cost
+            # entry so consumers of the aggregated cost table keep the hedge
+            # instead of silently reading stderr 0. At z == 0 this is a no-op
+            # and the per-format dloss stays the exact sum of member
+            # candidates. Shared with aggregate_fused_siblings.
+            member_terms = []
+            # P5a: member candidates were priced WITH the family penalty, so
+            # the hedge conversion must scale each member's stderr by the same
+            # factor or it would over-subtract the linear hedge it is undoing.
+            act_penalty = _activation_penalty(spec.name, activation_pricing)
+            for m in members:
+                entry, entry_fmt = _resolve_cost_entry(
+                    costs.get(m, {}), spec.name)
+                member_terms.append((
+                    stats[m],
+                    entry,
+                    float(member_cands[m][spec.name].predicted_dloss),
+                    float(gains.get(spec.name, gains.get(entry_fmt, 1.0)))
+                    * act_penalty,
+                ))
+            hedge_linear, stderr_agg = _super_item_ucb_hedge(
+                member_terms, ucb_z)
+            base_pred = sum_pred - hedge_linear
+            hedged_pred = base_pred + ucb_z * stderr_agg
             memory_by_fmt[spec.name] = total_bytes
-            super_cost[spec.name] = {"predicted_dloss": sum_pred}
+            super_cost[spec.name] = {
+                "predicted_dloss": base_pred,
+                "predicted_dloss_stderr": stderr_agg,
+            }
+            if activation_pricing is not None:
+                super_cost[spec.name][APPLIED_MARKER_KEY] = True
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=8.0 * total_bytes / max(n_params, 1),
                 memory_bytes=total_bytes,
-                predicted_dloss=max(sum_pred, 0.0),
+                predicted_dloss=max(hedged_pred, 0.0),
+                activation_pricing=_member_activation_branch(
+                    member_cands, members, spec.name),
+                serving_lane=_member_serving_lane(
+                    member_cands, members, spec.name),
+                serialized_identity=(
+                    json.dumps(sorted({
+                        identity
+                        for m in members
+                        for identity in (
+                            member_cands[m][spec.name].serialized_identity,
+                        )
+                        if identity is not None
+                    }), separators=(",", ":"))
+                    if any(
+                        member_cands[m][spec.name].serialized_identity is not None
+                        for m in members
+                    ) else None
+                ),
+                serialized_sidecar_identity=(
+                    json.dumps(sorted({
+                        identity
+                        for m in members
+                        for identity in (
+                            member_cands[m][spec.name]
+                            .serialized_sidecar_identity,
+                        )
+                        if identity is not None
+                    }), separators=(",", ":"))
+                    if any(
+                        member_cands[m][spec.name]
+                        .serialized_sidecar_identity is not None
+                        for m in members
+                    ) else None
+                ),
             ))
         if not cands:
-            # No format is legal for every member; aggregating would drop
-            # the whole group from the DP. Keep the members as individual
-            # rows (pre-refactor behavior: promotion repairs coherence).
+            # No format is legal for every member; aggregating would drop the
+            # whole group from the DP. Keep the members as individual rows
+            # (pre-refactor behavior) so the group stays visible and the
+            # failure is attributable — NOT because promotion can repair it.
+            # It cannot: the members' candidate lists are disjoint here, so
+            # promotion always lands on a format illegal for some member and
+            # every solve at every target ends in a compute_achieved pricing
+            # error. See this function's docstring.
             for m in members:
                 stats_ext[m] = stats[m]
                 costs_ext[m] = costs.get(m, {})
                 candidates_ext[m] = candidates[m]
             continue
+        # NOTE: deliberately NO in_features/out_features here. A packed
+        # group mixes member shapes (gate/up vs down projections), so no
+        # single (out, in) pair describes it — copying members[0]'s shape
+        # would make _shape_from_stats compute ONE member's bytes for the
+        # whole group. Without them _shape_from_stats falls back to the
+        # rank-1 (n_params,) legacy shape, which is at least
+        # total-parameter-consistent; exact byte paths must (and do)
+        # prefer the candidate / _memory_bytes_by_format.
         stats_ext[super_name] = {
             "h_trace": sum(
                 float(stats[m].get("h_trace", 0.0) or 0.0) for m in members
             ),
             "n_params": n_params,
-            "in_features": int(stats[members[0]].get("in_features", 0) or 0),
-            "out_features": int(stats[members[0]].get("out_features", 0) or 0),
             "n_tokens_seen": sum(
                 int(stats[m].get("n_tokens_seen", 0) or 0) for m in members
             ),
@@ -790,33 +3859,6 @@ def expand_packed_group_assignment(assignment: dict[str, str],
     return out
 
 
-# Expert projection roles that may carry distinct formats when the serving
-# lane supports per-role expert schemes (e.g. GGUF: the stacked-tensor
-# constraint is per projection, so gate/up and down may differ).
-_PACKED_ROLE_GROUPS = {
-    "gate_proj": "gate_up", "up_proj": "gate_up",
-    "gate_up_proj": "gate_up", "w1": "gate_up", "w3": "gate_up",
-    "down_proj": "down", "w2": "down",
-}
-
-
-def packed_projection_role_group(qname: str) -> str | None:
-    """Role bucket ("gate_up" / "down") for a packed-expert projection."""
-    parts = str(qname).split(".")
-    try:
-        experts_idx = len(parts) - 1 - list(reversed(parts)).index("experts")
-    except ValueError:
-        return None
-    tail = parts[experts_idx + 1:]
-    if len(tail) == 1:
-        leaf = tail[0]
-    elif len(tail) == 2 and tail[0].isdigit():
-        leaf = tail[1]
-    else:
-        return None
-    return _PACKED_ROLE_GROUPS.get(leaf)
-
-
 class _RoleSplitProfile:
     """Profile view that splits packed serving groups by projection role.
 
@@ -827,6 +3869,12 @@ class _RoleSplitProfile:
     the profile, wrapping keeps them consistent: role units stay atomic,
     and the final serving promotion remains a validated no-op. Everything
     else delegates to the wrapped profile.
+
+    The role itself comes from ``profile.packed_expert_role_group``: expert
+    leaf naming (``gate_proj``/``up_proj`` vs LFM2.5's ``w1``/``w3``, and which
+    packed 3D parent each belongs to) is profile knowledge, and the allocator
+    does not parse model names — the same boundary
+    ``packed_expert_format_group`` already respects.
     """
 
     def __init__(self, inner):
@@ -839,9 +3887,28 @@ class _RoleSplitProfile:
         key = self._inner.packed_expert_format_group(qname)
         if key is None:
             return None
-        role = packed_projection_role_group(qname)
+        role_fn = getattr(self._inner, "packed_expert_role_group", None)
+        if not callable(role_fn):
+            raise PackedExpertRoleUnknown(
+                f"profile {type(self._inner).__name__} groups {qname!r} as a "
+                "packed-expert serving unit but has no "
+                "packed_expert_role_group accessor, so the requested "
+                "gate_up/down role split cannot be keyed. Implement it (or "
+                "inherit ModelProfile, which derives it from the profile's "
+                "packed_experts spec)."
+            )
+        role = role_fn(qname)
         if role is None:
-            return key
+            raise PackedExpertRoleUnknown(
+                f"profile {type(self._inner).__name__} groups {qname!r} as a "
+                f"packed-expert serving unit (key {key!r}) but declares no "
+                "role for its projection leaf, so the requested gate_up/down "
+                "split would silently degrade to one layer-uniform unit. "
+                "Declare the leaf in the profile's structure spec "
+                "(packed_experts.projection_splits maps each per-expert leaf "
+                "to its packed 3D parent, e.g. "
+                '{"gate_up_proj": ["w1", "w3"], "down_proj": ["w2"]}).'
+            )
         return f"{key}::role:{role}"
 
 
@@ -860,9 +3927,11 @@ def _scan_source_dtype_manifest(
 ) -> dict[str, str]:
     """Classify source Linear weights for passthrough gating.
 
-    Returns ``bf16`` only for actual BF16 source tensors, ``fp8`` for native
-    FP8/scale-sidecar sources, and ``other`` for FP16/FP32/etc. passthroughs
-    that would be synthesized rather than byte-preserving.
+    Scale-bearing native layouts receive semantic kinds (``mxfp4``, ``fp8``,
+    ``fp8_ue8m0``). Ordinary tensors retain their lower-case safetensors dtype
+    token (``bf16``, ``f16``, ``f32``, ...), so source-rate accounting can
+    derive their storage width without guessing. Unreadable/mixed stacks are
+    explicit sentinels and fail the allocator's source-rate gate.
     """
     from safetensors import safe_open
 
@@ -888,8 +3957,9 @@ def _scan_source_dtype_manifest(
     # Without classifying them the manifest has no source kind for the
     # packed recipe names the allocator costs, and the BF16 passthrough is
     # dropped (source_dtype_mismatch) on a BF16 source — an expert-menu
-    # completeness bug. (Per-expert INDEXED layouts store 2-D ``.weight``
-    # keys and classify their own recipe names via the normal path.)
+    # completeness bug. Per-expert INDEXED layouts store 2-D ``.weight``
+    # keys; below we retain those source names and also fold their kinds onto
+    # the packed recipe parent that probe/cost actually enumerate.
     import re as _re
     _packed_leaf_re = _re.compile(
         r"\.experts\.(?:gate_up_proj|down_proj|gate_proj|up_proj|w1|w2|w3)$"
@@ -898,7 +3968,12 @@ def _scan_source_dtype_manifest(
     packed_bases: set[str] = set()
     for key in weight_map:
         matched = False
-        for suffix in (".weight_scale_inv", ".weight_scale", ".weight"):
+        # ``.scale`` is the OCP-MX / DSv4 group-scale sibling spelling, and it
+        # is listed LAST so it can never shadow ``.weight_scale``: the two do
+        # not overlap as suffixes ("...weight_scale"[-6:] == "_scale", not
+        # ".scale"), but ordering makes that independent of that coincidence.
+        for suffix in (".weight_scale_inv", ".weight_scale", ".weight",
+                       ".scale"):
             if key.endswith(suffix):
                 base = key[: -len(suffix)]
                 bases.setdefault(base, set()).add(suffix[1:])
@@ -908,9 +3983,11 @@ def _scan_source_dtype_manifest(
             bases.setdefault(key, set()).add("weight")
             packed_bases.add(key)
     weight_dtypes: dict[str, str] = {}
+    scale_dtypes: dict[str, str] = {}
     shard_keys: dict[str, list[str]] = defaultdict(list)
     for key, shard in weight_map.items():
-        if not (key.endswith(".weight") or key in packed_bases):
+        if not (key.endswith(".weight") or key.endswith(".scale")
+                or key in packed_bases):
             continue
         path = src / str(shard)
         if path.is_file():
@@ -919,100 +3996,119 @@ def _scan_source_dtype_manifest(
         try:
             with safe_open(path, framework="pt", device="cpu") as sf:
                 for key in keys:
-                    base = (
-                        key[:-len(".weight")]
-                        if key.endswith(".weight") else key
-                    )
+                    is_scale = key.endswith(".scale")
+                    if is_scale:
+                        base = key[: -len(".scale")]
+                    elif key.endswith(".weight"):
+                        base = key[: -len(".weight")]
+                    else:
+                        base = key
                     try:
-                        weight_dtypes[base] = str(
-                            sf.get_slice(key).get_dtype()
-                        ).upper()
+                        dtype = str(sf.get_slice(key).get_dtype()).upper()
                     except Exception:
                         continue
+                    if is_scale:
+                        scale_dtypes[base] = dtype
+                    else:
+                        weight_dtypes[base] = dtype
         except Exception:
             continue
 
-    def _strip_weight_suffix(name: str) -> str:
-        return name[:-7] if name.endswith(".weight") else name
+    # R5: every namespace mapping below routes through the ONE shared
+    # projection (`name_projection.NameProjection`); this consumer keeps no
+    # private checkpoint->live->recipe builder. A caller with no profile
+    # gets the repo's declared generic baseline — the same substitution
+    # `measure_quant_cost.resolve_cost_target_name` has always made — whose
+    # default `checkpoint_to_live_name` reproduces exactly the hardcoded
+    # visual/audio/MTP-decline + language_model-infix rules this function
+    # used to inline. Unlike those inlined fallbacks, a profile accessor
+    # that now FAILS raises `NameProjectionError` instead of silently
+    # skipping the row (fail-closed; a silent skip here is the wo_a shape).
+    from .model_profiles import DefaultProfile
 
-    def _to_recipe_name(ck_base: str) -> str:
-        if ck_base.startswith("mtp."):
-            # MTP tensors are REAL source tensors stored under the recipe
-            # namespace itself (transformers v5 drops the module; prismaquant
-            # synthesizes it back under the same names, and probe/cost rows
-            # use them verbatim). The historical skip left MTP names with no
-            # source kind, so the BF16 passthrough was dropped
-            # (source_dtype_mismatch) and --mtp-format=BF16 hard-failed the
-            # moment MTP rows were actually costed (35B frontier, 2026-07-02).
-            return ck_base
-        weight_key = f"{ck_base}.weight"
-        if profile is not None:
-            mapper = getattr(profile, "checkpoint_to_live_name", None)
-            if callable(mapper):
-                try:
-                    live_param = mapper(weight_key, multimodal=False)
-                except TypeError:
-                    live_param = mapper(weight_key)
-                except Exception:
-                    live_param = None
-                if live_param is None:
-                    return ""
-                live_qname = _strip_weight_suffix(str(live_param))
-                recipe_mapper = getattr(profile, "live_to_recipe_name", None)
-                if callable(recipe_mapper):
-                    try:
-                        return str(recipe_mapper(live_qname))
-                    except Exception:
-                        return live_qname
-                return live_qname
-        if (ck_base.startswith("model.visual.")
-                or ck_base.startswith("model.audio_tower.")
-                or ck_base.startswith("model.vision_tower.")
-                or ck_base.startswith("model.embed_vision.")
-                or ck_base.startswith("model.embed_audio.")):
-            return ""
-        if ck_base.startswith("model.language_model."):
-            return "model." + ck_base[len("model.language_model."):]
-        return ck_base
+    proj = NameProjection(profile if profile is not None else DefaultProfile())
 
-    def _packed_to_recipe_name(ck_key: str) -> str:
-        # Packed expert params have no ``.weight`` to fabricate for
-        # checkpoint_to_live_name; checkpoint name == live name modulo the
-        # language_model prefix, then the profile's live->recipe mapping.
-        name = ck_key
-        if name.startswith("model.language_model."):
-            name = "model." + name[len("model.language_model."):]
-        if profile is not None:
-            recipe_mapper = getattr(profile, "live_to_recipe_name", None)
-            if callable(recipe_mapper):
-                try:
-                    return str(recipe_mapper(name))
-                except Exception:
-                    return name
-        return name
+    def _record_source_kind(name: str, source_kind: str) -> None:
+        previous = manifest.get(name)
+        if previous is None or previous == source_kind:
+            manifest[name] = source_kind
+        else:
+            # A packed unit is passthrough-legal only when every serialized
+            # constituent has the same native source representation.
+            manifest[name] = "heterogeneous"
 
     manifest: dict[str, str] = {}
     for base, suffixes in bases.items():
         if "weight" not in suffixes:
             continue
         dtype = weight_dtypes.get(base)
-        if "weight_scale_inv" in suffixes or "weight_scale" in suffixes:
+        scale_dtype = scale_dtypes.get(base)
+        # E8M0 group/block exponents are the discriminator for the two native
+        # formats FP8_SOURCE cannot represent. Both tests run BEFORE the
+        # generic ``F8`` test, because the SCALE plane of both is itself
+        # ``F8_E8M0`` and would otherwise be mistaken for an fp8 weight
+        # contract with an FP32 scale_inv plane — a format whose byte count
+        # and whose exported scale dtype are both wrong for this checkpoint.
+        if scale_dtype == "F8_E8M0" and dtype in {"I8", "U8"}:
+            # Nibble-packed 4-bit elements carried in an 8-bit container with
+            # a power-of-two group scale: OCP-MX MXFP4 as DeepSeek-V4 ships
+            # its routed experts.
+            source_kind = "mxfp4"
+        elif scale_dtype == "F8_E8M0" and dtype == "F8_E4M3":
+            # Block-FP8 with UE8M0 block exponents (DeepSeek-V3.1/V4), NOT
+            # the FP32 weight_scale_inv contract FP8_SOURCE models.
+            source_kind = "fp8_ue8m0"
+        elif (
+            ("weight_scale_inv" in suffixes or "weight_scale" in suffixes)
+            and dtype is not None
+        ):
             source_kind = "fp8"
         elif dtype == "BF16":
             source_kind = "bf16"
         elif dtype is not None and dtype.startswith("F8"):
             source_kind = "fp8"
         elif dtype is None:
-            source_kind = "bf16"
+            source_kind = "unknown"
         else:
-            source_kind = "other"
-        recipe_name = (
-            _packed_to_recipe_name(base) if base in packed_bases
-            else _to_recipe_name(base)
-        )
-        if not recipe_name:
-            continue
-        manifest[recipe_name] = source_kind
+            source_kind = dtype.lower()
+        # MTP tensors are REAL source tensors stored under the recipe
+        # namespace itself (transformers v5 drops the module; prismaquant
+        # synthesizes it back under the same names, and probe/cost rows use
+        # them verbatim — physical key IS the recipe key, the same retention
+        # DSv4's fp8_scale_pairs applies). The historical skip left MTP names
+        # with no source kind, so the BF16 passthrough was dropped
+        # (source_dtype_mismatch) and --mtp-format=BF16 hard-failed the
+        # moment MTP rows were actually costed (35B frontier, 2026-07-02).
+        # This short-circuit is universe-membership policy, not name
+        # projection: no profile accessor declares "which checkpoint
+        # prefixes are recipe-native rows" yet (`source_passthrough_prefixes`
+        # is an EXPORT contract and admits visual prefixes this manifest must
+        # keep declining), so the narrow literal stays until that declaration
+        # exists. Packed expert keys are the suffix-less 3-D spellings
+        # (LFM2.5, Qwen3.6-35B) with no ``.weight`` leaf to fabricate.
+        if base.startswith("mtp."):
+            recipe_name = base
+        else:
+            projected = proj.checkpoint_to_live(
+                base if base in packed_bases else f"{base}.weight")
+            if projected.outcome != MAPPED:
+                continue  # declared out-of-graph: no recipe row exists
+            recipe_name = proj.recipe_unit(projected.target)
+        _record_source_kind(recipe_name, source_kind)
+        # Fold a per-expert source name's kind onto its packed parent: a
+        # per-expert checkpoint and a packed live module name the same
+        # weights at different granularities, and source-passthrough legality
+        # is checked against the live probe/cost key. The layer reuses
+        # `footprint.packed_expert_alias` with the profile's own mapping;
+        # mixed kinds fold to ``other`` so no byte-copy format can be
+        # admitted for a heterogeneous stack. With NO caller-supplied
+        # profile there is no declared mapping and nothing folds
+        # (historical behavior).
+        packed_parent = (
+            None if profile is None
+            else proj.packed_parent_of_expert_param(recipe_name))
+        if packed_parent is not None:
+            _record_source_kind(packed_parent, source_kind)
     fp8_pairs = None
     if profile is not None:
         pairs_fn = getattr(profile, "fp8_scale_pairs", None)
@@ -1022,13 +4118,16 @@ def _scan_source_dtype_manifest(
             except Exception:
                 fp8_pairs = None
     if fp8_pairs:
-        recipe_mapper = getattr(profile, "live_to_recipe_name", None)
         for live_param in fp8_pairs:
-            live_qname = _strip_weight_suffix(str(live_param))
-            if callable(recipe_mapper):
-                try:
-                    live_qname = str(recipe_mapper(live_qname))
-                except Exception:
-                    pass
-            manifest[live_qname] = "fp8"
+            live_qname = proj.recipe_unit(str(live_param))
+            # A profile's ``fp8_scale_pairs`` answers "does this weight have a
+            # serialized scale sibling the dequant pass must read", which is
+            # true of EVERY block-scaled format — DSv4's MXFP4 experts and its
+            # UE8M0 body both appear there. It is not a claim about which fp8
+            # contract the bytes are, so it must not overwrite a kind the
+            # header scan derived from the actual dtypes: doing so is what
+            # made 33,024 packed-MXFP4 experts look like FP32-scaled fp8.
+            # It still fills in names the dtype scan could not classify.
+            if manifest.get(live_qname) in (None, "unknown"):
+                manifest[live_qname] = "fp8"
     return manifest

@@ -8,20 +8,415 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from math import inf, isfinite
+from numbers import Integral, Real
+from typing import TYPE_CHECKING
 
 from . import format_registry as fr
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .measured_runtime_prices import RuntimeResources
+    # Import-time-free: the solver must not depend on the serving-profile
+    # loader at runtime (the lane is attached by candidate construction and
+    # never read by the DP), but the annotation should still name the type.
+    from .serving_profiles import ResolvedServingLane
+
+
+class PackedExpertRoleUnknown(RuntimeError):
+    """A role split was requested for an expert projection the profile cannot
+    name a role for (see ``allocator_candidates._RoleSplitProfile``).
+
+    Raised (not returned as None) because the split is opt-in and already
+    hard-gated on a serving profile that declares per-role expert schemes: the
+    operator asked for gate_up/down units, so quietly falling back to
+    layer-uniform units for the leaves the profile does not recognize would
+    ship a DIFFERENT allocation than the one requested, with no signal — and a
+    partial fallback is worse than none (some layers split, some not). The
+    remedy is one line of declarative spec, so failing loud costs one run and
+    fixes the architecture permanently.
+
+    Defined here rather than beside its raiser because both the aggregation
+    path (``allocator_candidates``) and the promotion path (this module) must
+    catch-and-re-raise it, and ``allocator_candidates`` imports from this
+    module — so this is the only home that does not close an import cycle.
+    ``allocator_candidates`` re-exports it.
+    """
+
 # Read once at import (coarse offline path; no per-call getenv).
 _SOLVER_TRACE = os.environ.get("PRISMAQUANT_SOLVER_TRACE", "") not in ("", "0")
+
+
+#: Serving-unit kinds ``promote_serving_units`` tags its groups with.  The
+#: kind is which builder produced the group -- a fused module
+#: (``profile.fused_sibling_group``) or a packed-expert unit
+#: (``profile.packed_expert_format_group``) -- never a restatement of the
+#: member names, so a renamed leaf cannot change a component's kind.  Only a
+#: fused kind may enter the family relaxation: the pinned Tessera contract's
+#: ``fused_module`` block scopes the per-member licence to one vLLM-fused
+#: module, and its ``expert_parallel`` world is closed with no unit in it.
+_GROUP_KIND_FUSED = "fused"
+_GROUP_KIND_PACKED = "packed"
+_GROUP_KINDS = frozenset({_GROUP_KIND_FUSED, _GROUP_KIND_PACKED})
+
+#: ``promote_serving_units`` / ``_promote_group_components`` default: read the
+#: pinned contract's ``fused_module`` block on first need (through
+#: ``tessera_menu.fused_module_licence``, the module's declared one read).  An
+#: explicit ``None`` is the ABSENCE of a licence -- one rung per group -- not
+#: a request to read.
+_LICENCE_FROM_CONTRACT: object = object()
 
 
 @dataclass
 class Candidate:
     fmt: str
     bits_per_param: float
+    # Per-candidate tensor payload only. Assignment-level shared sidecars are
+    # non-additive activation costs and must be deduplicated by the caller's
+    # exact-filter/reporting pass before claiming a final achieved rate.
     memory_bytes: int
     predicted_dloss: float
+    # Versioned producer-layout identity. None for formats whose FormatSpec is
+    # already a complete serialized description. Kept out of solver logic for
+    # backwards compatibility; reports/assertions use it to distinguish e.g.
+    # FP4-CB v1 from v2 and lattice from learned sidecars.
+    serialized_identity: str | None = None
+    # Physical codebook-table identity, kept separately so aggregation and
+    # export assertions can deduplicate/compare sidecars without parsing the
+    # complete tensor-layout JSON above.
+    serialized_sidecar_identity: str | None = None
+    # WHICH estimator priced this candidate's activation contract (ultraplan
+    # P5a). One of activation_fair_pricing.BRANCH_*: measured_output_mse,
+    # interpolated_output_mse, bit_exact, source_passthrough,
+    # activation_identity, weight_only_activation_calibrated,
+    # weight_only_uncalibrated, weight_only_kill_switch. Kept out of solver
+    # logic — like serialized_identity it is provenance, not an input to the
+    # DP — so that "was this row's A side ever priced" is recoverable from the
+    # artifact instead of inferred from the producer commit.
+    activation_pricing: str | None = None
+    # The CONCRETE serving-lane route this candidate would ride (ultraplan
+    # P5b): activation contract, whether the consumer's fused mid-M kernel
+    # actually instantiates this rung, and the fallback route when it does
+    # not. ``serving_profiles.ResolvedServingLane``; None where the target
+    # profile declares no lane for the format. Also kept out of solver logic:
+    # this is route provenance. The opt-in runtime solver reads its separate
+    # measured resource table, never a speed inferred from this lane label.
+    serving_lane: ResolvedServingLane | None = None
+    # For a whole-GROUP option (``tessera_formats.is_tessera_group_option``):
+    # the rung each member of the fused/packed serving unit holds. One family
+    # across the group -- that is the serving constraint -- and a rate per
+    # member, which is not. None for every ordinary candidate, so a stock run
+    # never sees this field. Kept out of solver logic like the other
+    # provenance fields: the DP reads bytes and cost, and expansion reads
+    # this.
+    member_formats: dict[str, str] | None = None
+
+
+class RuntimeFrontierLimitError(ValueError):
+    """The declared exact-search bound was exceeded; no allocation is returned."""
+
+
+@dataclass(frozen=True)
+class RuntimeAllocation:
+    """One nondominated additive proposal, not an end-to-end SLO certificate.
+
+    ``memory_bytes`` is serialized candidate payload. Terminal weight residency
+    is summed independently; activation and scratch are separate sequential
+    peaks. ``device_bytes`` adds those three quantities and the caller's fixed
+    device charge (for example KV and non-quantizable resident weights).
+    """
+
+    assignment: dict[str, str]
+    chosen_candidates: dict[str, Candidate]
+    memory_bytes: int
+    predicted_dloss: float
+    prefill_ms: float
+    decode_ms: float | None
+    resident_bytes: int
+    peak_scratch_bytes: int
+    activation_bytes: int
+    device_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeState:
+    # Serialized bytes, quality, prefill, decode, resident, scratch, activation.
+    totals: tuple
+    formats: tuple[str, ...]
+    parent: _RuntimeState | None = None
+    candidate: Candidate | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeDominanceNode:
+    lower: tuple
+    upper: tuple
+    points: tuple[tuple, ...] = ()
+    left: _RuntimeDominanceNode | None = None
+    right: _RuntimeDominanceNode | None = None
+
+
+def _runtime_dominance_tree(points: list[tuple], depth: int = 0):
+    """Exact orthant index; integer byte coordinates never pass through floats."""
+    lower = tuple(map(min, zip(*points)))
+    upper = tuple(map(max, zip(*points)))
+    if len(points) <= 16:
+        return _RuntimeDominanceNode(lower, upper, tuple(points))
+    axis = depth % len(lower)
+    ordered = sorted(points, key=lambda point: point[axis])
+    mid = len(ordered) // 2
+    return _RuntimeDominanceNode(lower, upper,
+        left=_runtime_dominance_tree(ordered[:mid], depth + 1),
+        right=_runtime_dominance_tree(ordered[mid:], depth + 1))
+
+
+def _runtime_has_dominator(node: _RuntimeDominanceNode, query: tuple) -> bool:
+    if any(lo > q for lo, q in zip(node.lower, query)):
+        return False
+    if all(hi <= q for hi, q in zip(node.upper, query)):
+        return True
+    if node.points:
+        return any(all(p <= q for p, q in zip(point, query))
+                   for point in node.points)
+    return (_runtime_has_dominator(node.left, query)
+            or _runtime_has_dominator(node.right, query))
+
+
+def _runtime_int(value, label: str, *, positive: bool = False) -> int:
+    if (isinstance(value, bool) or not isinstance(value, Integral)
+            or value < (1 if positive else 0)):
+        raise ValueError(f"{label} must be a {'positive' if positive else 'nonnegative'} integer")
+    return int(value)
+
+
+def _runtime_float(value, label: str, *, nonnegative: bool = True) -> float:
+    try:
+        valid = (not isinstance(value, bool) and isinstance(value, Real)
+                 and isfinite(value) and (not nonnegative or value >= 0))
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError(f"{label} must be a finite {'nonnegative ' if nonnegative else ''}number")
+    return float(value)
+
+
+def solve_runtime_frontier(
+    candidates: dict[str, list[Candidate]],
+    resources: Mapping[tuple[str, str], RuntimeResources],
+    *,
+    max_memory_bytes: int,
+    max_prefill_ms: float,
+    max_decode_ms: float | None = None,
+    max_device_bytes: int | None = None,
+    fixed_device_bytes: int = 0,
+    max_states: int = 100_000,
+    max_transitions: int = 8_000_000,
+    diagnostics: dict | None = None,
+) -> list[RuntimeAllocation]:
+    """Exact discrete bytes/quality/prefill frontier under declared budgets.
+
+    This opt-in alternative to :func:`solve_allocation` charges exact integer
+    ``Candidate.memory_bytes`` and preserves nondominance, including nonconvex
+    pockets and faster same-byte activation routes with higher loss. Decode
+    joins the frontier only when constrained. A device budget adds THREE
+    independent coordinates: summed terminal residency, maximum scratch, and
+    maximum activation bytes. Comparing their current sum would discard valid
+    options because later operators can replace one of those maxima.
+
+    Candidate rows must already represent independent serving units with all
+    legal group options retained. A group option is atomic: its runtime row
+    must measure that whole operator. There is no leaf-latency summation,
+    serving promotion, quality rescaling, byte binning or convex-hull pruning.
+    The caller validates timing provenance/workload/group bindings, charges
+    non-additive artifact costs and fixed runtime overhead, and runs final
+    end-to-end validation. Resource sums propose assignments; they do not
+    certify TTFT/decode quantiles.
+
+    All input prices are checked before search, including infeasible rows.
+    Missing constrained decode prices refuse. Units and formats are traversed
+    lexically; equal active-coordinate vectors retain the lexically first
+    assignment. Results sort by quality, then active resources, then formats.
+    Comparisons use the supplied finite numeric values without epsilons.
+
+    Intermediate folds include canonical assignment order as a dominance
+    coordinate: a later peak can erase a strict resource difference, and a
+    floating-point sum can erase a strict loss difference. Retaining the
+    lexically earlier prefix preserves the final tie rule in those cases.
+    This auxiliary coordinate is removed for the final resource frontier.
+
+    ``max_states`` bounds each fold frontier (including that tie coordinate);
+    ``max_transitions`` bounds the total attempted cross-product pairs before
+    budget/dominance filtering. Crossing either finite bound raises
+    :class:`RuntimeFrontierLimitError`, with ``complete=False`` diagnostics;
+    it never returns a truncated or approximate frontier. An empty returned
+    list is a completed search finding no feasible assignment.
+    """
+    diag = diagnostics if diagnostics is not None else {}
+    diag.update(complete=False, feasible=False, frontier_sizes=[],
+                transitions=0, refusal=None, approximation="none")
+    max_memory_bytes = _runtime_int(max_memory_bytes, "max_memory_bytes")
+    max_prefill_ms = _runtime_float(max_prefill_ms, "max_prefill_ms")
+    if max_decode_ms is not None:
+        max_decode_ms = _runtime_float(max_decode_ms, "max_decode_ms")
+    if max_device_bytes is not None:
+        max_device_bytes = _runtime_int(max_device_bytes, "max_device_bytes")
+    fixed_device_bytes = _runtime_int(fixed_device_bytes, "fixed_device_bytes")
+    max_states = _runtime_int(max_states, "max_states", positive=True)
+    max_transitions = _runtime_int(max_transitions, "max_transitions", positive=True)
+    diag.update(max_states=max_states, max_transitions=max_transitions,
+                intermediate_tie_coordinate=True)
+
+    if any(not isinstance(name, str) or not name for name in candidates):
+        raise ValueError("candidate unit names must be nonempty strings")
+    names = sorted(candidates)
+    options = {}
+    for name in names:
+        if not candidates[name]:
+            raise ValueError(f"runtime candidate menu for {name!r} is empty")
+        seen = set()
+        unit_options = []
+        for c in candidates[name]:
+            if not isinstance(c.fmt, str) or not c.fmt:
+                raise ValueError(f"candidate format for {name!r} must be a nonempty string")
+            if c.fmt in seen:
+                raise ValueError(f"duplicate runtime candidate ({name!r}, {c.fmt!r})")
+            seen.add(c.fmt)
+            key = (name, c.fmt)
+            label = f"runtime row {key!r}"
+            if key not in resources:
+                raise ValueError(f"missing measured {label}")
+            row = resources[key]
+            memory = _runtime_int(c.memory_bytes, f"{label} memory_bytes")
+            serialized = _runtime_int(getattr(row, "serialized_bytes", None),
+                                      f"{label} serialized_bytes")
+            if serialized != memory:
+                raise ValueError(f"{label} serialized_bytes={serialized} differs from candidate memory_bytes={memory}")
+            loss = _runtime_float(c.predicted_dloss, f"{label} predicted_dloss", nonnegative=False)
+            prefill = _runtime_float(getattr(row, "prefill_ms", None), f"{label} prefill_ms")
+            decode = getattr(row, "decode_ms", None)
+            if decode is not None or max_decode_ms is not None:
+                decode = _runtime_float(decode, f"{label} decode_ms")
+            resident = _runtime_int(getattr(row, "resident_bytes", None), f"{label} resident_bytes")
+            scratch = _runtime_int(getattr(row, "peak_scratch_bytes", None), f"{label} peak_scratch_bytes")
+            activation = _runtime_int(getattr(row, "activation_bytes", None), f"{label} activation_bytes")
+            unit_options.append((c, (memory, loss, prefill, decode, resident, scratch, activation)))
+        options[name] = sorted(unit_options, key=lambda option: option[0].fmt)
+
+    axes = (0, 1, 2) + ((3,) if max_decode_ms is not None else ())
+    if max_device_bytes is not None:
+        axes += (4, 5, 6)
+    diag["dimensions"] = [
+        ("memory_bytes", "predicted_dloss", "prefill_ms", "decode_ms",
+         "resident_bytes", "peak_scratch_bytes", "activation_bytes")[axis]
+        for axis in axes]
+    frontier = [_RuntimeState((0, 0.0, 0.0, 0.0, 0, 0, 0), ())]
+    if max_device_bytes is not None and fixed_device_bytes > max_device_bytes:
+        frontier = []
+
+    for name in names:
+        if not frontier:
+            break
+        pairs = len(frontier) * len(options[name])
+        if diag["transitions"] + pairs > max_transitions:
+            diag.update(refusal="max_transitions", refused_unit=name,
+                        attempted_transitions=diag["transitions"] + pairs)
+            raise RuntimeFrontierLimitError(
+                f"runtime frontier at {name!r} requires {diag['transitions'] + pairs} "
+                f"attempted transitions, over max_transitions={max_transitions}; "
+                "exact search refused without returning a partial allocation")
+        diag["transitions"] += pairs
+        unique = {}
+        for state in frontier:
+            a = state.totals
+            for c, b in options[name]:
+                totals = (a[0] + b[0], a[1] + b[1], a[2] + b[2],
+                          None if a[3] is None or b[3] is None else a[3] + b[3],
+                          a[4] + b[4], max(a[5], b[5]), max(a[6], b[6]))
+                if any(value is not None and not isfinite(value)
+                       for value in totals[1:4]):
+                    raise ValueError(f"runtime totals overflowed at unit {name!r}")
+                if totals[0] > max_memory_bytes or totals[2] > max_prefill_ms:
+                    continue
+                if max_decode_ms is not None and totals[3] > max_decode_ms:
+                    continue
+                if (max_device_bytes is not None
+                        and sum(totals[4:]) + fixed_device_bytes > max_device_bytes):
+                    continue
+                vector = tuple(totals[axis] for axis in axes)
+                formats = state.formats + (c.fmt,)
+                prior = unique.get(vector)
+                if prior is None or formats < prior.formats:
+                    unique[vector] = _RuntimeState(totals, formats, state, c)
+        ordered = sorted(unique.items())
+        if not ordered:
+            frontier = []
+        else:
+            # Intermediate dominance must also preserve the canonical prefix:
+            # maxima or rounded sums can erase strict differences in a later
+            # fold. At the final fold resource dominance alone is sufficient.
+            # Each final coordinate is unique, so querying one less excludes
+            # self without requiring numerical epsilons on measured resources.
+            ranks = {formats: i for i, formats in enumerate(
+                sorted(state.formats for _, state in ordered))}
+            coordinates = [ranks[state.formats] if name != names[-1] else index
+                           for index, (_, state) in enumerate(ordered)]
+            tree = _runtime_dominance_tree(
+                [vector + (coordinate,) for (vector, _), coordinate
+                 in zip(ordered, coordinates)])
+            frontier = []
+            for (vector, state), coordinate in zip(ordered, coordinates):
+                if not _runtime_has_dominator(tree, vector + (coordinate - 1,)):
+                    frontier.append(state)
+                    if len(frontier) > max_states:
+                        diag.update(refusal="max_states", refused_unit=name,
+                                    frontier_size_lower_bound=len(frontier))
+                        raise RuntimeFrontierLimitError(
+                            f"runtime frontier at {name!r} exceeds max_states={max_states}; "
+                            "exact search refused without truncating nondominated states")
+        diag["frontier_sizes"].append(len(frontier))
+
+    frontier.sort(key=lambda state: (state.totals[1],
+        tuple(state.totals[axis] for axis in axes if axis != 1), state.formats))
+    result = []
+    for state in frontier:
+        chosen = {}
+        cursor = state
+        for name in reversed(names):
+            chosen[name] = cursor.candidate
+            cursor = cursor.parent
+        chosen = {name: chosen[name] for name in names}
+        a = state.totals
+        result.append(RuntimeAllocation(
+            assignment={name: c.fmt for name, c in chosen.items()},
+            chosen_candidates=chosen, memory_bytes=a[0], predicted_dloss=a[1],
+            prefill_ms=a[2], decode_ms=a[3], resident_bytes=a[4],
+            peak_scratch_bytes=a[5], activation_bytes=a[6],
+            device_bytes=sum(a[4:]) + fixed_device_bytes))
+    diag.update(complete=True, feasible=bool(result), frontier_size=len(result))
+    return result
+
+
+@dataclass(frozen=True)
+class DualInterval:
+    """Non-negative point-cost shadow prices weakly supporting one selected rung.
+
+    ``lambda_lo`` and ``lambda_hi`` are in predicted-dloss per DP-charged
+    byte.  An interval is empty when ``lambda_lo > lambda_hi``.  Empty
+    intervals are expected for integer-knapsack choices in non-convex pockets:
+    the exact budget DP may select a rung that no scalar Lagrangian supports.
+
+    This is not the uncertainty-aware global lambda-star bracket from an
+    interval cost table: the current :class:`Candidate` carries one loss and
+    the current DP carries no lower/upper loss bounds.
+    """
+
+    lambda_lo: float
+    lambda_hi: float
+
+    @property
+    def is_empty(self) -> bool:
+        return self.lambda_lo > self.lambda_hi
 
 
 def _shape_from_stats(entry: dict) -> tuple[int, ...]:
@@ -62,6 +457,15 @@ def _packed_groups_by_profile(names, profile) -> dict[str, list[str]]:
     for name in names:
         try:
             key = group_fn(name)
+        except PackedExpertRoleUnknown:
+            # A profile that cannot name a packed expert's role under
+            # --packed-role-split is a declaration gap, not a "this row has no
+            # group" answer: swallowing it here would silently promote the two
+            # roles as one unit, i.e. ship a DIFFERENT allocation than the
+            # operator asked for. Aggregation raises this first today, so this
+            # is defence in depth for any future path that promotes without
+            # aggregating.
+            raise
         except Exception:
             key = None
         if key is None:
@@ -70,12 +474,322 @@ def _packed_groups_by_profile(names, profile) -> dict[str, list[str]]:
     return groups
 
 
+def legal_formats_from_candidates(
+    candidates: dict[str, list[Candidate]],
+) -> dict[str, set[str]]:
+    """Per-row legal-format sets for serving-unit promotion.
+
+    A row's candidate list IS its legality verdict: ``build_candidates``
+    admits a ``(row, format)`` pair only after
+    ``check_stats_format_applicability`` clears source-passthrough integrity,
+    the serving profile, group / scale-block divisibility and the runtime
+    kernel shape rules. Handing those sets to promotion is what lets it pick
+    a format the WHOLE serving unit can run, instead of one that happens to
+    top the rank order for some member.
+    """
+    return {name: {c.fmt for c in cands} for name, cands in candidates.items()}
+
+
+def _member_allows(
+    fmt: str,
+    member: str,
+    legal_formats: dict[str, set[str]] | None,
+) -> bool:
+    """Whether ``fmt`` is legal for ``member``.
+
+    A member with no entry is UNCONSTRAINED, not illegal: callers that cannot
+    supply legality for a name (auxiliary MTP/visual pins, hand-built test
+    assignments) must keep today's behaviour rather than acquire a new failure.
+    """
+    if not legal_formats:
+        return True
+    allowed = legal_formats.get(member)
+    return allowed is None or fmt in allowed
+
+
+def _serving_group_common_formats(
+    members: list[str],
+    legal_formats: dict[str, set[str]] | None,
+) -> set[str] | None:
+    """Formats legal for EVERY member, or None when nothing is known."""
+    if not legal_formats:
+        return None
+    known = [legal_formats[m] for m in members if m in legal_formats]
+    if not known:
+        return None
+    common = set(known[0])
+    for allowed in known[1:]:
+        common &= allowed
+    return common
+
+
+class FormatRankUnknown(KeyError):
+    """A promotion asked for the rank of a format the rank table does not hold.
+
+    ``format_rank`` is a dense ordinal over *this run's* menu -- cheapest to
+    most expensive by exact serialized rate -- and promotion's only question is
+    which member of a serving unit carries the most expensive format.  When
+    every assigned format came from the menu that built the rank, that question
+    always has an answer.  Hand promotion a name from outside the menu and the
+    bare ``KeyError: '<fmt>'`` that came back read as a corrupt DP assignment,
+    when what it actually means is that the rank table does not cover the
+    assignment it was given.
+
+    The refusal names the format, the unit, where in promotion it fired, and
+    the menu -- and it says what the caller owes rather than guessing: an
+    exact serialized rate for that format over this run's shapes.  Inventing a
+    rank would silently reorder every promotion decision in the unit, which is
+    the same class of error as a post-allocator rewrite.
+
+    It subclasses ``KeyError`` so an existing ``except KeyError`` still
+    catches it, and overrides ``__str__`` because ``KeyError.__str__`` reprs
+    its argument -- a multi-line diagnostic would arrive as one escaped blob.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._message = message
+
+    def __str__(self) -> str:
+        return self._message
+
+
+def _rank_of(
+    fmt: str,
+    format_rank: "dict[str, int]",
+    *,
+    where: str,
+    members: "list[str] | None" = None,
+) -> int:
+    """``format_rank[fmt]``, or a refusal that says what is missing."""
+
+    try:
+        return format_rank[fmt]
+    except KeyError:
+        pass
+    menu = sorted(format_rank, key=lambda name: (format_rank[name], name))
+    unit = ""
+    if members is not None:
+        shown = sorted(members)
+        unit = (f"\n    serving unit: {len(shown)} members "
+                f"(representative {shown[0]!r}): {shown[:8]}"
+                + (" ..." if len(shown) > 8 else ""))
+    raise FormatRankUnknown(
+        f"promotion cannot rank {fmt!r}: it is not in this run's format rank "
+        f"table, so there is no answer to which member of the unit is most "
+        f"expensive.\n    fired in: {where}{unit}\n"
+        f"    promotion menu (low->high rank): {menu}\n"
+        "Extend the rank from the built candidate menus before promoting -- "
+        "the table needs an exact serialized rate for this format over this "
+        "run's shapes. Promotion will not invent one: a guessed rank silently "
+        "reorders every promotion decision in the unit."
+    )
+
+
+def _serving_group_menu_error(
+    members: list[str],
+    assigned: dict[str, str],
+    legal_formats: dict[str, set[str]],
+    format_rank: dict[str, int],
+    common: set[str] | None,
+) -> str:
+    """Diagnostic for a serving unit with no format legal for every member."""
+    member_lines = "\n".join(
+        f"    {m}: assigned={assigned.get(m)!r} legal="
+        + (
+            f"{sorted(legal_formats[m])}"
+            if m in legal_formats
+            else "<unknown: not a priced row, treated as unconstrained>"
+        )
+        for m in sorted(members)
+    )
+    menu = sorted(format_rank, key=lambda name: (format_rank[name], name))
+    return (
+        f"serving-unit component of {len(members)} members (representative "
+        f"{min(members)!r}) shares no format that is legal for every member:\n"
+        f"{member_lines}\n"
+        f"    common legal formats: {sorted(common or ())}\n"
+        f"    promotion menu (low->high rank): {menu}\n"
+        "Packed-MoE experts and fused siblings (q/k/v, gate/up) load under ONE "
+        "format at serve time (vLLM selects one scheme per FusedMoE layer, one "
+        "scheme per fused module), so an empty intersection is not an "
+        "allocatable state: EVERY format whole-unit promotion could pick is "
+        "illegal for at least one member, export then coerces that one member "
+        "to BF16, and the resulting quantized+BF16 mix inside a single serving "
+        "unit is caught only by the fused-coherence gate at the END of export. "
+        "This is an upstream cost/legality bug to fix, not a state to promote "
+        "around: a missing cost row for one member, an over-tight applicability "
+        "mask (see the [alloc] format-applicability log lines and the mask "
+        "summary JSON), or a passthrough-source mismatch (BF16/FP8_SOURCE are "
+        "legal only where the source tensor already has that precision, so a "
+        "unit whose members have different source dtypes loses them)."
+    )
+
+
+def _choose_group_format(
+    members: list[str],
+    assigned: dict[str, str],
+    format_rank: dict[str, int],
+    legal_formats: dict[str, set[str]],
+    best_fmt: str,
+) -> str:
+    """Pick one format for a unit whose max-rank assignment is illegal for it.
+
+    Only reached when ``best_fmt`` (the highest-rank format assigned to any
+    member, i.e. what unconstrained promotion would write) is illegal for at
+    least one member. Preference order, from the promotion contract this
+    function repairs rather than reinvents:
+
+    1. the CHEAPEST legal-for-all format at or above ``best_fmt``'s rank —
+       promotion has always been non-degrading (no member ends below the
+       format the DP picked for it), and ``solve_with_promotion``'s
+       tightening loop is built to absorb the extra bits promotion charges;
+    2. otherwise the HIGHEST-rank legal-for-all format, which is necessarily
+       below some member's assignment. That downgrade is correct: the unit
+       must be uniform, so a member cannot keep a format the unit cannot
+       serve. It is the same downgrade export was applying per member (issue
+       #28) — done once for the whole unit, before any render work, and
+       priced by ``compute_achieved`` instead of discovered at export.
+    """
+    common = _serving_group_common_formats(members, legal_formats)
+    ranked = sorted(
+        (fmt for fmt in (common or ()) if fmt in format_rank),
+        key=lambda fmt: (format_rank[fmt], fmt),
+    )
+    if not ranked:
+        raise AssertionError(
+            _serving_group_menu_error(
+                members, assigned, legal_formats, format_rank, common)
+        )
+    best_rank = _rank_of(best_fmt, format_rank,
+                         where="_choose_group_format", members=list(members))
+    for fmt in ranked:
+        if format_rank[fmt] >= best_rank:
+            return fmt
+    return ranked[-1]
+
+
+def _resolve_family_group(
+    members: list[str],
+    assigned: dict[str, str],
+    format_rank: dict[str, int],
+    legal_formats: dict[str, set[str]] | None,
+    promotion_class: str,
+    fused_licence=None,
+) -> dict[str, str] | None:
+    """Move a FUSED serving unit onto one FAMILY, leaving each member's rate free.
+
+    Reached only for a component every one of whose groups is a fused module
+    -- ``promote_serving_units`` tags the groups by kind, and packed-expert or
+    untagged components never enter (issue #140).  The per-member rates are
+    licensed, not asserted: ``fused_licence`` is the pinned Tessera contract's
+    ``fused_module`` block parsed into a
+    :class:`~prismaquant.tessera_runtime_contract.FusedModuleLicence`, and the
+    relaxation runs only while that block marks the rate field
+    (``q256``) ``per_member``.  ``None`` -- no contract pinned, no table to
+    derive the rate's freedom from -- declines rather than asserting it, so a
+    contract that re-tightens ``q256`` to ``shared`` collapses the group to
+    one rung instead of leaving promotion writing rungs the loader refuses.  A
+    ``q256`` word the block does not name at all raises (through the
+    licence's own lookup) rather than guessing either way.
+
+    Every other menu is untouched by construction: for a stock format the
+    class IS the name, the caller never enters this branch, and the run is
+    byte-identical to one built before this function existed.
+
+    Each member takes the CHEAPEST legal rung of ``promotion_class`` at or
+    above its own current rank -- the same non-degrading contract
+    ``_choose_group_format`` implements for the uniform case, applied per
+    member instead of once for the unit.  Returns ``None`` (and the caller
+    falls back to uniform promotion) if any member has no legal rung in the
+    family at all, so the relaxation can only ever be a widening of what
+    promotion accepts, never a new way for it to fail.
+    """
+    if fused_licence is None:
+        return None
+    if not fused_licence.is_per_member("q256"):
+        return None
+    from .tessera_formats import format_promotion_class
+
+    out: dict[str, str] = {}
+    for member in members:
+        legal = (
+            legal_formats.get(member, set())
+            if legal_formats is not None else None
+        )
+        floor = format_rank.get(assigned[member])
+        if floor is None:
+            return None
+        rungs = [
+            fmt for fmt in format_rank
+            if format_promotion_class(fmt) == promotion_class
+            and format_rank[fmt] >= floor
+            and (legal is None or fmt in legal)
+        ]
+        if not rungs:
+            return None
+        out[member] = min(rungs, key=lambda fmt: (format_rank[fmt], fmt))
+    return out
+
+
 def _promote_group_components(
     assignment: dict[str, str],
     format_rank: dict[str, int],
     groups: list[list[str]],
+    legal_formats: dict[str, set[str]] | None = None,
+    *,
+    group_kinds: "Sequence[str] | None" = None,
+    fused_licence=_LICENCE_FROM_CONTRACT,
 ) -> dict[str, str]:
-    """Promote connected serving-unit components to one shared format."""
+    """Promote connected serving-unit components to one shared format.
+
+    ``legal_formats`` (see ``legal_formats_from_candidates``) maps a row to the
+    formats that are legal FOR THAT ROW. Without it, promotion writes the
+    highest-rank format any member was assigned to every member — with no
+    check that the format is runnable for the rest of them. Members of one
+    unit do not share a shape (gate_up vs down differ on the reduce dim; an
+    odd ``moe_intermediate_size`` makes one projection's group / scale-block
+    divisibility fail while the other's passes), so that format can be
+    illegal for a subset, and export's per-Linear shape coercion then breaks
+    the unit's coherence (issue #28). Omit the argument and the legacy
+    max-rank behaviour is reproduced exactly.
+
+    ``group_kinds`` tags each group ``"fused"`` or ``"packed"`` -- which
+    builder produced it (see ``_GROUP_KINDS``).  The family relaxation
+    (``_resolve_family_group``) is entered only for a component every one of
+    whose groups is fused AND under a ``q256: per_member`` licence; a packed
+    or untagged component takes the uniform path even when its max-rank
+    format is a Tessera rung, and a component that unions a fused group with
+    a packed one REFUSES, because neither licence scope covers the mix and
+    picking a side would assert what nothing attests (issue #140).  The
+    refusal fires only where the kind matters -- on a stock menu the uniform
+    path treats every kind identically, so overlapping stock groups keep the
+    behaviour they always had.
+
+    ``fused_licence`` is the pinned contract's ``fused_module`` block parsed
+    into a ``FusedModuleLicence``; ``None`` is the absence of a licence (one
+    rung per group), and the default reads the contract on first need through
+    ``tessera_menu.fused_module_licence`` -- lazily, so a stock run never
+    imports the menu reader.
+    """
+    from .tessera_formats import format_promotion_class
+
+    if group_kinds is not None:
+        if len(group_kinds) != len(groups):
+            raise ValueError(
+                f"promotion got {len(groups)} groups and "
+                f"{len(group_kinds)} kinds; the two lists are parallel and "
+                "must match exactly"
+            )
+        for kind in group_kinds:
+            if kind not in _GROUP_KINDS:
+                raise ValueError(
+                    f"promotion group kind {kind!r} is not one of "
+                    f"{sorted(_GROUP_KINDS)}; the kind is which builder "
+                    "produced the group, and an unknown word would silently "
+                    "widen or narrow the family relaxation"
+                )
+
     out = dict(assignment)
     parent = {name: name for name in out}
 
@@ -103,14 +817,92 @@ def _promote_group_components(
     for name in out:
         components.setdefault(find(name), []).append(name)
 
-    for members in components.values():
+    # Which kinds met in each component, recomputed AFTER every union so the
+    # roots are final.  A group that contributed no union (fewer than two
+    # members present) contributed no coupling either, so it lends no kind.
+    comp_kinds: dict[str, set[str]] = {}
+    comp_sources: dict[str, list[tuple[str, list[str]]]] = {}
+    if group_kinds is not None:
+        for index, group in enumerate(groups):
+            members = [m for m in group if m in out]
+            if len(members) < 2:
+                continue
+            root = find(members[0])
+            comp_kinds.setdefault(root, set()).add(group_kinds[index])
+            comp_sources.setdefault(root, []).append(
+                (group_kinds[index], sorted(members)))
+
+    licence = fused_licence
+    for root, members in components.items():
         if len(members) < 2:
             continue
-        best_fmt = max((out[member] for member in members), key=lambda fmt: format_rank[fmt])
-        best_rank = format_rank[best_fmt]
+        kinds_here = comp_kinds.get(root, set())
+        best_fmt = max(
+            (out[member] for member in members),
+            key=lambda fmt: _rank_of(
+                fmt, format_rank,
+                where="_promote_group_components max-choice", members=members),
+        )
+        promotion_class = format_promotion_class(best_fmt)
+        if promotion_class != best_fmt:
+            # A format whose serving identity is coarser than its name: the
+            # unit has to share the FAMILY, not the rate. Only Tessera rungs
+            # answer to this today, so no stock menu reaches the branch.
+            if _GROUP_KIND_FUSED in kinds_here and _GROUP_KIND_PACKED in kinds_here:
+                # One component coupled by a fused group and a packed group.
+                # The fused licence scopes per-member rates to one vLLM-fused
+                # module and says nothing about experts; the packed unit is
+                # outside it. Refuse rather than pick a side.
+                fused_side = sorted(
+                    src for kind, src in comp_sources.get(root, [])
+                    if kind == _GROUP_KIND_FUSED)
+                packed_side = sorted(
+                    src for kind, src in comp_sources.get(root, [])
+                    if kind == _GROUP_KIND_PACKED)
+                raise AssertionError(
+                    f"serving-unit component of {len(members)} members "
+                    f"(representative {min(members)!r}) unions a fused group "
+                    f"with a packed-expert group: fused {fused_side}, packed "
+                    f"{packed_side}. Per-member rungs are licensed only "
+                    "inside one vLLM-fused module (the pinned Tessera "
+                    "contract's fused_module block) and uniform promotion is "
+                    "the packed unit's own constraint -- the mix satisfies "
+                    "neither scope, so promotion refuses instead of choosing "
+                    "one. This is an upstream grouping bug to fix, not a "
+                    "state to promote around."
+                )
+            if kinds_here == {_GROUP_KIND_FUSED}:
+                if licence is _LICENCE_FROM_CONTRACT:
+                    from .tessera_menu import fused_module_licence as _read_licence
+                    licence = _read_licence()
+                resolved = _resolve_family_group(
+                    members, out, format_rank, legal_formats, promotion_class,
+                    licence)
+                if resolved is not None:
+                    out.update(resolved)
+                    continue
+        if all(_member_allows(best_fmt, member, legal_formats)
+               for member in members):
+            # Shadowed by the max-choice above -- reaching here proves every
+            # member ranked -- but routed anyway: the next caller to arrive by
+            # another path would otherwise reintroduce the bare lookup.
+            best_rank = _rank_of(
+                best_fmt, format_rank,
+                where="_promote_group_components uniform write", members=members)
+            for member in members:
+                if _rank_of(out[member], format_rank,
+                            where="_promote_group_components uniform write",
+                            members=members) < best_rank:
+                    out[member] = best_fmt
+            continue
+        # The max-rank assignment cannot run on every member of an atomic
+        # serving unit. Move the WHOLE unit to a format that can, and write it
+        # unconditionally: a member sitting on an equal-rank-but-different
+        # format would otherwise survive the promotion and keep the unit mixed.
+        chosen = _choose_group_format(
+            members, out, format_rank, legal_formats, best_fmt)
         for member in members:
-            if format_rank[out[member]] < best_rank:
-                out[member] = best_fmt
+            out[member] = chosen
     return out
 
 
@@ -121,17 +913,43 @@ def promote_serving_units(
     profile=None,
     include_fused: bool = True,
     include_moe: bool = True,
+    legal_formats: dict[str, set[str]] | None = None,
+    fused_licence=_LICENCE_FROM_CONTRACT,
 ) -> dict[str, str]:
-    """Promote all serving-coupled units in one order-independent pass."""
+    """Promote all serving-coupled units in one order-independent pass.
+
+    Pass ``legal_formats`` (``legal_formats_from_candidates(candidates)``)
+    wherever per-row legality is known, so the shared format a unit lands on
+    is one every member can actually run. Omitted, promotion keeps its legacy
+    max-rank behaviour.
+
+    The groups are tagged by KIND where they are built -- fused modules vs
+    packed-expert units -- and the tags travel into
+    ``_promote_group_components`` beside the member lists, so the family
+    relaxation fires only for fused-kind components under the pinned
+    contract's ``fused_module`` licence (issue #140).  ``fused_licence`` is
+    that block parsed into a ``FusedModuleLicence``; ``None`` is the absence
+    of a licence (one rung per group), and the default reads the contract on
+    first need.
+    """
     if profile is None:
         from .model_profiles import DefaultProfile
         profile = DefaultProfile()
     groups: list[list[str]] = []
+    group_kinds: list[str] = []
     if include_fused:
-        groups.extend(_group_by_profile(assignment.keys(), profile).values())
+        for members in _group_by_profile(
+                assignment.keys(), profile).values():
+            groups.append(members)
+            group_kinds.append(_GROUP_KIND_FUSED)
     if include_moe:
-        groups.extend(_packed_groups_by_profile(assignment.keys(), profile).values())
-    return _promote_group_components(assignment, format_rank, groups)
+        for members in _packed_groups_by_profile(
+                assignment.keys(), profile).values():
+            groups.append(members)
+            group_kinds.append(_GROUP_KIND_PACKED)
+    return _promote_group_components(
+        assignment, format_rank, groups, legal_formats,
+        group_kinds=group_kinds, fused_licence=fused_licence)
 
 
 def fused_siblings(name: str, profile=None) -> tuple[tuple[str, ...], str] | None:
@@ -150,6 +968,7 @@ def promote_moe_pair(
     format_rank: dict[str, int],
     *,
     profile=None,
+    legal_formats: dict[str, set[str]] | None = None,
 ) -> dict[str, str]:
     """Promote packed MoE projections that must share one serving format."""
     if profile is None:
@@ -161,13 +980,27 @@ def promote_moe_pair(
         profile=profile,
         include_fused=False,
         include_moe=True,
+        legal_formats=legal_formats,
     )
 
 
 def promote_fused(assignment: dict[str, str],
-                  format_rank: dict[str, int],
-                  profile=None) -> dict[str, str]:
-    """Promote each fused-sibling group to one shared serving format."""
+                   format_rank: dict[str, int],
+                   profile=None,
+                   legal_formats: dict[str, set[str]] | None = None,
+                   fused_licence=_LICENCE_FROM_CONTRACT,
+                   ) -> dict[str, str]:
+    """Promote each fused-sibling group to one shared serving format.
+
+    ``fused_licence`` is the pinned Tessera contract's ``fused_module``
+    block parsed into a ``FusedModuleLicence``; ``None`` is the absence of
+    a licence (one rung per group), and the default reads the contract on
+    first need through ``tessera_menu.fused_module_licence`` -- lazily, so
+    a stock run never imports the menu reader. It is forwarded to
+    ``promote_serving_units`` unchanged, so a licensed fused group keeps
+    its per-member rungs here exactly as it does on the
+    ``solve_with_promotion`` path (issue #169).
+    """
     if profile is None:
         from .model_profiles import DefaultProfile
         profile = DefaultProfile()
@@ -177,22 +1010,74 @@ def promote_fused(assignment: dict[str, str],
         profile=profile,
         include_fused=True,
         include_moe=False,
+        legal_formats=legal_formats,
+        fused_licence=fused_licence,
     )
     groups = _group_by_profile(assignment.keys(), profile)
+    licence = fused_licence
+
+    def _group_is_licensed(members_present: list[str]) -> bool:
+        """Is this group's format mix a licensed per-member family, not drift?
+
+        True only while the members share one promotion family (one Tessera
+        decoder) AND the ``q256`` word licenses per-member rates. A mix
+        across families is unservable under any licence and answers False
+        without touching the contract, so a stock run never imports the
+        menu reader for a question whose answer is already no. An unnamed
+        ``q256`` word raises through the licence's own lookup rather than
+        guessing either way -- the same fail-closed read
+        ``_resolve_family_group`` performs.
+        """
+        from .tessera_formats import format_promotion_class
+        if len({format_promotion_class(out[m])
+                for m in members_present}) != 1:
+            return False
+        nonlocal licence
+        if licence is _LICENCE_FROM_CONTRACT:
+            from .tessera_menu import fused_module_licence as _read_licence
+            licence = _read_licence()
+        if licence is None:
+            return False
+        return bool(licence.is_per_member("q256"))
+
+    # Legacy per-group repass, kept for its post-check below. On an
+    # unlicensed group it cannot write: a connected component is a superset
+    # of each group it contains, so every group is already uniform here and
+    # no member's rank is below the group max. On a LICENSED group it must
+    # not write: the component pass above has deliberately left per-member
+    # rungs of one family in place (issue #140), and collapsing them to
+    # ``max(ranks)`` would silently discard exactly those rungs (issue
+    # #169). (The repass is also legality-blind, so writing here would be
+    # able to undo the component pass's legal-for-all choice.)
     for members_present in groups.values():
+        members_present = [m for m in members_present if m in out]
         if len(members_present) < 2:
             continue
-        ranks = [format_rank[out[m]] for m in members_present]
+        if len({out[m] for m in members_present}) > 1 and _group_is_licensed(
+                members_present):
+            continue
+        ranks = [_rank_of(out[m], format_rank,
+                          where="promote_fused legacy repass",
+                          members=members_present)
+                 for m in members_present]
         best = max(ranks)
         best_fmt = next(k for k, v in format_rank.items() if v == best)
         for m in members_present:
-            if format_rank[out[m]] < best:
+            if _rank_of(out[m], format_rank,
+                        where="promote_fused legacy repass",
+                        members=members_present) < best:
                 out[m] = best_fmt
 
     for group_key, members in groups.items():
         if len(members) < 2:
             continue
         fmts = {out[m] for m in members}
+        if len(fmts) > 1 and _group_is_licensed(
+                [m for m in members if m in out]):
+            # A licensed family mix: one shared decoder with a rate per
+            # member, which is what the component pass above wrote. The
+            # uniformity post-check below is for unlicensed groups only.
+            continue
         if len(fmts) > 1:
             detail = ", ".join(f"{m}={out[m]}" for m in members)
             raise AssertionError(
@@ -221,10 +1106,109 @@ def _charged_bins(d_avg_bits: float, bit_precision: float) -> int:
     return dbins
 
 
+def selected_rung_dual_intervals(
+    stats: dict,
+    candidates: dict[str, list[Candidate]],
+    assignment: dict[str, str],
+    bit_precision: float = 0.001,
+) -> dict[str, DualInterval]:
+    """Return each selected rung's local weak-Lagrangian support interval.
+
+    This reads the two quantities already formed by ``solve_allocation``'s
+    forward options: ``predicted_dloss`` and the conservatively rounded
+    average-bit charge from :func:`_charged_bins`.  The latter is converted to
+    bytes with ``total_params / 8`` so lambda has the design's bytes-to-loss
+    units while still mirroring the DP's discretization exactly.
+
+    For selected rung ``s`` and every alternative ``c``, the supporting-price
+    condition is::
+
+        loss(s) + lambda * bytes(s) <= loss(c) + lambda * bytes(c)
+
+    Alternatives cheaper than ``s`` supply upper bounds; alternatives more
+    expensive than ``s`` supply lower bounds.  Equal-charge alternatives can
+    make the interval empty.  This is a per-unit pairwise intersection under
+    the DP's rounded charge function, including equality at breakpoints; it is
+    not a certificate of the exact-budget DP's global tie choice or the
+    design's uncertainty-aware hull widening.  The helper is deliberately
+    observational: it neither runs nor changes the budget DP, and an exact
+    integer-DP choice may legitimately have an empty interval when it lies off
+    the Lagrangian hull.
+    """
+    if bit_precision <= 0.0:
+        raise ValueError("bit_precision must be positive")
+
+    names = list(candidates.keys())
+    total_params = sum(int(stats[n]["n_params"]) for n in names)
+    if total_params <= 0:
+        return {}
+
+    bytes_per_bin = float(bit_precision) * float(total_params) / 8.0
+    out: dict[str, DualInterval] = {}
+    for name in names:
+        if name not in assignment:
+            raise KeyError(f"assignment is missing candidate unit {name!r}")
+        cs = candidates[name]
+        selected_fmt = assignment[name]
+        matches = [c for c in cs if c.fmt == selected_fmt]
+        if len(matches) != 1:
+            raise ValueError(
+                f"assignment {name!r}={selected_fmt!r} resolves to "
+                f"{len(matches)} candidates; expected exactly one"
+            )
+        selected = matches[0]
+        baseline = min(cs, key=lambda c: c.bits_per_param)
+        fraction = int(stats[name]["n_params"]) / total_params
+
+        def charged_bytes(candidate: Candidate) -> float:
+            d_avg_bits = (
+                candidate.bits_per_param - baseline.bits_per_param
+            ) * fraction
+            return (
+                _charged_bins(d_avg_bits, bit_precision) * bytes_per_bin
+            )
+
+        selected_bytes = charged_bytes(selected)
+        lambda_lo = 0.0
+        lambda_hi = inf
+        for competitor in cs:
+            if competitor is selected:
+                continue
+            byte_delta = selected_bytes - charged_bytes(competitor)
+            loss_delta = (
+                competitor.predicted_dloss - selected.predicted_dloss
+            )
+            if byte_delta > 0.0:
+                lambda_hi = min(lambda_hi, loss_delta / byte_delta)
+            elif byte_delta < 0.0:
+                lambda_lo = max(lambda_lo, loss_delta / byte_delta)
+            elif selected.predicted_dloss > competitor.predicted_dloss:
+                lambda_lo, lambda_hi = inf, -inf
+                break
+        out[name] = DualInterval(lambda_lo=lambda_lo, lambda_hi=lambda_hi)
+    return out
+
+
 def solve_allocation(stats: dict, candidates: dict[str, list[Candidate]],
                      target_bits: float, bit_precision: float = 0.001
                      ) -> tuple[dict[str, str], dict[str, Candidate]] | None:
-    """Solve multi-choice knapsack in average-bits-per-parameter units."""
+    """Solve multi-choice knapsack in average-bits-per-parameter units.
+
+    Contract (audit 2026-08-21): this is a PROJECTION, not a budget
+    feasibility certificate. Returns None when ``target_bits`` is below the
+    format floor (``min_bits``); otherwise the returned assignment's charged
+    bins fit ``round((target_bits - min_bits) / bit_precision) + 1``, but its
+    ACHIEVED average bits can exceed ``target_bits`` — each unit's share-
+    scaled bit delta is rounded to the nearest bin (minimum one bin when
+    strictly positive, see ``_charged_bins``), so the overshoot is bounded by
+    ``bit_precision * (n_units + 3) / 2``: n/2 bins of per-unit round-to-
+    nearest slack plus 1.5 bins of DP capacity slack. Budget feasibility
+    (``achieved - target <= tolerance``) is enforced upstream on the promoted,
+    exactly-priced assignment — by :func:`solve_with_promotion`'s overshoot
+    ratchet and the byte-budget exact filter — never here (see
+    docs/design/constrained_pareto_allocation.md and serve_constraints.py
+    for why the filter deliberately lives outside this DP).
+    """
     import numpy as np
 
     names = list(candidates.keys())
@@ -334,7 +1318,28 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
                      format_specs: dict[str, fr.FormatSpec],
                      candidates: dict[str, list[Candidate]] | None = None,
                      ) -> tuple[float, float]:
-    """Return ``(avg_bits, total_predicted_dloss)`` for an assignment."""
+    """Return additive proposal ``(avg_bits, total_predicted_dloss)``.
+
+    ``Candidate.memory_bytes`` is deliberately tensor-local, so this helper
+    does not charge assignment-shared CB codebooks or other non-additive
+    artifact costs. Producer callers must exact-price the expanded assignment
+    before reporting a final achieved rate; :mod:`prismaquant.allocator` does
+    that in its proposal-then-exact-filter loop.
+
+    A priced row (a name present in ``candidates``) whose assigned format has
+    no candidate is a HARD ERROR, not a zero-cost row. It means promotion put
+    that Linear on a format its own candidate set never offered — the format
+    is illegal for it, and pricing the move at 0 Δloss made the unpriced row
+    look free. That mattered the moment ``solve_with_promotion`` started
+    ratcheting on this Δloss: the contaminated (too-low) sum is exactly what
+    the min-Δloss ratchet would prefer. ``compute_assignment_predicted_dloss``
+    already refuses the same input, so failing here only moves the same error
+    to where the miscosting happens.
+
+    Names ABSENT from ``candidates`` (and the ``candidates=None`` byte-only
+    call form) stay on the unpriced byte path: they are not DP rows, so they
+    contribute bytes and no Δloss.
+    """
     total_params = sum(stats[n]["n_params"] for n in assignment)
     total_bits = 0.0
     total_predicted_dloss = 0.0
@@ -347,6 +1352,15 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
             total_predicted_dloss += float(
                 getattr(chosen_cand, "predicted_dloss", 0.0))
             continue
+        if n in cs:
+            raise AssertionError(
+                f"assignment {n!r} picked fmt={fmt!r}, but no candidate "
+                "exists to price its predicted loss (available: "
+                f"{sorted(c.fmt for c in cs[n])}). Serving-unit promotion "
+                "moved a priced Linear onto a format its candidate set never "
+                "offered; scoring it at zero Δloss would bias the solver's "
+                "min-Δloss ratchet toward exactly this unpriced state."
+            )
         memory_map = stats[n].get("_memory_bytes_by_format")
         if memory_map is not None and fmt in memory_map:
             total_bits += 8.0 * memory_map[fmt]
@@ -390,17 +1404,21 @@ def solve_with_promotion(
     stall_threshold: float = 1e-4,
     stall_grace: int = 3,
     profile=None,
+    diagnostics: dict | None = None,
 ) -> tuple[dict[str, str] | None, float]:
     """Solve, promote coupled tensors, and retry if promotion exceeds budget.
 
     Termination contract: the returned
     assignment is always FEASIBLE — ``achieved <= target_bits +
     overshoot_tolerance`` — and, among the feasible iterates seen, the
-    densest one (largest achieved bits, i.e. least undershoot). When no
+    one with MINIMUM total predicted Δloss (ties broken toward larger
+    achieved bits). Δloss is the solver's actual objective; density is
+    not a proxy for it — more bits is not monotonically better (5.5 bpp
+    has beaten 6.0 bpp on served PPL), and promotion can flip a serving
+    group into a denser-but-worse format. When no
     iterate is feasible within ``max_iters`` the rung is INFEASIBLE and
     ``(None, nan)`` is returned so callers exclude it from the Pareto curve
-    and byte-budget bisection. The three silent fallbacks this replaces all
-    fabricated ``feasible=True`` rows:
+    and byte-budget bisection. Three silent fallbacks are replaced:
 
       - ``solve_allocation`` returning None (tightened below the format
         floor) used to return the previous, massively over-target iterate;
@@ -408,14 +1426,27 @@ def solve_with_promotion(
         (rung 6.0 returning achieved 4.95 with 25x worse loss);
       - the stall exit used to return an iterate still far above target.
 
-    The search runs in two phases on the *tightened* DP target:
+    Honest scope: only the ``--target-bits`` emit path shipped those
+    over-target iterates silently. The byte-budget selector priced them
+    at their true (larger) disk size, so its feasibility calls were
+    correct — the rung label was just wrong, skewing the Pareto curve's
+    x-axis rather than fabricating feasibility.
+
+    First evaluate the per-unit minimum measured loss assignment. Return it
+    if serving promotion preserves every unit's minimum and its unrounded
+    candidate payload fits. Otherwise use the existing two-phase search on
+    the *tightened* DP target. The caller still exact-prices shared sidecars
+    and other non-additive artifact costs before accepting any proposal.
+
+    The binned search runs in two phases:
 
     1. Damped descent (the old loop's cost profile — the first eval at the
        full target is the only expensive DP; every subsequent eval has a
        smaller bin table): tighten by ``overshoot/2`` until an iterate is
        feasible or the DP floor is reached.
     2. Bracket bisection between the first feasible tightened value and the
-       last infeasible one, ratcheting the densest feasible assignment.
+       last infeasible one, ratcheting the minimum-Δloss feasible
+       assignment.
        Promotion is a coarse step function (one packed-MoE serving group
        flipping format moves the average by tenths of a bit), so
        achieved(tightened) is locally non-monotone; the ratchet keeps
@@ -426,10 +1457,36 @@ def solve_with_promotion(
     acceleration; ``stall_grace`` is retained for call compatibility but
     unused (both phases shrink their search state every evaluation, so
     they cannot stall).
+
+    Pass ``diagnostics`` (an empty dict) to receive the numbers an INFEASIBLE
+    verdict needs to be actionable — they are otherwise computed and thrown
+    away. The dict is filled IN PLACE, on every return path:
+
+      ``target_bits``, ``min_bits`` (the DP baseline: cheapest-candidate
+      average bits, i.e. the format floor), ``overshoot_tolerance``,
+      ``evals``, ``feasible``, ``achieved_bits`` / ``predicted_dloss`` (the
+      returned iterate, ``None`` when INFEASIBLE), ``closest_achieved_bits``
+      / ``closest_tightened_target`` (the least-overshooting iterate seen —
+      "how close did it get"), and ``floor_achieved_bits`` (what the DP floor
+      itself promoted to, the number that distinguishes "target below the
+      format floor" from "serving-group promotion overshoots").
     """
     del stall_grace  # legacy fixed-point knob; see docstring
     stall_eps = float(stall_threshold)
     target = float(target_bits)
+    diag = diagnostics if diagnostics is not None else {}
+    diag.update({
+        "target_bits": target,
+        "min_bits": None,
+        "overshoot_tolerance": float(overshoot_tolerance),
+        "evals": 0,
+        "feasible": False,
+        "achieved_bits": None,
+        "predicted_dloss": None,
+        "closest_achieved_bits": None,
+        "closest_tightened_target": None,
+        "floor_achieved_bits": None,
+    })
     names = list(candidates.keys())
     total_params = sum(stats[n]["n_params"] for n in names)
     if total_params <= 0:
@@ -439,19 +1496,67 @@ def solve_with_promotion(
         * stats[n]["n_params"]
         for n, cs in candidates.items()
     ) / total_params
+    diag["min_bits"] = float(min_bits)
     if target < min_bits - 1e-6:
         return None, float("nan")
 
     best_assign: dict[str, str] | None = None
     best_achieved = float("nan")
+    best_dloss = float("inf")
+    # Per-row legality for the promotion below. On the aggregated path this is
+    # a no-op (a super-item is one row and has no serving siblings), but with
+    # --no-packed-aggregation / --no-fused-aggregation — or a group that fell
+    # back to individual rows — promotion is the ONLY coherence mechanism, and
+    # the format it picks has to be runnable for every member. Built once: the
+    # search re-promotes on every DP evaluation.
+    legal_formats = legal_formats_from_candidates(candidates)
+
+    # Bin rounding can exclude the exact feasible quality endpoint: every
+    # unit may round upward even when the sum of its real bytes fits. Check
+    # the unconstrained per-unit loss minimum before using the binned proposal.
+    # Equal-loss choices retain the existing preference for larger achieved
+    # payloads. This is format-agnostic; BF16 gets no special treatment.
+    quality_choices = {
+        name: min(options, key=lambda c: (c.predicted_dloss, -c.memory_bytes))
+        for name, options in candidates.items()
+    }
+    quality_assignment = promote_serving_units(
+        {name: c.fmt for name, c in quality_choices.items()},
+        format_rank,
+        profile=profile,
+        include_fused=not no_fused_promote,
+        include_moe=True,
+        legal_formats=legal_formats,
+    )
+    quality_achieved, quality_loss = compute_achieved(
+        stats, quality_assignment, format_specs, candidates=candidates,
+    )
+    # Test each promoted row against its own minimum; comparing rounded sums
+    # could hide a small loss increase beside a very large unchanged row.
+    quality_preserved = all(
+        _candidate_for_assignment(name, fmt, candidates).predicted_dloss
+        == quality_choices[name].predicted_dloss
+        for name, fmt in quality_assignment.items()
+    )
+    diag.update(quality_endpoint_achieved_bits=float(quality_achieved),
+                quality_endpoint_preserves_minimum_loss=quality_preserved)
+    if quality_preserved and quality_achieved - target <= overshoot_tolerance:
+        diag.update(feasible=True, achieved_bits=float(quality_achieved),
+                    predicted_dloss=float(quality_loss),
+                    quality_endpoint_selected=True)
+        return quality_assignment, quality_achieved
+    diag["quality_endpoint_selected"] = False
 
     def _evaluate(t: float) -> float | None:
         """Solve+promote at tightened ``t``; ratchet if feasible.
 
         Returns achieved bits, or None when the DP is infeasible at ``t``.
+        The ratchet keeps the feasible iterate with minimum total predicted
+        Δloss (the solve objective), tie-broken toward higher achieved bits.
         """
-        nonlocal best_assign, best_achieved
+        nonlocal best_assign, best_achieved, best_dloss
         t0 = time.time() if _SOLVER_TRACE else 0.0
+        diag["evals"] += 1
         result = solve_allocation(stats, candidates, t, bit_precision)
         if result is None:
             if _SOLVER_TRACE:
@@ -466,19 +1571,34 @@ def solve_with_promotion(
             profile=profile,
             include_fused=not no_fused_promote,
             include_moe=True,
+            legal_formats=legal_formats,
         )
-        achieved, _ = compute_achieved(
+        achieved, predicted = compute_achieved(
             stats, assign, format_specs,
             candidates=candidates,
         )
         if _SOLVER_TRACE:
             print(f"[solver] target={target:.4f} eval t={t:.4f} -> "
-                  f"achieved={achieved:.4f} ({time.time() - t0:.1f}s)",
+                  f"achieved={achieved:.4f} dloss={predicted:.3e} "
+                  f"({time.time() - t0:.1f}s)",
                   flush=True)
+        if abs(t - min_bits) <= 1e-9:
+            diag["floor_achieved_bits"] = float(achieved)
+        if achieved - target > overshoot_tolerance:
+            closest = diag["closest_achieved_bits"]
+            if closest is None or achieved < closest:
+                diag["closest_achieved_bits"] = float(achieved)
+                diag["closest_tightened_target"] = float(t)
         if achieved - target <= overshoot_tolerance and (
-                best_assign is None or achieved > best_achieved):
+                best_assign is None
+                or predicted < best_dloss
+                or (predicted == best_dloss and achieved > best_achieved)):
             best_assign = assign
             best_achieved = achieved
+            best_dloss = predicted
+            diag["feasible"] = True
+            diag["achieved_bits"] = float(achieved)
+            diag["predicted_dloss"] = float(predicted)
         return achieved
 
     # Phase 1: damped descent until the first feasible iterate. Promotion
@@ -507,7 +1627,8 @@ def solve_with_promotion(
             continue
         if achieved - target <= overshoot_tolerance:
             if achieved >= target - overshoot_tolerance:
-                # Within the band on both sides — cannot improve.
+                # Within the band on both sides; return the best feasible
+                # iterate seen. Binning does not prove global optimality.
                 return best_assign, best_achieved
             lo = tightened
             break
@@ -533,7 +1654,9 @@ def solve_with_promotion(
         if tightened <= min_bits:
             tightened = min_bits
 
-    # Phase 2: bisect (lo, hi) for the densest feasible iterate.
+    # Phase 2: bisect (lo, hi) toward the target. The bisection PROPOSES
+    # progressively denser feasible iterates; the ratchet in _evaluate
+    # KEEPS whichever feasible iterate has the minimum predicted Δloss.
     if lo is not None:
         while evals < max_iters and hi - lo > max(bit_precision, 1e-9):
             evals += 1
@@ -541,11 +1664,17 @@ def solve_with_promotion(
             achieved = _evaluate(mid)
             if achieved is not None and achieved - target <= overshoot_tolerance:
                 if achieved >= target - overshoot_tolerance:
+                    # In-band: densest possible; keep the min-Δloss ratchet.
                     return best_assign, best_achieved
                 lo = mid
             else:
                 hi = mid
 
     if best_assign is None:
+        if _SOLVER_TRACE:
+            print(f"[solver] target={target:.4f} INFEASIBLE after "
+                  f"{diag['evals']} evals: floor={min_bits:.4f} "
+                  f"floor_achieved={diag['floor_achieved_bits']} "
+                  f"closest={diag['closest_achieved_bits']}", flush=True)
         return None, float("nan")
     return best_assign, best_achieved

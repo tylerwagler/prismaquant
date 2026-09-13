@@ -13,31 +13,68 @@ uniformly:
   - autoround_config()      dict AutoRound consumes via --layer_config
   - quantize_dequantize(w)  apply RTN in-place (for closed-loop MSE)
   - min_capability_sm       minimum SM arch (useful for hardware filter)
+  - static_activation_contract
+                            the served static-scale activation contract
+                            (which quantiser, which per-unit G rule), or None
 
 Users register new formats with @register_format. New hardware formats
-(e.g. a future MXFP6 variant or Ada W4A8) can be added without touching
+(e.g. a future MX variant or Ada W4A8) can be added without touching
 core code.
 """
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 import re
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Iterable
 
 import torch
 from compressed_tensors.quantization.utils.mxfp_utils import generate_mx_scales
 
+from prismaquant.cb_layout import (
+    CODEWORDS_PER_SUPERBLOCK,
+    FP4_GROUP,
+    FP8_ACCEPTED_RUNGS,
+    FP8_PRODUCT_RUNGS,
+    NVFP4_ACCEPTED_RUNGS,
+    NVFP4_PRODUCT_RUNGS,
+    SCALE_CODING_V1,
+    SCALE_PLANE_BYTES,
+    SUPERBLOCK,
+    is_producer_format_name,
+    parse_format_name,
+)
 from prismaquant.fp8_dynamic import (
     fp8_dynamic_activation_qdq_vllm,
     fp8_dynamic_weight_qdq,
 )
 from prismaquant.gguf_formats import make_gguf_qdq
+from prismaquant.nvfp4_cb_formats import make_nvfp4_cb_qdq
 from prismaquant.mx_formats import (
     e8m0_to_scale,
     mxfp8_e4m3_activation_qdq_vllm,
     mxfp8_e4m3_weight_qdq,
+    mxfp8_ue8m0_activation_qdq,
+    mxfp8_ue8m0_weight_qdq,
 )
+from prismaquant.nvfp4_activation_contract import (
+    NVFP4_SERVED_ACTIVATION_CONTRACT,
+    StaticActivationContract,
+)
+
+
+def act_bits_quantize_input(act_bits: "int | None") -> bool:
+    """The predicate of ``FormatSpec.act_quant_changes_input``, for callers
+    that hold an ``act_bits`` value without a ``FormatSpec`` around it.
+
+    A Tessera route record is the case this exists for: it carries the same
+    three ``act_*`` fields as a spec, is turned into config metadata before a
+    spec exists, and must reach the same answer.  One definition, two entry
+    points -- re-deriving it a third time is what
+    ``tests/test_bit_exact_cost_pricing.py`` refuses.
+    """
+    return act_bits is not None and int(act_bits) < 16
 
 
 @dataclass
@@ -49,7 +86,9 @@ class FormatSpec:
     scale_dtype_name: str    # "fp8_e4m3", "uint8_e8m0", "fp32", ...
     weight_element_dtype: str   # "fp4_e2m1", "fp8_e4m3", "fp6_e3m2", "int4", ...
     scale_block_shape: tuple[int, int] | None = None
-    act_bits: int | None = None   # None = no activation quant (W8A16)
+    # None or >=16 = no activation quant (W8A16); see act_quant_changes_input,
+    # the single predicate every consumer must use for that question.
+    act_bits: int | None = None
     act_dtype_name: str | None = None
     act_group_size: int | None = None
     family: str = "generic"       # "nv", "mx", "int", "fp"
@@ -65,10 +104,96 @@ class FormatSpec:
     activation_quantize_dequantize: Callable[[torch.Tensor], torch.Tensor] = field(
         default=lambda x: x
     )
+    # Reader compatibility is deliberately wider than the producer surface
+    # for FP8-CB: old K28..K48 artifacts remain loadable even though new
+    # artifacts may only use K%4.  Kept last to preserve FormatSpec's existing
+    # positional constructor ABI. Menus/assignments must use the explicit
+    # producer APIs instead of treating registry membership as authority.
+    producer_eligible: bool = True
+    # An exact bits-per-parameter rate, for formats whose serialized size is
+    # not the integer-weight-plus-group-scale model the fields above encode.
+    # When set it is the WHOLE rate -- body and scales together -- and
+    # ``memory_bytes_for_shape`` uses it instead of, not in addition to, the
+    # ``weight_bits``/``scale_bits`` terms.  Kept last to preserve the
+    # positional constructor ABI.
+    exact_bits_per_param: "Fraction | None" = None
+    # A *shape-dependent* exact rate, for formats whose serialized size is not
+    # a rate at all.  A Tessera unit whose wire recipe carries a per-unit plane
+    # -- one fp16 per output row (CHANNEL), or a 2**L window table for the
+    # whole tensor -- costs a different number of bits per parameter on a
+    # 2048x4096 tensor than on a 96x768 one, so no scalar can state it.  When
+    # set it is the WHOLE size, body and planes together, in bits, and it wins
+    # over ``exact_bits_per_param`` and the weight/scale terms alike; a spec
+    # that sets it has NO shape-free rate and ``effective_bits`` refuses rather
+    # than quoting a floor.  Kept last to preserve the positional constructor
+    # ABI.
+    bits_for_shape_fn: "Callable[[tuple[int, ...]], Fraction] | None" = None
+    # The served STATIC-scale activation contract, when serving quantizes the
+    # input against a calibrated per-unit ``input_global_scale`` rather than a
+    # scale it computes from the batch (``nvfp4_activation_contract
+    # .StaticActivationContract``).  ``activation_quantize_dequantize`` above
+    # takes no G and so can only ever be the dynamic quantiser; this is the
+    # one place a consumer that holds a calibrated maximum -- the assignment-KL
+    # hooks, the production cache scorer, the campaign -- learns which served
+    # quantiser and which G rule the spec is priced under.  It is a property
+    # of the spec, not of its name: a Tessera rung routed through the NVFP4
+    # kernel carries the same contract as ``NVFP4`` with no "NVFP4" in its
+    # name (#205).  None for dynamic W8A8 (FP8, MX) and A16 rows.  Kept last
+    # to preserve the positional constructor ABI.
+    static_activation_contract: "StaticActivationContract | None" = None
+
+    @property
+    def act_quant_changes_input(self) -> bool:
+        """Dtype-level fact: serving quantizes the INPUT activations.
+
+        A weight-only (A16 / passthrough) format declares its activation
+        path two equivalent ways, and BOTH mean "the kernel consumes the
+        activations at the execution dtype":
+
+          * ``act_bits is None`` — the field is simply not applicable
+            (BF16, FP8_SOURCE, NVFP4A16, MXFP8A16, INT8_W8A16, ...);
+          * ``act_bits >= 16`` — "activations are 16-bit", i.e. not
+            quantized away from bf16/fp16. This is the spelling the
+            ``autoround_config`` dicts in this module already use for the
+            same formats (``act_bits=16, act_data_type="float"``), so a
+            future A16 rung declared that way must not be mistaken for a
+            W·A· format.
+
+        Anything below 16 bits means the serving kernel consumes quantized
+        activations (W·A· formats: NVFP4, FP8 dynamic, MX, GGUF Q8_1
+        compute), so even a bit-identical weight tensor changes the layer
+        output through the A side.
+
+        This is the single predicate for that question. Consumers must use
+        it rather than re-deriving it from ``act_bits``: the allocator's
+        bit-exact cost short-circuit
+        (``allocator_candidates.cost_entry_is_bit_exact``), the KL
+        validator's activation-quant assignment, ``layer_state_cache`` and
+        ``perturbed_x_cache`` all key off this one property, so a format's
+        activation semantics cannot drift between pricing and emulation.
+        Registry consistency between this declaration and the actual
+        activation callable is pinned by
+        tests/test_bit_exact_cost_pricing.py.
+        """
+        return act_bits_quantize_input(self.act_bits)
 
     @property
     def effective_bits(self) -> float:
-        """Average bits per parameter accounting for scales."""
+        """Average bits per parameter accounting for scales.
+
+        Refuses when the format's size is shape-dependent
+        (``bits_for_shape_fn``): there is no scalar to return, and the only
+        answers available -- the body-plus-block-plane part, or the rate at
+        some reference shape -- are floors that every consumer here would
+        multiply by a parameter count as if they were exact.  Ask
+        :meth:`bits_for_shape` or :meth:`effective_bits_for_shape` instead.
+        """
+        if self.bits_for_shape_fn is not None:
+            raise ValueError(
+                f"format {self.name!r} has a shape-dependent exact size and "
+                "therefore no shape-free bits-per-parameter rate; call "
+                "bits_for_shape(shape) or effective_bits_for_shape(shape)"
+            )
         # Backward-compatible fallback when no layer shape is available.
         if self.group_size == 0:
             if self.scale_bits == 0:
@@ -116,9 +241,50 @@ class FormatSpec:
         inner = int(shape[-1])
         return outer * math.ceil(inner / self.group_size)
 
+    def bits_for_shape(self, shape: tuple[int, ...]) -> Fraction:
+        """Exact serialized size of one tensor, in bits, as a rational.
+
+        The one shape-aware size question, answered in the order the spec
+        declares its size:
+
+          * ``bits_for_shape_fn`` -- the format's own accountant, for a wire
+            whose per-unit planes make the rate a function of the shape;
+          * ``exact_bits_per_param`` -- the declared whole rate times the
+            parameter count, exact because both factors are rational;
+          * otherwise the weight/scale model, quoted through
+            ``memory_bytes_for_shape`` so this method can never disagree with
+            it -- which means the answer is byte-rounded for those formats,
+            since that is what their serialization is.
+
+        ``memory_bytes_for_shape`` is the byte view of this same number, and
+        every byte accountant in the tree reaches it through one of the two.
+        """
+
+        if self.bits_for_shape_fn is not None:
+            return Fraction(self.bits_for_shape_fn(tuple(int(d) for d in shape)))
+        if self.exact_bits_per_param is not None:
+            n_params = int(math.prod(shape)) if len(shape) else 1
+            return Fraction(self.exact_bits_per_param) * n_params
+        return Fraction(8 * self.memory_bytes_for_shape(shape))
+
     def memory_bytes_for_shape(self, shape: tuple[int, ...]) -> int:
         """Exact-ish serialized size for a tensor in this format."""
         n_params = int(math.prod(shape)) if len(shape) else 1
+        if self.bits_for_shape_fn is not None:
+            # The format's own accountant owns the whole size, including the
+            # per-unit planes a rate cannot state.  It is also the shape gate:
+            # it raises (as a ValueError) on a shape the format cannot tile,
+            # which is what ``allocator._sort_specs_by_serialized_rate`` and
+            # ``footprint`` already expect from this call.
+            bits = self.bits_for_shape(shape)
+            return -(-bits.numerator // (bits.denominator * 8))
+        if self.exact_bits_per_param is not None:
+            # The declared rate already covers every plane the artifact
+            # writes.  Adding the group-scale term here would charge the
+            # scales twice, which is precisely the drift principle 8 forbids:
+            # the allocator would price a checkpoint the exporter never emits.
+            rate = Fraction(self.exact_bits_per_param)
+            return -(-(n_params * rate.numerator) // (rate.denominator * 8))
         weight_bytes = math.ceil(n_params * self.weight_bits / 8.0)
         scale_bytes = math.ceil(self.scale_count_for_shape(shape) * self.scale_bits / 8.0)
         return weight_bytes + scale_bytes
@@ -141,6 +307,20 @@ FORMAT_ALIASES: dict[str, str] = {
     "FP8_DYNAMIC": "FP8_E4M3",
 }
 
+# Formats whose registry descriptor is weight-8 / activation-16, plus the two
+# source-FP8 compatibility spellings that must stay readable for published
+# artifacts.  This is a classification, NOT a global producer ban: dedicated
+# source-model campaigns still reproduce those artifacts.  Hardware-scoped
+# producer profiles (notably SM120/RTX50) use this set as an explicit deny so
+# an old/fallback W8A16 route cannot re-enter a maintained candidate menu merely
+# because the generic compatibility registry knows how to read its assignment.
+W8A16_COMPAT_FORMAT_NAMES = frozenset({
+    "MXFP8A16",
+    "INT8_W8A16",
+    "FP8_SOURCE",
+    "FP8_BLOCK_UE8M0_SOURCE",
+})
+
 
 def register_format(spec: FormatSpec) -> FormatSpec:
     REGISTRY[spec.name] = spec
@@ -148,6 +328,27 @@ def register_format(spec: FormatSpec) -> FormatSpec:
 
 
 def canonical_format_name(name: str) -> str:
+    """The registry's own spelling of a requested format name.
+
+    Case is not part of a format's identity, and this function is where that
+    is decided -- once, for every consumer.  The raw-then-upper probes below
+    cover "the caller typed lower case and the row is upper case"; they did
+    NOT cover the mirror image, and exactly one registered row is mixed case
+    (``INT4_W4A16_g128``).  So every caller that normalizes a requested name
+    by upper-casing it -- ``production_weight_cache._render_base_format``, the
+    cache identity keys, ``render_production_weight`` -- handed the resolver a
+    name no resolver owned, and ``get_format`` raised ``KeyError`` on a format
+    PrismaQuant ships and a precision plan can select (#218).
+
+    The case-insensitive probe is last, so it fires only where the exact
+    probes have already failed: nothing that resolved before resolves
+    differently now, and an unknown name is still returned unchanged for
+    ``get_format`` to refuse by name.  No two registered names differ only by
+    case (pinned by ``tests/test_format_registry.py``), so the answer is
+    unambiguous.  It is a linear scan over ~80 rows on the MISS path only,
+    which is also the path every synthesized Tessera rung takes; that is
+    string comparison against a fixed-size table, not a hot-loop cost.
+    """
     raw = str(name).strip()
     if raw in FORMAT_ALIASES:
         return FORMAT_ALIASES[raw]
@@ -158,6 +359,13 @@ def canonical_format_name(name: str) -> str:
         return FORMAT_ALIASES[upper]
     if upper in REGISTRY:
         return upper
+    folded = raw.casefold()
+    for alias, target in FORMAT_ALIASES.items():
+        if alias.casefold() == folded:
+            return target
+    for registered in REGISTRY:
+        if registered.casefold() == folded:
+            return registered
     return raw
 
 
@@ -517,6 +725,29 @@ def _mxfp8_e4m3_weight_rtn(w: torch.Tensor) -> torch.Tensor:
     return mxfp8_e4m3_weight_qdq(w).dequant.to(w.dtype)
 
 
+def _mxfp8_ue8m0_weight_rtn(w: torch.Tensor) -> torch.Tensor:
+    """MXFP8_UE8M0_G32 weight RTN — the saturating-ceil shared-exponent rule.
+
+    Same codec the streaming exporter writes, so emulation and shipped bytes
+    are one rendering (see ``mx_formats.mxfp8_ue8m0_shared_exponent``).
+    """
+    return mxfp8_ue8m0_weight_qdq(w).dequant.to(w.dtype)
+
+
+def _mxfp8_ue8m0_activation_rtn(x: torch.Tensor) -> torch.Tensor:
+    """MXFP8_UE8M0_G32 ACTIVATION RTN — dynamic per-32 E8M0, same ceil rule.
+
+    Mirrors the A side the retired Gridbook lane executed (its
+    ``Mxfp8DenseLinearMethod`` quantized activations to MXFP8 per 32-element
+    group each forward; lane retired 2026-09-02), so ``output_mse`` measured
+    through this closure is the W8A8 error of that contract rather than
+    weight-only error.  No sanctioned lane executes this format today, and
+    ``allocator_candidates`` prices it accordingly -- see the format comment
+    below.
+    """
+    return mxfp8_ue8m0_activation_qdq(x).dequant.to(x.dtype)
+
+
 def _make_plain_fp8_weight_rtn(
     element_dtype: torch.dtype,
     element_max: float,
@@ -634,8 +865,13 @@ register_format(FormatSpec(
     autoround_config=lambda: _nv_autoround(4, 16, 4),
     quantize_dequantize=_nvfp4_export_aligned_rtn,
     # activations: per-group dynamic RTN, NOT the export codec — see
-    # _nvfp4_export_aligned_rtn docstring (batch-dependence).
+    # _nvfp4_export_aligned_rtn docstring (batch-dependence).  This is the
+    # screen baseline; what the kernel actually executes -- static G plus
+    # UE4M3 block scales -- is the contract below, which a consumer holding
+    # the calibrated maximum prices through (opt-in for this row, see
+    # StaticActivationContract.measured_as_served).
     activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    static_activation_contract=NVFP4_SERVED_ACTIVATION_CONTRACT,
 ))
 register_format(FormatSpec(
     name="NVFP4A16",
@@ -647,7 +883,7 @@ register_format(FormatSpec(
     activation_quantize_dequantize=lambda x: x,
 ))
 
-# MXFP4 / MXFP8_E4M3 / MXFP8_E5M2 / MXFP6 variants
+# MXFP4 / MXFP8_E4M3 / MXFP8_E5M2 variants
 # (OCP MX, group_size=32, E8M0 scales)
 # All MX formats use mx_scale=True so RTN models the actual E8M0 power-of-two
 # per-block scale used by the serving path. Without this the measured RTN
@@ -660,24 +896,6 @@ register_format(FormatSpec(
     autoround_config=lambda: _mx_autoround(4, 32, 4, "fp4_e2m1"),
     quantize_dequantize=_make_rtn("fp4_e2m1", 32, mx_scale=True),
     activation_quantize_dequantize=_make_rtn("fp4_e2m1", 32, mx_scale=True),
-))
-register_format(FormatSpec(
-    name="MXFP6_E3M2",
-    weight_bits=6, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
-    weight_element_dtype="fp6_e3m2", act_bits=6, act_dtype_name="fp6_e3m2",
-    act_group_size=32, family="mx", min_capability_sm=100,
-    autoround_config=lambda: _mx_autoround(6, 32, 6, "fp6_e3m2"),
-    quantize_dequantize=_make_rtn("fp6_e3m2", 32, mx_scale=True),
-    activation_quantize_dequantize=_make_rtn("fp6_e3m2", 32, mx_scale=True),
-))
-register_format(FormatSpec(
-    name="MXFP6_E2M3",
-    weight_bits=6, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
-    weight_element_dtype="fp6_e2m3", act_bits=6, act_dtype_name="fp6_e2m3",
-    act_group_size=32, family="mx", min_capability_sm=100,
-    autoround_config=lambda: _mx_autoround(6, 32, 6, "fp6_e2m3"),
-    quantize_dequantize=_make_rtn("fp6_e2m3", 32, mx_scale=True),
-    activation_quantize_dequantize=_make_rtn("fp6_e2m3", 32, mx_scale=True),
 ))
 register_format(FormatSpec(
     name="MXFP8_E4M3",  # explicit name for the canonical variant
@@ -705,6 +923,92 @@ register_format(FormatSpec(
     autoround_config=lambda: _mx_autoround(8, 32, 16, "fp8_e4m3"),
     quantize_dequantize=_mxfp8_e4m3_weight_rtn,
     activation_quantize_dequantize=lambda x: x,
+))
+
+# MXFP8_UE8M0_G32 — MX-FP8 with the saturating-ceil shared-exponent rule and
+# a native ``float8_e8m0fnu`` scale plane.  Built for the Gridbook lane, which
+# was retired 2026-09-02 (archive/gridbook_lane_2026-09-02/); the format stays
+# registered and priceable, but no exporter writes it and no live serving
+# profile admits it (docs/ARCHITECTURE.md, D34).
+#
+# WHY THIS IS NOT JUST ``MXFP8_E4M3``. It has the same element grid (E4M3),
+# the same group (32 along K) and the same 8.25 bpw, so the obvious question
+# is why the registry carries two. Three reasons, in the order that matters:
+#
+#   * SCALE RULE. MXFP8_E4M3 defers to compressed-tensors, which is the right
+#     authority for the stock vLLM lane it ships on. That rule rounds the
+#     group amax to a power of two, which can scale a group UP and knock the
+#     smallest normals off the E4M3 subnormal ladder. This format instead
+#     picks the smallest non-clipping exponent, which is what buys the
+#     exactness property below. See ``mx_formats.mxfp8_ue8m0_shared_exponent``.
+#   * SCALE DTYPE. The stock lane serializes E8M0 as ``uint8``; this one
+#     serializes ``float8_e8m0fnu``, the spelling DeepSeek-V4 already uses for
+#     its own block scales and the one the retired Gridbook consumer read.
+#   * LANE. It rides its own wire id, not the compressed-tensors scheme.  The
+#     lane that served it is retired (2026-09-02); no sanctioned lane
+#     (compressed-tensors, GGUF, Tessera) executes these bytes.
+#
+# That is the same "different on-disk contract, therefore a different format"
+# call FP8_BLOCK_UE8M0_SOURCE made against FP8_SOURCE, and the reason the
+# ``MXFP8 -> MXFP8_E4M3`` alias above is deliberately left alone: historical
+# artifacts and launchers spelled the stock compressed-tensors rung ``MXFP8``,
+# and quietly repointing that name at a rung with a different codec, a
+# different scale plane and a different serving lane would reinterpret every
+# persisted assignment that uses it.
+#
+# EXACT ON BLOCK-FP8 SOURCES, ON THE WEIGHT PLANE. Any tensor whose stored
+# form is E4M3 codes times a shared power of two — the DeepSeek
+# ``fp8_e4m3_ue8m0_block128`` body convention — re-encodes here with ZERO
+# weight error: the ceil rule never picks an exponent above the block's own, so
+# every element is an E4M3 code scaled down by a power of two, which is exactly
+# representable. 128 = 4*32, so a 32-wide chunk never straddles a block
+# boundary and the scale map is pure replication. This is a property of the
+# rule, not a measurement, and tests/test_mxfp8_ue8m0.py pins it.
+#
+# Read that claim precisely: it is ``weight_mse == 0.0``, NOT ``output_mse ==
+# 0.0``. The lane below quantizes activations, so a weight-lossless unit still
+# has real A-side error — which is exactly why ``cost_entry_is_bit_exact``
+# refuses to short-circuit a W·A· format on a zero weight_mse.
+#
+# RE-QUANTIZATION, NOT PASSTHROUGH. Unlike the ``*_SOURCE`` family this is
+# legal on ANY source dtype: it has a real encoder, so it is deliberately
+# absent from SOURCE_PASSTHROUGH_CONTRACTS and is not source-gated.
+#
+# W8A8, WITH THE A SIDE MEASURED. The A-side contract priced here is the one
+# the Gridbook lane executed until its retirement on 2026-09-02
+# (``Mxfp8DenseLinearMethod``, archive/gridbook_lane_2026-09-02/): activations
+# quantized dynamically to MXFP8 per 32 reduction-axis elements, using the
+# SAME saturating-ceil rule as the weights — no static global scale to fit,
+# unlike NVFP4's ``nv_fp4_with_static_gs``. Declaring that here is not
+# bookkeeping: ``act_bits=8`` is what makes the cost stage apply
+# ``activation_quantize_dequantize`` before measuring ``output_mse``, so a
+# measured row carries genuine W8A8 error. Declaring A16 instead would price
+# an activation path that contract did not take, and on a block-FP8 source
+# (weight_mse exactly 0.0) would hand the DP a free zero-cost rung.
+#
+# SCOPE OF THAT CONTRACT (principle 14). It is the retired lane's executed
+# contract, not a live runtime's: since 2026-09-02 no sanctioned lane executes
+# this format at any unit kind, so the row is priced but never exportable.
+# Should a lane ever back it, its executed A-side contract must be read from
+# that runtime's packaged contract table, not from this comment.
+#
+# effective_bits = 8 + 8/32 = 8.25 bpw exactly.
+register_format(FormatSpec(
+    name="MXFP8_UE8M0_G32",
+    weight_bits=8, group_size=32, scale_bits=8,
+    scale_dtype_name="uint8_e8m0",
+    weight_element_dtype="fp8_e4m3",
+    act_bits=8, act_dtype_name="fp8_e4m3", act_group_size=32,
+    family="mx", min_capability_sm=100,
+    autoround_config=lambda: dict(bits=8, group_size=32,
+                                   data_type="fp8_e4m3", sym=True,
+                                   scale_fmt="ue8m0",
+                                   act_bits=8, act_group_size=32,
+                                   act_sym=True, act_data_type="mx_fp",
+                                   act_element_dtype="fp8_e4m3",
+                                   act_scale_fmt="ue8m0", act_dynamic=True),
+    quantize_dequantize=_mxfp8_ue8m0_weight_rtn,
+    activation_quantize_dequantize=_mxfp8_ue8m0_activation_rtn,
 ))
 
 # Plain FP8 (per-output-channel FP32 scale on weights, no microscaling).
@@ -798,6 +1102,96 @@ register_format(FormatSpec(
     activation_quantize_dequantize=lambda x: x.clone(),
 ))
 
+# Source-FP8 passthrough, UE8M0 block-scale variant — the DeepSeek-V3.1/V4
+# spelling of block-FP8. Same E4M3 element grid and same 128x128 block as
+# FP8_SOURCE, but the block scale is a ONE-BYTE unsigned E8M0 exponent
+# (config.json ``quantization_config.scale_fmt == "ue8m0"``) rather than the
+# FP32 ``weight_scale_inv`` plane FP8_SOURCE was written for.
+#
+# This is a DIFFERENT ON-DISK CONTRACT, not a cosmetic difference, which is why
+# it gets its own format instead of widening FP8_SOURCE:
+#
+#   * bytes. FP8_SOURCE charges 32 bits per 128x128 block (8.00195 bpw); this
+#     charges 8 (8.00049 bpw). Measured on DSv4-Flash: ``layers.0.attn.wo_a``
+#     is 33,554,432 weight bytes + 2,048 scale bytes, which is this formula
+#     exactly and NOT FP8_SOURCE's.
+#   * bit-exactness. The FP8_SOURCE export path widens its scale plane to FP32
+#     on write. Doing that here would quadruple the scale bytes and emit a
+#     tensor the checkpoint's own loader does not expect — the opposite of a
+#     passthrough.
+#
+# Serving: this block-128 wire contract WAS consumed by the retired Gridbook
+# lane's dedicated ``Fp8SourceW8A16LinearMethod`` (lane retired 2026-09-02,
+# archive/gridbook_lane_2026-09-02/).  Under that contract the stored E4M3
+# weight plane and UE8M0 scale plane stayed resident and byte-verbatim and
+# BF16 activations crossed the route unchanged -- which is why the format sits
+# in ``SOURCE_PASSTHROUGH_CONTRACTS`` (W and A both identity).  It is
+# deliberately distinct from ``MXFP8_UE8M0_G32`` above, which is a producer
+# re-encode with dynamic per-32 MXFP8 activations (W8A8).  Since the
+# retirement no sanctioned lane serves this wire: ``allocator_candidates``
+# carries the row as ``ROUTE_STATUS_BLOCKED`` and export fails closed on it.
+# This registry declaration states the numerical contract, not release status.
+register_format(FormatSpec(
+    name="FP8_BLOCK_UE8M0_SOURCE",
+    weight_bits=8, group_size=128, scale_bits=8,
+    scale_dtype_name="uint8_e8m0",
+    weight_element_dtype="fp8_e4m3",
+    scale_block_shape=(128, 128),
+    act_bits=None,
+    family="fp", min_capability_sm=89,
+    autoround_config=lambda: dict(bits=8, group_size=128,
+                                   data_type="fp8_e4m3", sym=True,
+                                   scale_fmt="ue8m0",
+                                   act_bits=16, act_data_type="float"),
+    quantize_dequantize=lambda w: w.clone(),
+    activation_quantize_dequantize=lambda x: x.clone(),
+))
+
+# Source-MXFP4 passthrough — the OCP-MX sibling of FP8_SOURCE, for models whose
+# ROUTED EXPERTS ship as nibble-packed E2M1 with per-32-block E8M0 scales
+# (DeepSeek-V4-Flash-0731: ``layers.N.ffn.experts.E.{w1,w3,w2}.{weight,scale}``,
+# I8 weight + F8_E8M0 scale, config ``expert_dtype: "fp4"``). When the allocator
+# picks this format the exporter STREAM-COPIES those source tensors verbatim —
+# no dequant, no re-encode, no CB stacking — and the serving side loads them on
+# the model's own native path rather than through a codebook decoder.
+#
+# WHY THE ACCOUNTING IS EXACT, NOT ESTIMATED. MXFP4 is a fixed-rate format, so
+# the generic FormatSpec arithmetic reproduces the checkpoint byte for byte:
+# for a [2048, 4096] expert projection, 2048*4096*4/8 = 4,194,304 weight bytes
+# plus 2048*(4096/32)*8/8 = 262,144 E8M0 scale bytes = 4,456,448 — precisely
+# the two source slices' sizes. ``memory_bytes_for_shape`` is therefore the
+# authoritative producer accountant here (unlike the CB families, whose
+# FormatSpec is deliberately only a nominal view), and
+# ``allocator_candidates.assert_source_passthrough_bytes_match_source`` pins
+# that identity against the real safetensors index before an allocation ships.
+#
+# WHY Δloss IS ZERO BY CONSTRUCTION. Every cost in this pipeline is measured
+# against the DEQUANTIZED SOURCE: the probe's BF16 view of an expert IS the
+# lossless dequant of exactly these bytes. Shipping them unchanged is the
+# identity transform on the reference, so there is nothing to measure and no
+# measurement branch to take — the candidate is priced 0.0 with provenance
+# ``cost_source="source_passthrough"`` (allocator_candidates
+# .SOURCE_PASSTHROUGH_FORMATS). This is the same claim FP8_SOURCE makes, one
+# element grid down; ``act_bits=None`` states the matching dtype-level fact
+# that this producer applies no activation quantization of its own, so the row
+# never enters P5a's activation calibration (its A side is the released
+# checkpoint's own contract, not a re-encode this pipeline chose).
+#
+# effective_bits = 4 + 8/32 = 4.25 bpw exactly.
+register_format(FormatSpec(
+    name="MXFP4_SOURCE",
+    weight_bits=4, group_size=32, scale_bits=8,
+    scale_dtype_name="uint8_e8m0",
+    weight_element_dtype="fp4_e2m1",
+    act_bits=None,
+    family="mx", min_capability_sm=100,
+    autoround_config=lambda: dict(bits=4, group_size=32,
+                                   data_type="fp4_e2m1", sym=True,
+                                   act_bits=16, act_data_type="float"),
+    quantize_dequantize=lambda w: w.clone(),
+    activation_quantize_dequantize=lambda x: x.clone(),
+))
+
 
 # GGUF k-quants (llama.cpp / vLLM-GGUF serving lane) — two-tier superblock
 # formats along the input dim: fp16 super-scale(s) per 256 + quantized
@@ -864,6 +1258,98 @@ register_format(_make_gguf_spec("IQ4_XS", 4, 256, 64))    # 136 B / 256 = 4.25
 register_format(_make_gguf_spec("IQ4_NL", 4, 32, 16))     # 18 B / 32 = 4.5
 
 
+# NVFP4-CB / FP8-CB vector-quantization codebook family (custom out-of-tree
+# vLLM plugin lane; NOT stock compressed-tensors — see docs/lanes/nvfp4-cb).
+# The k-bit VQ index stream lives in scale_bits (fp4 family, weight_bits=0,
+# group_size=256).  FormatSpec retains the legacy-v1 4k+16 nominal field for
+# old generic consumers; exact producer paths use CBSerializationContext and
+# price/render production layout-v2 as 4k+9.  FP8's FormatSpec likewise omits
+# its shape-dependent FP32 row-scale plane.  Consequently neither
+# ``effective_bits`` nor ``effective_bits_for_shape`` is authoritative for CB.
+# The FP8 index body is represented by the same group_size=256 superblock
+# stream as FP4-CB. Its per-output-channel FP32 scale cannot be represented by
+# that single-plane FormatSpec, so only the context-bound accountant adds the
+# shape-dependent 32/in_features term. quantize_dequantize
+# is the weighted-VQ closure that also feeds the (Milestone B) byte packer;
+# activations are byte-identical to NVFP4 (fp4) / FP8 dynamic (fp8).
+def _make_nvfp4_cb_spec(k: int, *, producer_eligible: bool) -> FormatSpec:
+    return FormatSpec(
+        name=f"NVFP4_CB_K{k}",
+        weight_bits=0, group_size=SUPERBLOCK,
+        scale_bits=(CODEWORDS_PER_SUPERBLOCK * k
+                    + 8 * SCALE_PLANE_BYTES[("fp4", SCALE_CODING_V1)]),
+        scale_dtype_name="nvfp4_cb_vq",
+        weight_element_dtype=f"nvfp4_cb_k{k}",
+        act_bits=4, act_dtype_name="fp4_e2m1", act_group_size=FP4_GROUP,
+        family="nvfp4_cb", min_capability_sm=100,
+        producer_eligible=producer_eligible,
+        autoround_config=(
+            lambda k=k: dict(bits=0, group_size=SUPERBLOCK, data_type="nvfp4_cb",
+                             cb_k=k, sym=True, act_bits=4,
+                             act_data_type="nv_fp4_with_static_gs",
+                             act_group_size=FP4_GROUP, act_dynamic=True)
+        ),
+        # Kept at v1 for direct legacy/research callers. Producer-cost paths
+        # bind CBSerializationContext explicitly; a FormatSpec alone cannot
+        # establish the artifact layout/codebook identity.
+        quantize_dequantize=make_nvfp4_cb_qdq(k, "fp4", "product"),
+        activation_quantize_dequantize=_make_rtn("fp4_e2m1", FP4_GROUP),
+    )
+
+
+def _make_fp8_cb_spec(k: int, *, producer_eligible: bool) -> FormatSpec:
+    # Index stream in scale_bits (32k bits / 256-superblock, weight_bits=0,
+    # group_size=256) so effective_bits = k/8 exactly, mirroring the GGUF /
+    # NVFP4_CB accounting. FP8_CB has NO group-16 scale plane; its
+    # per-output-channel fp32 scales are accounted by nvfp4_cb_footprint
+    # (the authoritative byte accountant, format-pipeline §1.5), which a
+    # single-scale FormatSpec cannot model on top of the superblock stream.
+    return FormatSpec(
+        name=f"FP8_CB_K{k}",
+        weight_bits=0, group_size=SUPERBLOCK,
+        scale_bits=CODEWORDS_PER_SUPERBLOCK * k,
+        scale_dtype_name="fp8_cb_vq",
+        weight_element_dtype=f"fp8_cb_k{k}",
+        act_bits=8, act_dtype_name="fp8_e4m3", act_group_size=0,
+        # Ada has native FP8 tensor-core execution, which the retired
+        # Gridbook lane's SM89 decode and expand+CUTLASS routes used (lane
+        # retired 2026-09-02).  This floor is capability metadata about the
+        # silicon, never a serving claim: no sanctioned lane serves FP8-CB.
+        family="fp8_cb", min_capability_sm=89,
+        producer_eligible=producer_eligible,
+        autoround_config=(
+            lambda k=k: dict(bits=0, group_size=0, data_type="fp8_cb",
+                             cb_k=k, sym=True, act_bits=8,
+                             act_data_type="fp8_e4m3", act_dynamic=True)
+        ),
+        quantize_dequantize=make_nvfp4_cb_qdq(k, "fp8", "product"),
+        activation_quantize_dequantize=_make_plain_fp8_activation_vllm_rtn(
+            torch.float8_e4m3fn, 448.0,
+        ),
+    )
+
+
+for _k in NVFP4_ACCEPTED_RUNGS:
+    # The public reader and producer domain is K1..K25 (v2 body
+    # 0.40625..3.40625 bpw). Wider direct-codec research has no registry id.
+    register_format(
+        _make_nvfp4_cb_spec(
+            _k,
+            producer_eligible=_k in NVFP4_PRODUCT_RUNGS,
+        )
+    )
+for _k in FP8_ACCEPTED_RUNGS:
+    # Registry membership is a reader/reporting guarantee, not a producer
+    # menu. Historical off-law K28..K48 rungs remain resolvable while only the
+    # exact K4,K8,...,K48 ladder is eligible for a new artifact.
+    register_format(
+        _make_fp8_cb_spec(
+            _k,
+            producer_eligible=_k in FP8_PRODUCT_RUNGS,
+        )
+    )
+
+
 def list_formats(family: str | None = None) -> list[FormatSpec]:
     if family is None:
         return sorted(REGISTRY.values(), key=lambda s: s.effective_bits)
@@ -871,9 +1357,140 @@ def list_formats(family: str | None = None) -> list[FormatSpec]:
                   key=lambda s: s.effective_bits)
 
 
+def list_producer_formats(family: str | None = None) -> list[FormatSpec]:
+    """Return formats legal in newly produced menus and assignments.
+
+    ``list_formats`` intentionally remains the compatibility inventory used by
+    readers and historical reports.  Producer code must opt into this narrower
+    API so accepting an old wire id cannot silently make it allocatable again.
+    """
+
+    return [
+        spec for spec in list_formats(family)
+        if spec.producer_eligible
+    ]
+
+
+def format_is_producer_eligible(name: str, *, context_by_unit=None) -> bool:
+    """Whether a canonical/alias format may be newly produced.
+
+    Resolved through :func:`get_format`, not through ``REGISTRY`` directly, so
+    a format whose spec is *synthesized* answers with its own
+    ``producer_eligible`` instead of with the silence of an absent registry row.
+    A continuous family addresses thousands of rungs and deliberately has no
+    static rows (``get_format``'s Tessera fallback); reading ``REGISTRY`` here
+    made every one of them ineligible and made the family's own two-gate
+    admission -- the wire can carry it AND a pinned runtime attests it --
+    unreachable, so the honest answer and the refusal were computed and then
+    thrown away.  An unknown name still raises ``KeyError`` inside
+    ``get_format``; that is "not a format", not "not producer-eligible", and it
+    is returned as False here exactly as the absent row was.
+
+    With explicit Tessera contexts this asks whether at least one unit admits
+    the rung. It is only shared-menu intake: each candidate must still pass
+    its own unit's scope. No context-free registry/spec claim is changed.
+    """
+
+    canonical = canonical_format_name(name)
+    if context_by_unit is not None and is_tessera_format_name(canonical):
+        # A shared allocator menu is the union of its units' admissible rungs,
+        # not a model-wide attestation. build_candidates still tests EACH
+        # unit against its own context. Never install this transient answer
+        # in the registry or in a context-free synthesized FormatSpec.
+        from .tessera_menu import menu_mode, route_admission
+        unique = {context.key(): context for context in context_by_unit.values()
+                  if context is not None}
+        return any(route_admission(canonical, serving_context=context).admits(menu_mode())
+                   for context in unique.values())
+    try:
+        spec = get_format(canonical)
+    except KeyError:
+        return False
+    if spec is None or not spec.producer_eligible:
+        return False
+    # Pin CB eligibility to the torch-free wire source as a second invariant;
+    # a registry construction bug cannot widen the producer ladder by itself.
+    if parse_format_name(canonical) is not None:
+        return is_producer_format_name(canonical)
+    return True
+
+
+def require_producer_formats(
+    names: Iterable[str],
+    *,
+    where: str = "producer format menu",
+    context_by_unit=None,
+) -> list[FormatSpec]:
+    """Resolve a new-artifact menu without admitting reader-only wire ids.
+
+    Explicit Tessera contexts admit the union needed by a per-unit allocator.
+    Returned specs remain context-free byte descriptions; scoped serving
+    claims belong to the individual candidates, not a global spec mutation.
+    """
+
+    requested = [str(name) for name in names]
+    if context_by_unit is not None:
+        # Every rate asks the same scope union. Reduce the model-sized input
+        # once, while leaving the caller's per-unit evidence untouched.
+        context_by_unit = {context.key(): context for context in context_by_unit.values()
+                           if context is not None}
+    nonproducer = [
+        name for name in requested
+        if not format_is_producer_eligible(name, **(
+            {"context_by_unit": context_by_unit} if context_by_unit is not None else {}))
+    ]
+    if nonproducer:
+        raise ValueError(
+            f"{where} may contain only producer-eligible formats; "
+            f"reader-only/unsupported entries: {nonproducer}"
+        )
+    return [get_format(name) for name in requested]
+
+
+def is_tessera_format_name(name: object) -> bool:
+    """True for a Tessera-shaped format name, **without importing Tessera**.
+
+    Four consumers ask only "is this one of mine?" before deciding whether to
+    take the Tessera path: ``render_production_weight`` and the three
+    production-cache miss fallbacks (``weight_session``, ``perturbed_x_cache``,
+    ``aura_cost``). All four are on the hot path of every *non*-Tessera format
+    too, so the question must not drag in the answer's dependencies --
+    ``tessera_formats`` and ``tessera_render`` both require the ``tessera``
+    package at import, and an NVFP4-only pipeline must not.
+
+    So this is the family's own name grammar anchored at the start, the same
+    line ``get_format`` draws below, and it is deliberately a *prefix* test
+    rather than a parse: a ``TESSERA_``-shaped name naming an illegal rung is
+    still Tessera's to refuse, with Tessera's own error, not the registry's
+    KeyError about an unknown format.
+    """
+    if not isinstance(name, str):
+        return False
+    return name.strip().upper().startswith("TESSERA_")
+
+
 def get_format(name: str) -> FormatSpec:
     canonical = canonical_format_name(name)
     if canonical not in REGISTRY:
+        # Tessera rungs are parameters of a family, not registry rows: one
+        # family addresses ~9500 rungs at 1/256-bpp resolution, and freezing
+        # those into REGISTRY would turn a continuous rate axis into a menu
+        # someone has to maintain. Synthesize on demand so every consumer that
+        # resolves a format by name works unchanged, then fall through to the
+        # normal KeyError for anything that is not Tessera-shaped.
+        #
+        # The prefix test is the family's own name grammar anchored at the
+        # start (``tessera_formats._FORMAT_NAME``), and it is here rather than
+        # inside the synthesizer because reaching the synthesizer imports the
+        # ``tessera`` package: an unknown NON-Tessera name must raise KeyError
+        # naming the registry, not ModuleNotFoundError naming a package it was
+        # never asking for.  ``is_tessera_format_name`` above is that line.
+        if is_tessera_format_name(canonical):
+            from .tessera_render import synthesize_tessera_spec
+
+            spec = synthesize_tessera_spec(canonical)
+            if spec is not None:
+                return spec
         raise KeyError(f"Unknown format '{name}'. Available: "
                        f"{sorted((*REGISTRY.keys(), *FORMAT_ALIASES.keys()))}")
     return REGISTRY[canonical]
@@ -883,50 +1500,10 @@ def nvfp4_activation_qdq_served(
     x: torch.Tensor,
     input_global_scale: float,
 ) -> torch.Tensor:
-    """Serve-faithful NVFP4 activation quantize-dequantize.
+    """Compatibility import for the single-owner served W4A4 oracle."""
 
-    Emulates vLLM's runtime activation path for W4A4 NVFP4 with a static
-    per-tensor ``input_global_scale`` G (the on-disk value): per 16-group
-    along the last dim, the FP8-STORED block scale is
-    ``sf = fp8_e4m3(amax/6 * G)`` and elements quantize on the E2M1 grid
-    at effective scale ``sf / G``. This models the two effects the plain
-    dynamic emulation misses (2026-07-02 audit, M18 residual + C1):
-    subnormal/zeroed FP8 block scales when a block's amax is far below
-    the calibration amax baked into G, and CLIPPING when a block's amax
-    exceeds it. Requires ``x.shape[-1] % 16 == 0``; callers fall back to
-    the dynamic path otherwise.
-    """
-    if x.shape[-1] % 16 != 0:
-        raise ValueError(
-            f"nvfp4_activation_qdq_served needs last dim % 16 == 0, "
-            f"got {tuple(x.shape)}")
-    g = float(input_global_scale)
-    orig_shape = x.shape
-    orig_dtype = x.dtype
-    x2 = x.reshape(-1, x.shape[-1] // 16, 16).float()
-    amax = x2.abs().amax(dim=-1, keepdim=True)
-    s_real = amax / 6.0
-    # FP8 snap of the stored scale in LOADED units (clamp before the
-    # cast: torch's float8_e4m3fn cast is NOT saturating and mints NaN
-    # above ~464).
-    sf = (s_real * g).clamp(max=448.0)
-    sf = sf.to(torch.float8_e4m3fn).float()
-    s_used = sf / g
-    # sf == 0 (block scale underflowed FP8): vLLM dequantizes the whole
-    # block to exactly 0.
-    safe = s_used.clamp_min(torch.finfo(torch.float32).tiny)
-    q = (x2 / safe).clamp(-6.0, 6.0)
-    cb = _codebook_on_device(
-        _CODEBOOKS["fp4_e2m1"], device=q.device, dtype=torch.float32)
-    idx = torch.bucketize(q.contiguous().abs(), cb[cb >= 0])
-    pos = cb[cb >= 0]
-    idx_lo = (idx - 1).clamp_min(0)
-    idx_hi = idx.clamp_max(pos.numel() - 1)
-    lo, hi = pos[idx_lo], pos[idx_hi]
-    qa = q.abs()
-    # ties toward zero, matching the export codec's _round_to_codebook
-    choose_hi = (hi - qa).abs() < (qa - lo).abs()
-    rounded = torch.where(choose_hi, hi, lo) * torch.sign(q)
-    out = rounded * s_used
-    out = torch.where(sf > 0, out, torch.zeros_like(out))
-    return out.reshape(orig_shape).to(orig_dtype)
+    from prismaquant.nvfp4_activation_contract import (
+        nvfp4_activation_qdq_served as _owned_nvfp4_activation_qdq_served,
+    )
+
+    return _owned_nvfp4_activation_qdq_served(x, input_global_scale)

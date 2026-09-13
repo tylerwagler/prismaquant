@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import dataclasses
+
+import pytest
+
+import prismaquant.format_registry as fr
+import prismaquant.serving_profiles as serving_profiles_module
 from prismaquant.serving_profiles import (
+    ExportLaneSpec,
     ServingProfile,
     check_serving_format,
     check_serving_shape,
+    lane_emittable_formats,
     load_serving_profile,
     serving_profile_names,
 )
@@ -11,10 +19,50 @@ from prismaquant.serving_profiles import (
 
 VLLM_PROFILE = "vllm_packed_moe"
 
+# Representative qnames for dense, unpacked shared-expert, and packed-expert
+# targets. Shared experts are rank-2 tensors and therefore use dense scope.
+DENSE_QNAME = "model.layers.0.self_attn.q_proj"
+SHARED_QNAME = "model.layers.0.mlp.shared_expert.gate_proj"
+EXPERT_QNAME = "model.layers.0.mlp.experts.gate_up_proj"
+
+NVFP4_CB_SCOPE_CASES = (
+    pytest.param(DENSE_QNAME, False, id="dense"),
+    pytest.param(SHARED_QNAME, False, id="shared"),
+    pytest.param(EXPERT_QNAME, True, id="packed"),
+)
+
+ALL_FORMAT_NAMES = tuple(sorted(set(fr.REGISTRY) | set(fr.FORMAT_ALIASES)))
+
 
 def test_serving_profile_names_are_config_discovered():
     assert "research" in serving_profile_names()
     assert VLLM_PROFILE in serving_profile_names()
+
+
+def test_serving_runtime_version_backs_nothing(monkeypatch):
+    """No pinned producer runtime -> the empty version -> the empty backed set.
+
+    It read the Gridbook producer pin until 2026-09-02 and answered "" for an
+    unreleased pin; the lane and its pin are in
+    archive/gridbook_lane_2026-09-02/, so "" is now the only answer, and this
+    test pins that it stays the FAIL-CLOSED one: "" matches no lane spec's
+    ``fused_mid_m_rungs_by_runtime_version`` key, so no rung is claimed backed.
+    """
+    monkeypatch.setattr(serving_profiles_module, "_RUNTIME_VERSION", None)
+
+    assert serving_profiles_module.serving_runtime_version() == ""
+
+    spec = serving_profiles_module.ServingLaneSpec(
+        id="probe",
+        formats=("NVFP4",),
+        activation_contract="W4A4",
+        fallback_route="expand_gemm",
+        fused_mid_m_rungs_by_runtime_version=(("9.9.9", (28,)),),
+    )
+    rungs, source = spec.backed_rungs(
+        serving_profiles_module.serving_runtime_version())
+    assert rungs == ()
+    assert source == "pinned_runtime_version_not_declared"
 
 
 def test_vllm_profile_extends_runtime_shape_rules():
@@ -58,6 +106,44 @@ def test_serving_profile_format_rules_are_config_backed():
     dense_mxfp4 = check_serving_format(VLLM_PROFILE, dense, "MXFP4")
     assert not dense_mxfp4.legal
     assert dense_mxfp4.rule == "dense_formats_without_vllm_fast_path"
+
+
+def test_check_serving_shape_fails_closed_on_an_unknown_profile():
+    """A gate that permits everything when it cannot identify the profile is
+    not a gate.
+
+    ``check_serving_shape`` used to catch ``FileNotFoundError`` and silently
+    resolve an unknown profile id to ``research``, whose shape rules permit
+    every shape -- while both of its siblings fail closed
+    (``check_serving_format`` returns ``profile_mismatch``,
+    ``serving_lane_route`` resolves no lane, ``serving_lane_catalog`` returns
+    ``{}``).  Ten of the archived CB load-gate tests were passing on that
+    permit-all path against a profile id that had been deleted: they asserted
+    a gate that could not refuse.
+
+    The refusal is spelled exactly like ``check_serving_format``'s, so a caller
+    that already branches on ``profile_mismatch`` needs no new case.  A shape
+    that is genuinely illegal under a REAL profile is untouched, and
+    ``profile_id=None`` still resolves to ``research`` -- that is the declared
+    default and it loads.
+    """
+    unknown = check_serving_shape(
+        "no_such_profile",
+        "NVFP4",
+        qname="model.layers.0.mlp.up_proj",
+        in_features=1024,
+        out_features=1024,
+    )
+    assert not unknown.legal
+    assert unknown.reason == "profile_mismatch"
+    assert "no_such_profile" in unknown.detail
+    # Same verdict, same reason, as the format half of the same question.
+    fmt = check_serving_format("no_such_profile", "model.layers.0.mlp.up_proj",
+                               "NVFP4")
+    assert (fmt.legal, fmt.reason) == (unknown.legal, unknown.reason)
+    # The declared default still loads and still decides on its own rules.
+    assert check_serving_shape(
+        None, "NVFP4", in_features=1024, out_features=1024).legal
 
 
 def test_serving_profile_shape_rules_are_config_backed():
@@ -273,3 +359,393 @@ def test_runtime_shape_validators_can_be_name_scoped(monkeypatch):
     assert not expert.legal
     assert expert.rule == "expert_runtime"
     assert calls == [("MXFP8_E4M3", 256, 256)]
+
+
+# ---------------------------------------------------------------------------
+# Export-lane bound: a serving profile must not be able to admit a format
+# its lane's exporter cannot emit (issue #22 part 2).
+#
+# The bound is derived from each exporter's OWN declaration
+# (export_native_compressed.EXPORTABLE_FORMATS for the compressed-tensors
+# lane, gguf_formats.GGUF_BLOCK_BYTES for the GGUF lane), so these tests pin
+# the derivation against the exporters' real accept/reject behaviour rather
+# than re-listing formats.
+# ---------------------------------------------------------------------------
+
+
+def _shipped_profiles() -> list[ServingProfile]:
+    return [load_serving_profile(name) for name in serving_profile_names()]
+
+
+def test_every_shipped_profile_is_lane_bound_or_declared_emulation_only():
+    """Fail-closed authoring gate. A new serving profile either names the
+    exporter that bounds its menu or declares itself emulation-only; it
+    cannot silently ship an unbounded production menu."""
+    for profile in _shipped_profiles():
+        assert profile.emulation_only or profile.export_lane is not None, (
+            f"serving profile {profile.id!r} declares neither an "
+            f"export_lane nor emulation_only: its format menu is not bounded "
+            f"by any exporter, so the allocator could spend budget on a rung "
+            f"that hard-fails (or silently BF16-coerces) at export."
+        )
+        # Not both: a lane-bound profile that also claimed emulation-only
+        # would read as exempt while carrying an exporter.
+        assert not (profile.emulation_only and profile.export_lane is not None)
+
+
+def test_research_profile_is_the_declared_emulation_only_exemption():
+    """`research` is deliberately unbounded: it exists so rungs with no
+    served path stay measurable in the emulation harness. Nothing ships
+    under it — export stages resolve a real serving profile."""
+    research = load_serving_profile("research")
+    assert research.emulation_only is True
+    assert research.export_lane is None
+    assert lane_emittable_formats("research") is None
+    for fmt in ("INT4_W4A16_g128", "NVFP4A16", "MXFP8A16",
+                "INT8_W8A16", "Q4_K"):
+        assert check_serving_format("research", DENSE_QNAME, fmt).legal, fmt
+
+
+@pytest.mark.parametrize("profile_id", ["vllm_packed_moe", "gguf"])
+def test_production_profile_never_admits_an_unexportable_format(profile_id):
+    """The invariant: effective-legal ⊆ exporter-emittable, for every
+    registered format and both rule scopes."""
+    emittable = lane_emittable_formats(profile_id)
+    assert emittable
+    scopes = (
+        (DENSE_QNAME, False),
+        (SHARED_QNAME, False),
+        (EXPERT_QNAME, True),
+    )
+    for qname, packed_expert in scopes:
+        for fmt in ALL_FORMAT_NAMES:
+            if not check_serving_format(
+                profile_id, qname, fmt, packed_expert=packed_expert
+            ).legal:
+                continue
+            assert fr.canonical_format_name(fmt) in emittable, (
+                f"{profile_id} admits {fmt} at {qname} but its exporter "
+                f"cannot emit it (emittable={sorted(emittable)})"
+            )
+
+
+@pytest.mark.parametrize("profile_id", ["vllm_packed_moe", "gguf"])
+def test_lane_bound_survives_a_widened_policy_rule(profile_id):
+    """Root-cause check, not a snapshot of today's deny lists: even with
+    every policy rule stripped away, the lane still refuses formats the
+    exporter cannot emit. Widening an allow/deny list can therefore never
+    re-admit an unexportable rung."""
+    profile = load_serving_profile(profile_id)
+    unpoliced = dataclasses.replace(profile, format_rules=())
+    emittable = profile.export_lane.emittable_formats()
+    for fmt in ALL_FORMAT_NAMES:
+        decision = unpoliced.check_format(DENSE_QNAME, fmt)
+        expected = fr.canonical_format_name(fmt) in emittable
+        assert decision.legal is expected, fmt
+        if not expected:
+            assert decision.reason == "exporter_cannot_emit"
+            assert decision.rule == profile.export_lane.id
+
+
+def test_vllm_lane_denies_the_a16_rungs_with_a_structural_reason():
+    """The concrete regression: A16 rungs were legal for dense Linears on
+    the vLLM lane (the dense rule denies only MXFP4/MXFP8_E5M2/FP8_E5M2)
+    while `_quantize_2d` has no branch for them — and the bit-exact
+    re-encode short-circuit prices a weight-lossless A16 rung at dloss
+    0.0, the unbeatable global minimum."""
+    for fmt in ("NVFP4A16", "MXFP8A16", "INT8_W8A16", "INT4_W4A16_g128",
+                "Q4_K", "IQ4_XS"):
+        decision = check_serving_format(VLLM_PROFILE, DENSE_QNAME, fmt)
+        assert not decision.legal, fmt
+        assert decision.reason == "exporter_cannot_emit", fmt
+
+
+def test_vllm_lane_still_admits_the_whole_production_menu():
+    """Backwards compatibility: the bound must not narrow any format the
+    shipped recipes actually use (run-pipeline's FORMATS default is
+    NVFP4,FP8_DYNAMIC,BF16; FP8_SOURCE and MXFP8_E4M3 are in the menu)."""
+    for fmt in ("NVFP4", "FP8_E4M3", "FP8_DYNAMIC", "FP8", "MXFP8_E4M3",
+                "MXFP8", "BF16", "FP8_SOURCE"):
+        assert check_serving_format(VLLM_PROFILE, DENSE_QNAME, fmt).legal, fmt
+    for fmt in ("NVFP4", "FP8_E4M3", "MXFP8_E4M3", "MXFP4", "BF16"):
+        assert check_serving_format(VLLM_PROFILE, EXPERT_QNAME, fmt).legal, fmt
+
+
+def test_gguf_lane_admits_every_ggml_type_and_nothing_else():
+    """The GGUF lane's legitimate formats must be untouched — the bound is
+    per-lane, derived from the GGUF codec table, not from the
+    compressed-tensors exporter."""
+    from prismaquant.gguf_formats import GGUF_BLOCK_BYTES
+
+    q = "model.layers.0.mlp.down_proj"
+    for fmt in GGUF_BLOCK_BYTES:
+        assert check_serving_format("gguf", q, fmt).legal, fmt
+    assert check_serving_format("gguf", q, "BF16").legal
+    assert lane_emittable_formats("gguf") == frozenset(
+        set(GGUF_BLOCK_BYTES) | {"BF16"})
+
+
+def test_compressed_tensors_lane_declaration_matches_exporter_behaviour():
+    """Anti-drift pin. Adding a `_quantize_2d` branch without a
+    FORMAT_SCHEME entry (or vice versa) breaks this, so the derived menu
+    can never silently diverge from what the exporter really does."""
+    import torch
+
+    from prismaquant.allocator_candidates import (
+        PASSTHROUGH_SOURCE_REQUIREMENTS,
+    )
+    import prismaquant.export_native_compressed as enc
+
+    emittable = lane_emittable_formats(VLLM_PROFILE)
+    # Every scheme the exporter can describe is either a codec format or a
+    # declared passthrough; nothing else is in the menu. Spelled out rather
+    # than compared to EXPORTABLE_FORMATS so that moving the source of truth
+    # into the exporter (issue #27) is pinned as a no-op for the menu.
+    assert emittable == frozenset(
+        {fr.canonical_format_name(f) for f in enc.FORMAT_SCHEME} | {"BF16"})
+    # ...and the lane now reads exactly that constant, so the exporter owns
+    # its own bound instead of the profile spec restating it.
+    assert emittable == frozenset(enc.EXPORTABLE_FORMATS)
+
+    # Canonical names only: `layer_config.canonicalize_format` resolves the
+    # FP8/FP8_DYNAMIC/MXFP8 aliases before an assignment reaches the
+    # exporter, so `_quantize_2d` is only ever handed a canonical name.
+    w = torch.randn(64, 256, dtype=torch.bfloat16)
+    for fmt in sorted(fr.REGISTRY):
+        if fmt in PASSTHROUGH_SOURCE_REQUIREMENTS:
+            # Source passthroughs ship through a container's passthrough
+            # branch (plain bf16 tensor, verbatim fp8 + scale copy, verbatim
+            # packed-MXFP4 + E8M0 copy), never through the weight codec.
+            #
+            # Which CONTAINER carries which passthrough is a per-lane fact,
+            # not a global one: BF16 and FP8_SOURCE are compressed-tensors
+            # passthroughs, while FP8_BLOCK_UE8M0_SOURCE and MXFP4_SOURCE were
+            # nvfp4_cb-container passthroughs whose byte layouts the CT
+            # exporter has no emit path for.
+            #
+            # 2026-09-02: the nvfp4_cb container was retired with the Gridbook
+            # lane (archive/gridbook_lane_2026-09-02/), so those two now have
+            # NO emitting container. This is recorded rather than papered
+            # over, and the two halves are different facts:
+            #   FP8_BLOCK_UE8M0_SOURCE also lost its serve route (it was the
+            #     Gridbook plugin's), so its contract row is now
+            #     route_status=blocked and the exporter refuses a selection
+            #     carrying it without an explicit override.
+            #   MXFP4_SOURCE keeps a real serve route -- stock vLLM Marlin
+            #     MoE, measured on sm121, nothing to do with Gridbook -- and
+            #     has only lost its writer. It stays honestly priced, and it
+            #     fails CLOSED at export (the ValueError asserted below),
+            #     which is the serving-gap signal principle 1 asks for rather
+            #     than a silent fallback.
+            # The invariant this test still holds everywhere is the codec one:
+            # a passthrough is NEVER quantized by the weight codec.
+            if fmt not in emittable:
+                with pytest.raises(ValueError):
+                    enc._quantize_2d(w, fmt)
+            continue
+        if fmt in emittable:
+            assert enc._quantize_2d(w, fmt), fmt
+        else:
+            with pytest.raises(ValueError):
+                enc._quantize_2d(w, fmt)
+
+
+def test_gguf_lane_declaration_matches_the_exporters_own_gate():
+    """Both GGUF exporters gate emission on `fmt in GGUF_BLOCK_BYTES`; the
+    lane derives its menu from that same object, and every entry has a
+    field codec behind it."""
+    pytest.importorskip("gguf")
+    import prismaquant.export_gguf as export_gguf
+    import prismaquant.export_gguf_direct as export_gguf_direct
+    from prismaquant import gguf_formats
+
+    assert (export_gguf_direct.GGUF_BLOCK_BYTES
+            is gguf_formats.GGUF_BLOCK_BYTES)
+    assert export_gguf.GGUF_BLOCK_BYTES is gguf_formats.GGUF_BLOCK_BYTES
+    assert set(gguf_formats.GGUF_BLOCK_BYTES) == set(gguf_formats._FIELDS)
+
+
+def test_every_format_named_in_a_shipped_profile_resolves_in_the_registry():
+    """Typo guard: a misspelled allow entry silently narrows a menu and a
+    misspelled deny entry silently widens one."""
+    for profile in _shipped_profiles():
+        for rule in profile.format_rules:
+            for fmt in (*rule.allow_formats, *rule.deny_formats):
+                fr.get_format(fmt)  # raises KeyError on an unknown name
+
+
+def test_export_lane_with_a_stale_declaration_fails_loudly():
+    """The declaration is a dotted path into the exporter. If the exporter
+    renames its table, the profile must fail loudly rather than fall back
+    to an empty (deny-everything) or unbounded menu."""
+    lane = ExportLaneSpec(
+        id="unit_lane",
+        exporter="prismaquant.export_native_compressed",
+        codec_formats_from=(
+            "prismaquant.export_native_compressed:FORMAT_SCHEME_RENAMED",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="has no attribute"):
+        lane.emittable_formats()
+
+    empty = ExportLaneSpec(id="unit_empty_lane")
+    with pytest.raises(RuntimeError, match="no emittable formats"):
+        empty.emittable_formats()
+
+    not_iterable = ExportLaneSpec(
+        id="unit_scalar_lane",
+        codec_formats_from=(
+            "prismaquant.export_native_compressed:FP8_E4M3_MAX",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="not iterable"):
+        not_iterable.emittable_formats()
+
+
+def test_export_lane_reads_a_set_declaration_as_well_as_a_dict():
+    """The compressed-tensors lane declares a `frozenset`
+    (EXPORTABLE_FORMATS) where the GGUF lane declares a dict
+    (GGUF_BLOCK_BYTES). Both are just iterables of format names, and both
+    get canonicalized, so neither container shape is privileged."""
+    as_set = ExportLaneSpec(
+        id="unit_set_lane",
+        codec_formats_from=("prismaquant.serving_profiles:_UNIT_SET_DECL",),
+    )
+    as_dict = ExportLaneSpec(
+        id="unit_dict_lane",
+        codec_formats_from=("prismaquant.serving_profiles:_UNIT_DICT_DECL",),
+    )
+    import prismaquant.serving_profiles as sp
+
+    sp._UNIT_SET_DECL = frozenset({"NVFP4", "MXFP8"})
+    sp._UNIT_DICT_DECL = {"NVFP4": object(), "MXFP8": object()}
+    try:
+        # `MXFP8` canonicalizes to `MXFP8_E4M3` from either container.
+        expected = frozenset({"NVFP4", "MXFP8_E4M3"})
+        assert as_set.emittable_formats() == expected
+        assert as_dict.emittable_formats() == expected
+    finally:
+        del sp._UNIT_SET_DECL
+        del sp._UNIT_DICT_DECL
+
+
+def test_vllm_lane_needs_no_passthrough_entry_of_its_own():
+    """Issue #27: the exporter's declaration already includes its container
+    passthroughs, so the spec must not restate them -- one source of truth.
+    BF16 staying in the menu is the check that removing the entry did not
+    narrow anything."""
+    import prismaquant.export_native_compressed as enc
+
+    lane = load_serving_profile(VLLM_PROFILE).export_lane
+    assert lane.passthrough_formats == ()
+    assert lane.codec_formats_from == (
+        "prismaquant.export_native_compressed:EXPORTABLE_FORMATS",
+    )
+    assert "BF16" in lane.emittable_formats()
+    assert "BF16" in enc.EXPORTABLE_FORMATS
+    assert check_serving_format(VLLM_PROFILE, DENSE_QNAME, "BF16").legal
+
+    # The GGUF lane's exporter declares a bare ggml-type table, so it still
+    # needs its own passthrough entry; the field is not dead.
+    assert load_serving_profile("gguf").export_lane.passthrough_formats == (
+        "BF16",
+    )
+
+
+def _string_leaves(node, prefix: str = ""):
+    """Every string value in a parsed JSON document, with its dotted key."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _string_leaves(value, f"{prefix}.{key}" if prefix else key)
+    elif isinstance(node, (list, tuple)):
+        for index, value in enumerate(node):
+            yield from _string_leaves(value, f"{prefix}[{index}]")
+    elif isinstance(node, str):
+        yield prefix, node
+
+
+# ---------------------------------------------------------------------------
+# No live serving profile may name a retired runtime (D34, Tessera #21)
+# ---------------------------------------------------------------------------
+def test_no_live_serving_profile_spec_names_the_retired_gridbook_runtime():
+    """A profile's `runtime` is a claim about who executes the bytes.
+
+    `tessera_research_sm121.json` declared `"runtime": "gridbook_plugin"` and
+    derived its `world_size: 1` from `gridbook_runtime_contract.0.9.1.json`'s
+    tensor_parallel table.  Both authorities left the tree on 2026-09-02
+    (`archive/gridbook_lane_2026-09-02/`) when Gridbook withdrew its Tessera
+    lane; the table that answers now is Tessera's OWN packaged
+    `runtime_contract.json`, whose tensor_parallel table pins
+    TESSERA_E2M1_K2 and TESSERA_E4M3_K1 at `max_world_size` 1.  Same
+    conclusion, checkable derivation -- principle 14 is about the value a
+    reader can verify, not only about the verdict being right.
+
+    Historical PROSE naming Gridbook is fine and deliberate everywhere in this
+    tree (`trellis_research_sm121.json` keeps a dated "it named
+    `gridbook_plugin` until 2026-09-02" note).  What this refuses is the two
+    shapes a reader cannot check: the `runtime` VALUE, and a citation of a
+    contract file that is no longer on disk.
+    """
+    import json
+    from pathlib import Path
+
+    root = (
+        Path(serving_profiles_module.__file__).parent / "serving_profile_specs"
+    )
+    specs = sorted(root.glob("*.json"))
+    assert specs, "no serving profile specs found"
+
+    for path in specs:
+        text = path.read_text()
+        payload = json.loads(text)
+        runtime = str(payload.get("runtime", ""))
+        assert "gridbook" not in runtime.lower(), (
+            f"{path.name} declares runtime={runtime!r}; the Gridbook lane was "
+            f"retired 2026-09-02 (archive/gridbook_lane_2026-09-02/)")
+        # Every remaining mention must be DATED. An undated one reads as a
+        # live derivation off a runtime that no longer answers; a dated one is
+        # the history the house style keeps. This is the machine-checkable
+        # half of "record the scope or do not record the claim".
+        for key, value in _string_leaves(payload):
+            if "gridbook" not in value.lower():
+                continue
+            assert "2026-09-02" in value, (
+                f"{path.name}:{key} names Gridbook with no retirement date; "
+                f"date it or re-derive it from a live contract")
+
+    tessera = json.loads((root / "tessera_research_sm121.json").read_text())
+    assert tessera["runtime"] == "vllm+tessera_plugin"
+    # ...and it is the same string the lane spec uses, so the two ends of the
+    # Tessera lane name one runtime rather than two.
+    lane = json.loads(
+        (Path(serving_profiles_module.__file__).parent
+         / "lane_specs" / "tessera.json").read_text())
+    assert lane["runtime"] == tessera["runtime"]
+
+
+def test_the_serve_dispatch_table_help_does_not_name_a_path_that_is_gone():
+    """`--serve-dispatch-table`'s help offered a file the tree does not ship.
+
+    It named `prismaquant/serve_dispatch_tables/gridbook_gb10_2026-08-01.
+    example.json`, which went to the archive with the Gridbook lane on
+    2026-09-02 -- `serve_dispatch_table.example_table_path()` was updated to
+    return None and the help string was not.  A CLI that points at a missing
+    file is worse than one that says there is none, because the reader spends
+    the search before learning the answer.
+    """
+    from pathlib import Path
+
+    import prismaquant.allocator as allocator_module
+    from prismaquant.serve_dispatch_table import example_table_path
+
+    assert example_table_path() is None
+    root = Path(allocator_module.__file__).parent
+    assert not (root / "serve_dispatch_tables").exists()
+
+    source = (root / "allocator.py").read_text()
+    marker = '"--serve-dispatch-table"'
+    start = source.index(marker)
+    end = source.index('ap.add_argument("--serve-workload-mix"', start)
+    help_block = source[start:end]
+    assert "serve_dispatch_tables/" not in help_block
+    assert "archive/gridbook_lane_2026-09-02/" in help_block

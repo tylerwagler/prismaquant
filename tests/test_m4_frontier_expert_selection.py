@@ -96,6 +96,36 @@ def test_force_format_renders_all_packed_experts_without_assignment():
         assert cache.activation_max_abs.get(full, 0.0) > 0.0
 
 
+def test_packed_cb_resume_rejects_preexisting_shard(tmp_path):
+    import prismaquant.production_weight_cache as pwc
+    from prismaquant.nvfp4_cb_footprint import CBSerializationContext
+
+    model = _model()
+    full = EXPERT_NAMES[0]
+    packed = dict(model.named_parameters())[full]
+    fmt = "NVFP4_CB_K16"
+    cache_dir = tmp_path / "shards"
+    cache_dir.mkdir()
+    torch.save(
+        packed.detach(),
+        cache_dir / pwc._cache_weight_filename(full, fmt),
+    )
+
+    with pytest.raises(RuntimeError, match="packed-CB cache resume is disabled"):
+        fill_packed_expert_cache_entries(
+            _empty_cache(),
+            model,
+            _calib(),
+            render_assignment={full: fmt},
+            levers={},
+            profile=None,
+            cache_dir=cache_dir,
+            col_weights={full: torch.ones(packed.shape[-1])},
+            cb_serialization_context=CBSerializationContext.production(),
+            progress=False,
+        )
+
+
 def test_format_menu_eager_renders_nvfp4_rung_only():
     model = _model()
     cache = _empty_cache({"gptq": True})
@@ -201,7 +231,7 @@ def test_source_dtype_manifest_classifies_packed_expert_params(tmp_path):
     assert manifest[
         "model.layers.0.feed_forward.experts.down_proj"] == "bf16"
     assert manifest["model.layers.0.self_attn.q_proj"] == "bf16"
-    assert manifest["model.layers.0.self_attn.k_proj"] == "other"
+    assert manifest["model.layers.0.self_attn.k_proj"] == "f32"
 
 
 def test_source_dtype_manifest_classifies_mtp_tensors(tmp_path):

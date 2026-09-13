@@ -39,6 +39,14 @@ from gguf import GGMLQuantizationType as QT
 
 from prismaquant.gguf_formats import GGUF_BLOCK_BYTES, gguf_pack
 from prismaquant.layer_config import load_assignment
+from prismaquant.export_output_safety import (
+    prepare_fresh_export_file,
+    transactional_file_output,
+)
+from prismaquant.nvfp4_cb_footprint import (
+    enforce_whole_artifact_budget,
+    whole_artifact_budget_from_assignment_payload,
+)
 
 # Skeleton tensor types we are willing to treat as a full-precision source.
 _SOURCE_TYPES = {QT.F32, QT.F16, QT.BF16}
@@ -197,6 +205,11 @@ def build_imatrix_from_act_cache(act_dir: str | Path) -> dict[str, torch.Tensor]
     return out
 
 
+@transactional_file_output(
+    source_parameter="skeleton_path",
+    output_parameter="out_path",
+    where="export_gguf",
+)
 def export_gguf(
     skeleton_path: str | Path,
     layer_config_path: str | Path,
@@ -208,11 +221,31 @@ def export_gguf(
     device: str | None = None,
     allow_imatrix_gaps: bool = False,
     gptq_act_dir: str | Path | None = None,
+    allow_research_cost_selection: bool = False,
 ) -> dict[str, int]:
+    out_path = prepare_fresh_export_file(
+        skeleton_path,
+        out_path,
+        where="export_gguf",
+    )
     if device is None:
         # GPU-first: the weighted scale search is the export hot path.
         device = "cuda" if torch.cuda.is_available() else "cpu"
     assignment = load_assignment(layer_config_path)
+    recipe_payload = json.loads(Path(layer_config_path).read_text())
+    from prismaquant.research_cost_acceptance import (
+        enforce_research_export_acknowledgement,
+    )
+    research_cost_selection = enforce_research_export_acknowledgement(
+        recipe_payload,
+        acknowledged=allow_research_cost_selection,
+        where="export_gguf",
+    )
+    whole_artifact_budget_from_assignment_payload(
+        recipe_payload,
+        where="export_gguf preflight",
+        assignment=assignment,
+    )
     illegal = sorted({
         fmt for fmt in assignment.values()
         if fmt not in GGUF_BLOCK_BYTES and fmt != "BF16"
@@ -412,6 +445,12 @@ def export_gguf(
                          gguf.GGUFValueType.STRING)
     writer.add_key_value("prismaquant.assignment_sha256", digest,
                          gguf.GGUFValueType.STRING)
+    if research_cost_selection is not None:
+        writer.add_key_value(
+            "prismaquant.research_cost_selection",
+            json.dumps(research_cost_selection, sort_keys=True),
+            gguf.GGUFValueType.STRING,
+        )
     writer.add_key_value("prismaquant.tensor_formats",
                          json.dumps(tensor_formats, sort_keys=True),
                          gguf.GGUFValueType.STRING)
@@ -448,6 +487,18 @@ def export_gguf(
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)
     writer.close()
+    budget_attestation = enforce_whole_artifact_budget(
+        out_path,
+        recipe_payload,
+        where="export_gguf",
+        assignment=assignment,
+    )
+    if budget_attestation is not None:
+        print(
+            "whole-artifact budget passed: "
+            f"{budget_attestation['actual_bytes']}B <= "
+            f"{budget_attestation['budget_bytes']}B"
+        )
     return dict(counts)
 
 
@@ -456,6 +507,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--skeleton", required=True,
                     help="bf16/f16 GGUF produced by convert_hf_to_gguf.py")
     ap.add_argument("--layer-config", required=True)
+    ap.add_argument(
+        "--allow-research-cost-selection",
+        action="store_true",
+        help="explicitly acknowledge export of a research-stamped assembled "
+             "cost selection; recorded in GGUF metadata",
+    )
     ap.add_argument("--out", required=True)
     ap.add_argument(
         "--default-format", default=None,
@@ -486,6 +543,8 @@ def main(argv: list[str] | None = None) -> None:
         "with llama.cpp imatrix semantics",
     )
     args = ap.parse_args(argv)
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("export_gguf")
     imatrix = None
     if args.imatrix_from_act_cache:
         imatrix = build_imatrix_from_act_cache(args.imatrix_from_act_cache)
@@ -501,6 +560,7 @@ def main(argv: list[str] | None = None) -> None:
         device=args.device,
         allow_imatrix_gaps=args.allow_imatrix_gaps,
         gptq_act_dir=(args.imatrix_from_act_cache if args.gptq else None),
+        allow_research_cost_selection=args.allow_research_cost_selection,
     )
     size = Path(args.out).stat().st_size / 1e9
     print(f"wrote {args.out} ({size:.2f} GB)")

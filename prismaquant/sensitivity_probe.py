@@ -75,9 +75,13 @@ from collections import defaultdict
 from pathlib import Path
 import tempfile
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .name_projection import NameProjection
 
 
 _STAGED_TEMP_DIRS: list[Path] = []
@@ -113,7 +117,26 @@ atexit.register(_cleanup_stage_dirs)
 # ---------------------------------------------------------------------------
 # Text-only staging
 # ---------------------------------------------------------------------------
-def stage_text_only(model_path: str) -> str:
+#
+# One rule, one home (issue #210): "which config keys make a checkpoint
+# text-only when no profile claims it" and the staging steps that act on
+# them live ONLY in `_stage_text_only_impl` below. `stage_text_only`
+# (this module) and `perturbed_x_cache.stage_text_only_under_work_root`
+# are both thin wrappers around it, differing only in where the staged
+# directory is created:
+#   - `stage_text_only`: under `_prismaquant_temp_parent()` (TMPDIR-ish),
+#     registered in `_STAGED_TEMP_DIRS` for `atexit` cleanup.
+#   - `stage_text_only_under_work_root`: under an explicit `work_root`
+#     the caller owns, never under /tmp, with no `atexit` registration.
+# Before this merge the two call sites carried separately-typed copies of
+# the same hardcoded fallback strip-key list (7 keys, textually identical
+# in both files). Keep both public names and their exact signatures and
+# behavior so no caller moves.
+def _stage_text_only_impl(
+    model_path: str,
+    *,
+    staging_root: str | Path | None,
+) -> str:
     src = Path(model_path)
     cfg_path = src / "config.json"
     if not cfg_path.exists():
@@ -123,9 +146,17 @@ def stage_text_only(model_path: str) -> str:
 
     # Profile-driven: ask the registered ModelProfile which config keys
     # to strip and whether to promote `text_config.model_type`.
+    from .model_profiles import DeadVendoredOverrideError, detect_profile
     try:
-        from .model_profiles import detect_profile
         profile = detect_profile(str(src))
+    except DeadVendoredOverrideError:
+        # The hardcoded default strip-key list below is for a checkpoint no
+        # profile claims. On a dead override it stages the model with a
+        # different config than the profile declares -- and every probe
+        # statistic (sensitivity_probe) or cached activation row
+        # (perturbed_x_cache) gathered afterwards describes that wrong
+        # staging (#202).
+        raise
     except Exception:
         profile = None
     strip_keys = (list(profile.stage_text_only_strip_keys())
@@ -152,7 +183,6 @@ def stage_text_only(model_path: str) -> str:
     promote_inner_mt = (profile.stage_text_only_promote_inner_model_type()
                         if profile is not None else False)
 
-    import tempfile
     for k in strip_keys:
         cfg.pop(k, None)
 
@@ -193,7 +223,12 @@ def stage_text_only(model_path: str) -> str:
             a.replace("ForConditionalGeneration", "ForCausalLM") for a in archs
         ]
 
-    staged = _mk_stage_dir("prismaquant_stage_")
+    if staging_root is None:
+        staged = _mk_stage_dir("prismaquant_stage_")
+    else:
+        root = Path(staging_root)
+        root.mkdir(parents=True, exist_ok=True)
+        staged = Path(tempfile.mkdtemp(prefix="prismaquant_stage_", dir=str(root)))
     skip = {"config.json", "preprocessor_config.json",
             "video_preprocessor_config.json", "processor_config.json"}
     for p in src.iterdir():
@@ -203,6 +238,10 @@ def stage_text_only(model_path: str) -> str:
     with open(staged / "config.json", "w") as f:
         json.dump(cfg, f, indent=2)
     return str(staged)
+
+
+def stage_text_only(model_path: str) -> str:
+    return _stage_text_only_impl(model_path, staging_root=None)
 
 
 # ---------------------------------------------------------------------------
@@ -451,11 +490,19 @@ def load_multimodal_calibration(
 _ALLOW_SUMSQ_PACKED_FISHER_ENV = "PRISMAQUANT_ALLOW_SUMSQ_PACKED_FISHER"
 
 
-def h_detail_blob(h_raw: torch.Tensor, n_tokens: int, name: str, *,
+def h_detail_blob(h_raw: torch.Tensor, global_tokens: int, name: str, *,
                   kind: str = "linear",
                   g2_per_token: torch.Tensor | None = None) -> dict:
     """Normalize a token-SUMMED Fisher diagonal accumulator to per-token
     units and wrap it in the canonical h-detail blob schema.
+
+    ``global_tokens`` must be the GLOBAL calibration token count — the
+    same denominator `finalize_fisher_stats` applies to the scalar
+    ``h_trace`` — never a per-row routed-token count. v4 pins this:
+    passing an unpacked expert Linear's own ``n_tokens_seen`` here left
+    the detail blob (global/routed)× hotter than the scalar it must
+    agree with, so `predicted_dloss` fallback rows priced expert rows on
+    a different scale than the rest of the knapsack.
 
     Every h-detail writer (this module's `FisherAccumulator.finalize` and
     `incremental_probe`'s two writer sites) goes through this helper so
@@ -466,7 +513,7 @@ def h_detail_blob(h_raw: torch.Tensor, n_tokens: int, name: str, *,
     probe produced the directory). ``g2_per_token`` is already a
     per-token vector and is stored as-is.
     """
-    tokens = max(int(n_tokens), 1)
+    tokens = max(int(global_tokens), 1)
     h = h_raw.detach().to("cpu", torch.float32) / tokens
     blob = {
         "h_diag": h,
@@ -474,11 +521,252 @@ def h_detail_blob(h_raw: torch.Tensor, n_tokens: int, name: str, *,
         "kind": kind,
         "shape": list(h.shape),
         "units": "per_token",
-        "h_detail_version": 3,   # v3: unit marker; no route_prob term (M4)
+        # v3: unit marker; no route_prob term (M4).
+        # v4: denominator is the GLOBAL calib token count for every row
+        #     (v3 unpacked-expert blobs were per-ROUTED-token).
+        "h_detail_version": 4,
+        "norm_tokens": tokens,
     }
     if g2_per_token is not None:
         blob["g2_per_token"] = g2_per_token
     return blob
+
+
+def finalize_fisher_stats(merged_stats: dict, global_tokens: int) -> None:
+    """Normalize raw Fisher accumulators into ``h_trace`` (etc.), in place.
+
+    Fisher normalization must share ONE denominator across every row: the
+    global calibration token count (nsamples x seqlen). Dense trunk Linears
+    accumulate exactly that many tokens in ``n_tokens_seen``, so their
+    values are unchanged by dividing by the global count. Per-expert
+    Linears, however, only see their ROUTED tokens; a per-row
+    ``h_trace_raw / n_tokens_seen`` inflates a rarely-routed expert's
+    Fisher by (global/routed) — exactly inverted importance weighting (the
+    least-used experts look the most sensitive). Tokens never routed to an
+    expert contribute zero gradient, so the empirical Fisher over the
+    calibration set divides by the GLOBAL count for every row.
+
+    HISTORY — this deliberately REVERSES a documented convention. Audit M4
+    removed an explicit ÷route_prob on the grounds that dividing by the
+    routed-token count was "the one implicit ÷token-fraction the MoE
+    convention prescribes", and both backends then shipped per-routed-token
+    as the single normalization (pinned by the original
+    tests/test_packed_expert_per_token_fisher.py). M4's *agreement* goal
+    stands — one division, both backends, route_prob as metadata only —
+    but per-routed-token was the wrong denominator for the mean-Δloss
+    objective the allocator optimizes: it is the same 1/p_e inflation M4
+    removed, merely implicit. CLAUDE.md §3 records the same reversal.
+
+    ``n_tokens_seen`` stays raw (routed count, metadata). Every h-detail
+    blob is normalized by the SAME global count (`h_detail_blob` v4) so
+    scalar and per-weight detail Fisher share one denominator.
+    """
+    for s in merged_stats.values():
+        s["h_trace"] = s.get("h_trace_raw", 0.0) / global_tokens
+        s["h_w2_sum"] = s.get("h_w2_sum_raw", 0.0) / global_tokens
+        # Per-expert Fisher trace (only present on packed-3D stat entries;
+        # dense Linears have no per-expert dimension). Normalize by the
+        # same token count so it shares units with `h_trace`.
+        per = s.get("h_trace_per_expert_raw")
+        if per is not None:
+            s["h_trace_per_expert"] = [float(v) / global_tokens for v in per]
+        # Per-GROUP Fisher trace (grouped-BMM operands like DSv4's wo_a).
+        # Same rule, same denominator: the group axis is a contraction
+        # structure ON one logical tensor, and every group sees every
+        # calibration token (attention output projection — nothing is
+        # routed), so the global count is exact for it, not just
+        # consistent.
+        per_group = s.get("h_trace_per_group_raw")
+        if per_group is not None:
+            s["h_trace_per_group"] = [
+                float(v) / global_tokens for v in per_group]
+        s["h_trace_norm_tokens"] = global_tokens
+
+
+# ---------------------------------------------------------------------------
+# Grouped-BMM Linear Fisher (`wo_a` shape)
+#
+# A declared grouped module (spec `probe.grouped_module_class_names`) is an
+# nn.Linear subclass whose forward consumes its `[G*R, D]` weight plane as
+# `W[g, r, d]`: `y[..., g, r] = sum_d x[..., g, d] * W[g, r, d]`
+# (view + bmm in `DeepseekV4GroupedLinear.forward`). The dense accumulator's
+# flatten-to-2D cannot represent this consumption: its chunk_h comes out
+# [R, D] against an [G*R, D] weight (the `chunk_h * w.pow(2)` broadcast that
+# motivated the original probe skip), and pooling groups into the token axis
+# destroys the per-(g,r) channel marginals. The functions below are the ONE
+# grouped accumulation mechanism; both backends fold its outputs into the
+# same stats keys the dense rows use.
+#
+# TP note (walker campaign addendum, 2026-08-22): identity, dispositions,
+# and every field below are properties of the WHOLE logical tensor. A future
+# Tensor-Parallel shard of `wo_a` would cut the stored plane's ROW axis
+# (axis 0 = G*R; the profile's `base_model_tp_plan` declares `rowwise`),
+# so a shard boundary must not straddle a group (a cut inside g's R rows
+# would make any future group-aware format illegal at that TP degree).
+# Nothing here bakes rank/shard identity into keys or sizes; byte totals
+# are TOTAL-of-logical, per-device splits are a serving-runtime concern.
+
+
+def grouped_linear_groups(mod, profile=None) -> int | None:
+    """Group count `G` for a profile-declared grouped-BMM Linear, else None.
+
+    Dispatch is EXPLICIT: only classes the profile declares under
+    ``probe.grouped_module_class_names`` are grouped — never a shape
+    heuristic. A declared class whose instance lacks a usable ``n_groups``
+    fails fast: silently falling through to the dense accumulator would
+    produce the inflated, mis-shaped numbers the old probe skip existed to
+    prevent.
+    """
+    import torch.nn as _nn
+    if not isinstance(mod, _nn.Linear) or profile is None:
+        return None
+    try:
+        declared = tuple(profile.probe_grouped_module_class_names())
+    except AttributeError:
+        declared = ()
+    if type(mod).__name__ not in declared:
+        return None
+    n_groups = getattr(mod, "n_groups", None)
+    if n_groups is None:
+        raise ValueError(
+            f"{type(mod).__name__} is declared under "
+            "probe.grouped_module_class_names but carries no n_groups "
+            "attribute; refusing to fall through to the dense Fisher "
+            "accumulator (its numbers would be wrong-shaped)")
+    g = int(n_groups)
+    out_features = int(mod.out_features)
+    if g <= 0 or out_features % g != 0:
+        raise ValueError(
+            f"{type(mod).__name__}: n_groups={g} does not divide "
+            f"out_features={out_features}")
+    return g
+
+
+def grouped_linear_stats_entry(mod, num_groups: int,
+                               w_max_abs: float | None = None,
+                               w_norm_sq: float | None = None) -> dict:
+    """Stats-schema entry for a grouped operand, mirroring the dense row.
+
+    Shape convention follows the serialized truth, NOT a slice fiction:
+    `out_features`=G*R and `in_features`=D name the flat `[G*R, D]` plane
+    the exporter quantizes, and the 1-D marginals index that same plane
+    (`fisher_row[g*R + r]`). `num_groups` is the distinguishing field —
+    deliberately NOT `num_experts`, which downstream code
+    (`_shape_from_stats`, `_stats_indicates_packed_expert`) reads as a
+    packed expert stack. Per-group structure rides on
+    `h_trace_per_group_raw`; the unit stays the whole logical tensor."""
+    w = mod.weight
+    return {
+        "h_trace_raw": 0.0,
+        "h_w2_sum_raw": 0.0,
+        "w_max_abs": w_max_abs,
+        "w_norm_sq": w_norm_sq,
+        "n_params": int(w.numel()),
+        "in_features": int(mod.in_features),
+        "out_features": int(mod.out_features),
+        "num_groups": int(num_groups),
+        "n_tokens_seen": 0,
+        # Grouped attention output projections are not routed: route
+        # metadata exists for schema parity with dense rows, always None.
+        "route_prob": None,
+        "router_path": None,
+        "expert_id": None,
+    }
+
+
+def grouped_linear_fisher_chunk(
+    x: torch.Tensor,
+    gy: torch.Tensor,
+    num_groups: int,
+    weight: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """One backward hook's worth of grouped empirical-Fisher pieces.
+
+    Input contract (validated): `x` is the module input `[..., G, D]`,
+    `gy = dL/dy` is `[..., G, R]`, `weight` is the `[G*R, D]` plane. The
+    per-token gradient of the weight is `grad_t W[g,r,d] =
+    gy[t,g,r] * x[t,g,d]`, so the per-token-summed empirical Fisher —
+    the SAME estimator as every dense row (`Σ_t ‖∇_t‖²_F`, audit M3;
+    never `‖Σ_t ∇_t‖²`) factorizes exactly:
+
+        h_trace = Σ_t Σ_g ‖gy[t,g,:]‖² · ‖x[t,g,:]‖²
+                = Σ_g Σ_{r,d} chunk_h[g,r,d],
+        chunk_h[g,r,d] = Σ_t gy[t,g,r]² · x[t,g,d]²
+
+    The true elementwise Fisher is block-diagonal in `g`
+    (`H[(g,r),(g',d)] = 0` for `g' ≠ g`), so the per-group bmm is EXACT,
+    not an approximation. Everything downstream reduces the ONE fp32
+    `chunk_h`, which makes `sum(fisher_row) == sum(fisher_col) ==
+    h_trace` hold BY CONSTRUCTION — the wiring discipline the dense
+    sites document at their own accumulation points.
+
+    Returns device-resident fp32 tensors:
+      h_trace         0-dim, raw (pre-`finalize_fisher_stats`)
+      h_w2            0-dim ⟨chunk_h, W²⟩ proxy (None when weight absent/meta)
+      fisher_row     [G*R] flat-plane output-channel marginal
+      fisher_col     [D]    input-channel marginal (pools groups: column d
+                      of the plane serves every group's contraction)
+      g_sq_sum       [G*R] flat gy² marginal
+      act_sq_sum     [D]    imatrix second moment (pools groups)
+      act_absmax     [D]    max |x| bound (pools groups; merge rule MAX)
+      trace_per_group [G]  decomposition of h_trace across the group axis
+      chunk_flat     [G*R, D] chunk_h reshaped onto the stored plane, for
+                      `h_full` collection
+
+    Normalization is NOT applied here: rows keep raw token-SUMMED values
+    and `finalize_fisher_stats` divides every row by the GLOBAL calibration
+    token count. Callers bump `n_tokens_seen` by TOKENS (= x rows before
+    the group dim), never T*G — group slices of one token are one token's
+    evidence, and the shared global denominator is what keeps grouped rows
+    commensurable with dense ones.
+    """
+    g = int(num_groups)
+    if x.dim() < 2 or gy.dim() < 2 or x.shape[-2] != g or gy.shape[-2] != g:
+        raise ValueError(
+            f"grouped Fisher expects x [..., {g}, D] and gy [..., {g}, R]; "
+            f"got x {tuple(x.shape)}, gy {tuple(gy.shape)}")
+    d_in = int(x.shape[-1])
+    r_out = int(gy.shape[-1])
+    if weight is not None and tuple(weight.shape) != (g * r_out, d_in):
+        raise ValueError(
+            f"grouped weight plane expected {(g * r_out, d_in)}, "
+            f"got {tuple(weight.shape)}")
+
+    xf = x.detach().reshape(-1, g, d_in)     # [T, G, D]
+    gyf = gy.detach().reshape(-1, g, r_out)  # [T, G, R]
+    tokens = int(xf.size(0))
+    gy_sq = gyf.pow(2)                       # input dtype, like the dense path
+    x_sq = xf.pow(2)
+    # One batched matmul over the group axis: [G,R,T] @ [G,T,D] -> [G,R,D].
+    # Same cost class as the dense chunk_h matmul; the [T*G, ...] flattening
+    # the dense path would apply instead pools groups into the token axis
+    # and loses exactly the structure this function exists to keep.
+    chunk_h = torch.bmm(
+        gy_sq.permute(1, 2, 0), x_sq.permute(1, 0, 2)).float()
+    if tokens == 0:
+        # An empty reduction would make amax/amin raise (same guard as
+        # _marginal_chunk); every sum here is already zero.
+        act_absmax = torch.zeros(d_in, dtype=torch.float32, device=xf.device)
+    else:
+        hi = torch.maximum(xf.amax(dim=0).abs(), xf.amin(dim=0).abs())
+        act_absmax = hi.amax(dim=0).to(torch.float32)
+
+    out = {
+        "h_trace": chunk_h.sum(),
+        "fisher_row": chunk_h.sum(dim=-1).reshape(-1),
+        "fisher_col": chunk_h.sum(dim=(0, 1)),
+        "g_sq_sum": gy_sq.sum(dim=0).reshape(-1).to(torch.float32),
+        "act_sq_sum": x_sq.sum(dim=(0, 1)).to(torch.float32),
+        "act_absmax": act_absmax,
+        "trace_per_group": chunk_h.sum(dim=(1, 2)),
+        "chunk_flat": chunk_h.reshape(g * r_out, d_in),
+    }
+    if weight is not None and not weight.is_meta:
+        w_view = weight.detach().view(g, r_out, d_in)
+        out["h_w2"] = (chunk_h * w_view.float().pow(2)).sum()
+    else:
+        out["h_w2"] = None
+    return out
 
 
 def _scalar_acc_add(acc: dict, name: str, value: torch.Tensor) -> None:
@@ -505,6 +793,7 @@ def _accumulate_packed_per_token_fisher(
     scalar_acc: dict,
     channel_acc: dict | None,
     full_acc: dict | None,
+    marginal_acc: dict | None = None,
 ) -> None:
     """Per-token-summed empirical Fisher moments for one expert's Linear
     application inside a packed [E, M, N] MoE parameter.
@@ -560,6 +849,61 @@ def _accumulate_packed_per_token_fisher(
         cur[expert_idx].add_(chunk_h.to("cpu", torch.float32))
         del chunk_h
 
+    if marginal_acc is not None:
+        # AQUA A-side marginals for THIS expert slice. Both are pure
+        # reductions of tensors the Fisher path already materialized, so
+        # they add no matmul and no extra device→host sync (the flush is
+        # batched by the caller, exactly like `h_trace_per_expert_raw`).
+        #
+        #   g_sq_sum [E, M] : Σ_{t routed to e} gy_{t,m}²   -- RAW sum.
+        #   act_sq_sum [E, N]: Σ_{t routed to e} x_{t,n}²   -- RAW sum.
+        #   act_absmax [E, N]: max_t |x_{t,n}|              -- a BOUND.
+        #   tokens [E]      : |{t routed to e}|             -- see below.
+        #
+        # `tokens` is the piece with no dense analogue and it is not
+        # optional. The two raw sums feed two DIFFERENT normalizations
+        # downstream and only one of them is global:
+        #
+        #   * g_sq_sum is divided by the GLOBAL token count, because that
+        #     is what carries an expert's share of the mean-Δloss
+        #     objective (a rarely-routed expert SHOULD price low). This is
+        #     the PR #14 convention `finalize_fisher_stats` already
+        #     enforces for h_trace.
+        #   * act_sq_sum is divided by this expert's ROUTED count, because
+        #     it is fitting the per-token noise magnitude of the rows that
+        #     actually flow through the expert. Dividing it globally too
+        #     would discount a rare expert TWICE -- once correctly in g,
+        #     once wrongly in the variance -- which is PR #14's inverted
+        #     importance weighting in mirror image.
+        #
+        # The packed stat entry's `n_tokens_seen` is the layer's global
+        # count, so the routed denominator has to be recorded here.
+        slot = marginal_acc.get(name)
+        if slot is None:
+            slot = {
+                "expert_g_sq_sum": torch.zeros(
+                    num_experts, gy2.size(1), dtype=torch.float32,
+                    device=gy2.device),
+                "expert_act_sq_sum": torch.zeros(
+                    num_experts, x2.size(1), dtype=torch.float32,
+                    device=x2.device),
+                "expert_act_absmax": torch.zeros(
+                    num_experts, x2.size(1), dtype=torch.float32,
+                    device=x2.device),
+                "expert_tokens": torch.zeros(
+                    num_experts, dtype=torch.float64, device=x2.device),
+            }
+            marginal_acc[name] = slot
+        slot["expert_g_sq_sum"][expert_idx].add_(
+            gy_sq.sum(dim=0, dtype=torch.float32))
+        slot["expert_act_sq_sum"][expert_idx].add_(
+            x_sq.sum(dim=0, dtype=torch.float32))
+        torch.maximum(
+            slot["expert_act_absmax"][expert_idx],
+            x2.abs().amax(dim=0).to(torch.float32),
+            out=slot["expert_act_absmax"][expert_idx])
+        slot["expert_tokens"][expert_idx].add_(float(x2.size(0)))
+
 
 def _packed_expert_slice_index(weight: torch.Tensor,
                                param: torch.Tensor) -> int | None:
@@ -606,13 +950,15 @@ class _PackedLinearPerTokenFisher(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, weight, bias, orig_linear, name, expert_idx,
-                num_experts, scalar_acc, channel_acc, full_acc):
+                num_experts, scalar_acc, channel_acc, full_acc,
+                marginal_acc=None):
         ctx.name = name
         ctx.expert_idx = expert_idx
         ctx.num_experts = num_experts
         ctx.scalar_acc = scalar_acc
         ctx.channel_acc = channel_acc
         ctx.full_acc = full_acc
+        ctx.marginal_acc = marginal_acc
         ctx.has_bias = bias is not None
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(x, weight)
@@ -621,16 +967,17 @@ class _PackedLinearPerTokenFisher(torch.autograd.Function):
     @staticmethod
     def backward(ctx, gy):
         if gy is None:
-            return (None,) * 11
+            return (None,) * 12
         x, w = ctx.saved_tensors
         _accumulate_packed_per_token_fisher(
             ctx.name, ctx.expert_idx, ctx.num_experts, x, gy,
-            ctx.scalar_acc, ctx.channel_acc, ctx.full_acc)
+            ctx.scalar_acc, ctx.channel_acc, ctx.full_acc,
+            ctx.marginal_acc)
         grad_x = gy.matmul(w) if ctx.needs_input_grad[0] else None
         grad_b = None
         if ctx.has_bias and ctx.needs_input_grad[2]:
             grad_b = gy.reshape(-1, gy.size(-1)).sum(dim=0)
-        return (grad_x, None, grad_b) + (None,) * 8
+        return (grad_x, None, grad_b) + (None,) * 9
 
 
 class _PackedWeightGradFallback(torch.autograd.Function):
@@ -800,6 +1147,7 @@ def _packed_expert_projection_candidate_names(profile=None) -> tuple[str, ...]:
 _PRISMAQUANT_PATCH_SENTINEL = "_prismaquant_packed_expert_patch"
 _PRISMAQUANT_CHANNEL_SENTINEL = "_prismaquant_packed_expert_channel_patch"
 _PRISMAQUANT_FULL_SENTINEL = "_prismaquant_packed_expert_full_patch"
+_PRISMAQUANT_MARGINAL_SENTINEL = "_prismaquant_packed_expert_marginal_patch"
 
 
 def install_packed_expert_hooks(
@@ -807,6 +1155,7 @@ def install_packed_expert_hooks(
     accumulator: dict,
     channel_accumulator: dict | None = None,
     full_accumulator: dict | None = None,
+    marginal_accumulator: dict | None = None,
     profile=None,
 ) -> dict[str, dict]:
     """Patch every packed-experts module's forward so each expert-slice
@@ -880,6 +1229,7 @@ def install_packed_expert_hooks(
             setattr(module, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
             setattr(module, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
             setattr(module, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
+            setattr(module, _PRISMAQUANT_MARGINAL_SENTINEL, marginal_accumulator)
             # Still report metadata so callers can refresh their stats dict.
             for pn in param_names:
                 p_existing = module._parameters.get(pn)
@@ -978,12 +1328,14 @@ def install_packed_expert_hooks(
         setattr(mod_ref, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
         setattr(mod_ref, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
         setattr(mod_ref, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
+        setattr(mod_ref, _PRISMAQUANT_MARGINAL_SENTINEL, marginal_accumulator)
 
         def patched_forward(*args, _ns=ns, _full=full_names, _orig=original_forward,
                             _mod=mod_ref, **kwargs):
             acc = getattr(_mod, _PRISMAQUANT_PATCH_SENTINEL, None)
             ch_acc = getattr(_mod, _PRISMAQUANT_CHANNEL_SENTINEL, None)
             fu_acc = getattr(_mod, _PRISMAQUANT_FULL_SENTINEL, None)
+            mg_acc = getattr(_mod, _PRISMAQUANT_MARGINAL_SENTINEL, None)
             if acc is None:
                 # Should not happen, but degrade gracefully.
                 return _orig(*args, **kwargs)
@@ -1013,7 +1365,8 @@ def install_packed_expert_hooks(
                     if e is not None:
                         return _PackedLinearPerTokenFisher.apply(
                             input, weight, bias, orig_linear, fn, e,
-                            int(param.shape[0]), acc, ch_acc, fu_acc)
+                            int(param.shape[0]), acc, ch_acc, fu_acc,
+                            mg_acc)
                 return orig_linear(input, weight, bias)
 
             F.linear = _intercepting_linear
@@ -1065,9 +1418,14 @@ def discover_moe_structure(
     That Linear is the router.
     """
     if profile is None:
+        from .model_profiles import DeadVendoredOverrideError, profile_from_model
         try:
-            from .model_profiles import profile_from_model
             profile = profile_from_model(model)
+        except DeadVendoredOverrideError:
+            # The profile names the packed-expert projections this walk looks
+            # for. `None` narrows the candidate set silently, so MoE experts
+            # go undiscovered and simply never get probed (#202).
+            raise
         except Exception:
             profile = None
     projection_candidates = _packed_expert_projection_candidate_names(profile)
@@ -1178,6 +1536,71 @@ def discover_moe_structure(
     return expert_info
 
 
+def discover_moe_routers(
+    model: nn.Module,
+    profile=None,
+) -> dict[str, int]:
+    """Return router module qnames and expert counts for all MoE blocks.
+
+    ``discover_moe_structure`` intentionally describes *per-expert Linear*
+    layouts.  Packed Qwen3.5/3.6 experts instead keep their projections as
+    3-D parameters, so that function has no Linear leaves to return even
+    though the sibling router is fully observable.  Coverage accounting only
+    needs the router module itself; discover it independently from either a
+    numbered expert container or a profile-declared packed 3-D parameter.
+    """
+    if profile is None:
+        from .model_profiles import DeadVendoredOverrideError, profile_from_model
+        try:
+            profile = profile_from_model(model)
+        except DeadVendoredOverrideError:
+            # As in `discover_moe_structure` (#202): the profile declares the
+            # packed 3-D parameters this discovery keys on, so `None` silently
+            # under-reports routers and the coverage accounting built on them.
+            raise
+        except Exception:
+            profile = None
+    packed_names = _packed_expert_param_name_set(profile)
+    routers: dict[str, int] = {}
+
+    def _matches(child: nn.Module, num_experts: int) -> bool:
+        if isinstance(child, nn.Linear) and child.out_features == num_experts:
+            return True
+        weight = getattr(child, "weight", None)
+        return bool(
+            isinstance(weight, torch.Tensor)
+            and weight.ndim >= 1
+            and int(weight.shape[0]) == num_experts
+        )
+
+    for parent_qname, parent in model.named_modules():
+        for attr in ("experts", "block_sparse_moe_experts",
+                     "moe_experts", "expert_layer"):
+            experts = getattr(parent, attr, None)
+            if not isinstance(experts, nn.Module):
+                continue
+            numeric = [name for name, _child in experts.named_children()
+                       if name.isdigit()]
+            num_experts = len(numeric)
+            if not num_experts:
+                for name, param in experts.named_parameters(recurse=False):
+                    if (name in packed_names and isinstance(param, torch.Tensor)
+                            and param.ndim == 3 and int(param.shape[0]) > 0):
+                        num_experts = int(param.shape[0])
+                        break
+            if not num_experts:
+                continue
+            for child_name, child in parent.named_children():
+                if child is experts:
+                    continue
+                if _matches(child, num_experts):
+                    qname = (f"{parent_qname}.{child_name}"
+                             if parent_qname else child_name)
+                    routers[qname] = num_experts
+                    break
+    return routers
+
+
 def read_top_k(model: nn.Module, default: int = 2) -> int:
     cfg = getattr(model, "config", None)
     if cfg is None:
@@ -1195,6 +1618,290 @@ def read_top_k(model: nn.Module, default: int = 2) -> int:
     return default
 
 
+# ---------------------------------------------------------------------------
+# The KV-cotangent path: Fisher cotangents for cross-layer SHARED state
+# ---------------------------------------------------------------------------
+def kv_cotangent_path_enabled() -> bool:
+    """Whether the reverse sweep routes shared-state cotangents back to the
+    producing layer (default: yes).
+
+    `PRISMAQUANT_KV_COTANGENT=0` restores the pre-fix severed-cotangent
+    behavior for an A/B — and, because that reintroduces the under-count, it
+    also re-arms `incremental_probe.kv_shared_fisher_block_reason`. One
+    definition, read by both the probe sweeps and that guard, so the flag can
+    never mean two different things."""
+    raw = os.environ.get("PRISMAQUANT_KV_COTANGENT")
+    if raw is None:
+        return True
+    return raw not in ("0", "", "false", "False", "FALSE", "no", "NO")
+
+
+class SharedStateCotangents:
+    """Route the Fisher cotangent of cross-layer SHARED forward state back to
+    the layer that PRODUCED it.
+
+    **The measurement gap.** Some architectures share activations across layers
+    within one forward pass: Gemma4's KV-sharing layers reuse the K/V computed
+    by an earlier *storing* layer, threaded through the ``shared_kv_states``
+    dict that ``ModelProfile.new_forward_pass_state`` declares. The Fisher
+    probe's phase-3 forwards each layer in ISOLATION and hands a sharing layer
+    the phase-1 *capture* of that K/V, which is necessarily detached (it is a
+    CPU snapshot taken from a ``torch.no_grad()`` pass). A sharing layer's
+    backward therefore stops dead at the borrowed K/V, and ``h_trace`` for the
+    storing layer's ``k_proj``/``v_proj`` counts only its OWN layer's gradient
+    — it misses the gradient flowing through every layer that consumes its
+    K/V. The under-count lands precisely on the layers that feed other layers,
+    i.e. exactly the ones the allocator should be most careful with. It also
+    truncates the chained ``grad_out`` handed to every layer BELOW the storing
+    layer, since that input gradient is missing the same paths.
+
+    **The fix, in one reverse pass.** ``graft`` replaces each borrowed tensor
+    with a grad-enabled LEAF clone. After that consumer's backward, ``harvest``
+    reads ``leaf.grad`` — exactly the cotangent this consumer contributes to
+    the producer's shared tensor — and sums it per (kwarg, source key,
+    position); gradients from several consumers of one source add, which is
+    what the sum is. When the sweep later reaches the producing layer,
+    ``produced_roots`` returns the tensors that layer wrote into the container
+    paired with those accumulated gradients, so the caller can drive one
+    ``torch.autograd.backward([out, *roots], [grad_out, *grads])``. Autograd
+    accumulates both contributions at the producer's K/V node before its
+    ``grad_fn`` runs, so each Linear's full-backward hook still fires ONCE,
+    with the total — the same gy an end-to-end backward would have delivered.
+
+    **Why one pass suffices.** A consumer always comes AFTER its producer in
+    the forward order (Gemma4 derives ``kv_shared_layer_index`` from the layers
+    strictly BEFORE the sharing point), and phase-3 sweeps in REVERSE, so every
+    consumer has been harvested by the time its producer is forwarded.
+
+    Bookkeeping rules that keep this honest:
+
+    - A borrowed leaf is never seeded as a root. It has no ``grad_fn`` (and its
+      identity is tracked), so a source whose cotangent is still accumulating
+      cannot be fed back into a later consumer and double-counted.
+    - A seeded key is POPPED. Two layers writing one key would otherwise each
+      collect the same consumers' cotangent; the sweep-end ``pending_keys``
+      diagnostic reports anything never consumed.
+    - Accumulation is promoted to at least fp32, so many bf16 consumer
+      cotangents don't lose the small ones; the seed is cast back to the
+      producer tensor's dtype.
+    - ``graft`` of an empty/absent pass state returns the caller's own object
+      and records nothing, so architectures that declare no shared state take
+      byte-for-byte the same path they did before this class existed.
+    """
+
+    def __init__(self, *, enabled: bool = True):
+        self.enabled = bool(enabled)
+        # (kwarg, source key, position) -> summed cotangent (>= fp32).
+        self._acc: dict[tuple, torch.Tensor] = {}
+        # Per-layer: grafted leaves awaiting harvest, and the containers this
+        # layer may have written into.
+        self._live: list[tuple[tuple, torch.Tensor]] = []
+        self._live_ids: set[int] = set()
+        self._containers: list[tuple[str, dict]] = []
+        # Diagnostics (reported at sweep end; never used to make a decision).
+        self.n_grafted = 0
+        self.n_harvested = 0
+        self.n_seeded = 0
+        self.n_no_grad = 0
+        self.nondifferentiable: list[str] = []
+
+    # -- consumer side ----------------------------------------------------
+    def graft(self, pass_state):
+        """Return `pass_state` with every borrowed tensor replaced by a
+        grad-enabled leaf clone, recording the leaves for `harvest` and the
+        containers for `produced_roots`. Hand the RESULT to the layer call."""
+        if not self.enabled or not pass_state:
+            return pass_state
+        grafted: dict = {}
+        tracked = False
+        for kwarg, container in pass_state.items():
+            if not isinstance(container, dict):
+                # Not a keyed shared-state container; pass through untouched
+                # rather than guess at its structure.
+                grafted[kwarg] = container
+                continue
+            fresh = {
+                key: self._graft_value(kwarg, key, value)
+                for key, value in container.items()
+            }
+            grafted[kwarg] = fresh
+            self._containers.append((kwarg, fresh))
+            tracked = True
+        return grafted if tracked else pass_state
+
+    def _graft_value(self, kwarg, key, value):
+        if isinstance(value, torch.Tensor):
+            return self._leaf(kwarg, key, None, value)
+        if isinstance(value, (tuple, list)):
+            out = [
+                self._leaf(kwarg, key, pos, item)
+                if isinstance(item, torch.Tensor) else item
+                for pos, item in enumerate(value)
+            ]
+            return tuple(out) if isinstance(value, tuple) else out
+        return value
+
+    def _leaf(self, kwarg, key, pos, tensor: torch.Tensor) -> torch.Tensor:
+        if not (tensor.is_floating_point() or tensor.is_complex()):
+            # Integer/bool shared state carries no cotangent at all — the
+            # producer's Fisher genuinely cannot be recovered through it.
+            self.nondifferentiable.append(f"{kwarg}[{key!r}][{pos}]:{tensor.dtype}")
+            return tensor
+        try:
+            slot = (kwarg, key, pos)
+            hash(slot)
+        except TypeError:
+            self.nondifferentiable.append(f"{kwarg}[{key!r}]:unhashable-key")
+            return tensor
+        leaf = tensor.detach().clone().requires_grad_(True)
+        self._live.append((slot, leaf))
+        self._live_ids.add(id(leaf))
+        self.n_grafted += 1
+        return leaf
+
+    def harvest(self) -> int:
+        """Fold this layer's leaf gradients into the per-source accumulator and
+        end the layer. Call AFTER the backward; returns the number folded."""
+        folded = 0
+        for slot, leaf in self._live:
+            grad = leaf.grad
+            if grad is None:
+                # The layer never used the borrowed tensor on a path that
+                # reaches its output (or the cotangent was structurally zero).
+                self.n_no_grad += 1
+                continue
+            acc_dtype = torch.promote_types(grad.dtype, torch.float32)
+            contrib = grad.detach().to(acc_dtype)
+            prev = self._acc.get(slot)
+            if prev is None:
+                self._acc[slot] = contrib.clone()
+            else:
+                prev.add_(contrib)
+            leaf.grad = None
+            folded += 1
+        self.n_harvested += folded
+        self._live.clear()
+        self._live_ids.clear()
+        self._containers.clear()
+        return folded
+
+    # -- producer side ----------------------------------------------------
+    def produced_roots(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """`(tensors, grads)` — extra backward roots for the layer just
+        forwarded: the shared tensors IT produced, paired with the cotangent
+        its consumers accumulated. Call after the forward, before the
+        backward. Empty when this layer produced nothing consumers wanted."""
+        if not self.enabled or not self._acc:
+            return [], []
+        order: list[int] = []
+        by_id: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for kwarg, container in self._containers:
+            for key, value in list(container.items()):
+                for pos, tensor in self._iter_positions(value):
+                    slot = (kwarg, key, pos)
+                    grad = self._acc.get(slot)
+                    if grad is None:
+                        continue
+                    if id(tensor) in self._live_ids or tensor.grad_fn is None:
+                        # A tensor this layer BORROWED, not produced: it is a
+                        # leaf clone with no graph. Seeding it would inject
+                        # other consumers' cotangent into this layer's harvest.
+                        continue
+                    self._acc.pop(slot)
+                    seed = grad.to(device=tensor.device, dtype=tensor.dtype)
+                    if id(tensor) in by_id:
+                        # Same object written at two positions (Gemma4's
+                        # `value_states = key_states` k_eq_v layers): one root,
+                        # summed grad — duplicate roots would be legal but this
+                        # is unambiguous.
+                        prev_t, prev_g = by_id[id(tensor)]
+                        by_id[id(tensor)] = (prev_t, prev_g + seed)
+                    else:
+                        by_id[id(tensor)] = (tensor, seed)
+                        order.append(id(tensor))
+                    self.n_seeded += 1
+        roots = [by_id[i][0] for i in order]
+        grads = [by_id[i][1] for i in order]
+        return roots, grads
+
+    @staticmethod
+    def _iter_positions(value):
+        if isinstance(value, torch.Tensor):
+            yield None, value
+        elif isinstance(value, (tuple, list)):
+            for pos, item in enumerate(value):
+                if isinstance(item, torch.Tensor):
+                    yield pos, item
+
+    # -- diagnostics ------------------------------------------------------
+    def fork_for_replay(self, *, max_resident_bytes: int) -> "SharedStateCotangents":
+        """Fork completed adjoints for one disposable target replay.
+
+        The budget covers the fork's new compact tensor storages only; the
+        caller still owns and charges this original accumulator. ``graft``,
+        ``produced_roots`` and ``harvest`` may mutate the fork freely. Only a
+        final committed replay should use the original owner. No live graph,
+        mutable accumulator storage or diagnostic list crosses the fork.
+        """
+        if self._live or self._containers or self._live_ids:
+            raise RuntimeError("shared cotangent replay requires a quiescent owner")
+        if type(max_resident_bytes) is not int or max_resident_bytes < 0:
+            raise ValueError("shared cotangent replay requires a nonnegative tensor byte cap")
+        needed = sum(t.numel() * t.element_size() for t in self._acc.values())
+        if needed > max_resident_bytes:
+            raise RuntimeError("shared cotangent replay exceeds its tensor residency budget")
+        fork = type(self)(enabled=self.enabled)
+        try:
+            for slot, tensor in self._acc.items():
+                fork._acc[slot] = tensor.detach().clone(memory_format=torch.contiguous_format)
+            for name in ("n_grafted", "n_harvested", "n_seeded", "n_no_grad"):
+                setattr(fork, name, getattr(self, name))
+            fork.nondifferentiable = list(self.nondifferentiable)
+            return fork
+        except BaseException:
+            fork.release_resident_state()
+            raise
+
+    def resident_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Expose retained shared adjoints for the streamed owner's byte cap.
+
+        Call at layer boundaries after harvest; a live graft belongs to the
+        current autograd graph, so treating it as completed state must refuse.
+        """
+        if self._live or self._containers:
+            raise RuntimeError("shared cotangent residency queried before harvest")
+        return tuple(self._acc.values())
+
+    def release_resident_state(self) -> None:
+        """Release adjoints/graph references when their entire sweep closes."""
+        self._acc.clear()
+        self._live.clear()
+        self._live_ids.clear()
+        self._containers.clear()
+
+    def pending_keys(self) -> list[tuple]:
+        """Accumulated cotangents no producer ever claimed. Non-empty means the
+        sweep never forwarded the producing layer (or it stopped writing the
+        key), so that producer's Fisher is still under-counted."""
+        return sorted(self._acc, key=repr)
+
+    def summary(self) -> str:
+        pending = self.pending_keys()
+        parts = [
+            f"enabled={self.enabled}",
+            f"grafted={self.n_grafted}",
+            f"harvested={self.n_harvested}",
+            f"seeded={self.n_seeded}",
+        ]
+        if self.n_no_grad:
+            parts.append(f"no_grad={self.n_no_grad}")
+        if self.nondifferentiable:
+            parts.append(f"nondifferentiable={len(self.nondifferentiable)}")
+        if pending:
+            parts.append(f"UNCLAIMED={[repr(k) for k in pending]}")
+        return "kv_cotangent[" + " ".join(parts) + "]"
+
+
 def _streaming_visual_layer_kwargs(
     profile,
     *,
@@ -1202,13 +1909,32 @@ def _streaming_visual_layer_kwargs(
     pass_state: dict | None = None,
     captured_pass_state=None,
     layer=None,
+    cotangents: "SharedStateCotangents | None" = None,
 ) -> dict:
+    """Resolve the profile kwargs for one layer call in the streaming visual
+    probe: per-layer `extra_layer_kwargs` plus the per-pass SHARED state —
+    either the live dict threaded through the forward pass (`pass_state`, one
+    object for the whole pass) or, for the isolated reverse-sweep forwards,
+    the slice rebuilt from what that pass captured (`captured_pass_state`).
+
+    Merging goes through `merge_pass_state_kwargs` so the shallow-merge /
+    no-op-when-empty / raise-on-collision rule has one definition shared with
+    `_call_layer`.
+
+    `cotangents` (reverse sweep only) grafts grad-enabled leaves over the
+    borrowed tensors so the producing layer's Fisher gets its consumers'
+    cotangent — see `SharedStateCotangents`. Grafting happens on the isolated
+    slice, before the merge, so only declared shared containers are touched."""
+    from .layer_streaming import merge_pass_state_kwargs
+
+    ctx = type(layer).__name__ if layer is not None else "streaming layer"
     kwargs = dict(profile.extra_layer_kwargs(input_ids=input_ids))
-    if pass_state is not None:
-        kwargs.update(pass_state)
+    kwargs = merge_pass_state_kwargs(kwargs, pass_state, context=ctx)
     if captured_pass_state is not None and layer is not None:
-        kwargs.update(profile.isolated_layer_pass_state(
-            captured_pass_state, layer))
+        isolated = profile.isolated_layer_pass_state(captured_pass_state, layer)
+        if cotangents is not None:
+            isolated = cotangents.graft(isolated)
+        kwargs = merge_pass_state_kwargs(kwargs, isolated, context=ctx)
     return kwargs
 
 
@@ -1322,6 +2048,11 @@ class RouterTracker:
 # ---------------------------------------------------------------------------
 # Fisher accumulator with activation snapshot cache
 # ---------------------------------------------------------------------------
+_DENSE_FISHER_MARGINAL_KEYS = (
+    "fisher_row", "fisher_col", "g_sq_sum", "act_sq_sum", "act_absmax",
+)
+
+
 class FisherAccumulator:
     def __init__(self, model: nn.Module, tracked: list[str],
                  expert_info: dict[str, tuple[str, str]],
@@ -1329,7 +2060,8 @@ class FisherAccumulator:
                  input_rows: int = 256,
                  hook_packed_experts: bool = True,
                  h_detail_dir: Path | None = None,
-                 model_profile=None):
+                 model_profile=None,
+                 emit_dense_marginals: bool = False):
         self.stats: dict[str, dict] = {}
         self._saved_inputs: dict[str, torch.Tensor] = {}
         self._fwd_handles, self._bwd_handles = [], []
@@ -1347,6 +2079,10 @@ class FisherAccumulator:
         # values may be device-resident 0-dim fp32 tensors), read in
         # finalize().
         self._packed_grad_acc: dict[str, float | torch.Tensor] = {}
+        # AQUA per-expert A-side marginals, same estimator and same merge
+        # rules as the incremental backend (the two backends agree on the
+        # packed path or a card built by one mis-prices under the other).
+        self._packed_marginal_acc: dict[str, dict[str, torch.Tensor]] = {}
         # Per-(experts module qname) sample count (one per backward),
         # populated by the experts forward hook below.
         self._packed_sample_count: dict[str, int] = defaultdict(int)
@@ -1355,12 +2091,35 @@ class FisherAccumulator:
         self._packed_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._packed_act_rows: dict[str, int] = defaultdict(int)
         if model_profile is None:
+            from .model_profiles import (
+                DeadVendoredOverrideError,
+                profile_from_model,
+            )
             try:
-                from .model_profiles import profile_from_model
                 model_profile = profile_from_model(model)
+            except DeadVendoredOverrideError:
+                # The comment below is careful that a DefaultProfile fallback
+                # is "an explicit declaration, not a silent degrade". That
+                # holds when no profile matched. On a dead override the
+                # declaration would be false: a profile DID match, and every
+                # Fisher statistic this accumulator records would be projected
+                # through the wrong names (#202).
+                raise
             except Exception:
                 model_profile = None
         self.model_profile = model_profile
+        # One shared name projection (R5 consumer migration). Block
+        # identity and the declared structural spellings are read through
+        # prismaquant.name_projection, never re-derived here from string
+        # surgery. When the model's own profile is unavailable, fall back
+        # to DefaultProfile exactly like `_packed_expert_param_name_set`
+        # above; NameProjection itself refuses a None profile by contract,
+        # so the fallback is an explicit declaration, not a silent degrade.
+        if self.model_profile is not None:
+            self._name_projection = NameProjection(self.model_profile)
+        else:
+            from .model_profiles import DefaultProfile
+            self._name_projection = NameProjection(DefaultProfile())
 
         # Per-layer accumulator for full per-weight Fisher diagonal.
         # Keyed by Linear qname -> CPU fp64 tensor of shape [out, in]
@@ -1384,6 +2143,14 @@ class FisherAccumulator:
         # Python scalar `stats[name]["h_trace_raw"]` once at finalize().
         self._gpu_h_trace: dict[str, torch.Tensor] = {}
         self._gpu_h_w2_sum: dict[str, torch.Tensor] = {}
+        # Optional dense per-channel Fisher marginals.  The ordinary
+        # sensitivity backend does not need these, so keep the path strictly
+        # opt-in.  Sample-parallel MTP does need them: its terminal-BF16 rows
+        # participate in the same closed dense schema as body/lm_head rows.
+        # Accumulate on the producing device and drain only in finalize() so
+        # enabling the contract cannot add CPU synchronization to each hook.
+        self.emit_dense_marginals = bool(emit_dense_marginals)
+        self._gpu_dense_marginals: dict[str, list[torch.Tensor]] = {}
         # Linears we never want Fisher signal for (always BF16 in our
         # serving stack, so accumulating the full per-weight matrix is
         # dead work). Populated in install_hooks() based on a regex; the
@@ -1410,13 +2177,27 @@ class FisherAccumulator:
         self._h_packed_channel: dict[str, torch.Tensor] = {}
         # Pre-compute the BF16-skip set: profile-pinned Linears end up BF16
         # in serving, so accumulating their full per-weight Fisher matrix is
-        # dead work. Keep the embedding fallback for older profiles; embeddings
-        # are normally not nn.Linear and therefore never enter this loop.
+        # dead work. The embedding spelling is the profile's DECLARATION
+        # (ModelProfile.embedding_name), not a probe substring test; the
+        # embedding fallback only fires for profiles that implement the
+        # table as an nn.Linear (embeddings are normally not nn.Linear and
+        # therefore never enter this loop).
+        #
+        # Both accessors are read defensively, for the same reason: skipping
+        # here is an OPTIMIZATION, never a correctness gate, so a profile that
+        # declares neither simply does the extra work. `model_profile` is a
+        # loosely-typed optional kwarg that duck-typed objects reach (see
+        # tests/test_incremental_measure_quant_cost.py), and a probe must not
+        # start refusing profiles over a field that only saves it work.
+        _embedding_decl = getattr(
+            self._name_projection.profile, "embedding_name", None)
+        _declared_embedding = (
+            str(_embedding_decl()) if _embedding_decl is not None else None)
         def _skip_fisher_name(qname: str) -> bool:
             checker = getattr(self.model_profile, "is_pinned_name", None)
             if checker is not None and checker(qname):
                 return True
-            return qname == "model.embed_tokens" or qname.endswith(".embed_tokens")
+            return qname == _declared_embedding
 
         # Detect MoE expert blocks for batched Fisher accumulation. A block
         # qualifies if its immediate children all expose w1/w2/w3 nn.Linear
@@ -1500,6 +2281,29 @@ class FisherAccumulator:
             if _skip_fisher_name(name):
                 self._fisher_skip.add(name)
             w = mod.weight
+            # Grouped-BMM operand (wo_a shape): route to the grouped
+            # accumulator BEFORE the dense registration below. Its stats
+            # entry carries `num_groups`; the flat-plane dims let every
+            # dense consumer (byte math, card validate, shape gates) read
+            # it unchanged.
+            num_groups = grouped_linear_groups(mod, self.model_profile)
+            if num_groups is not None:
+                self.stats[name] = grouped_linear_stats_entry(
+                    mod, num_groups,
+                    w_max_abs=None if w.is_meta else float(
+                        w.detach().abs().max().item()),
+                    w_norm_sq=None if w.is_meta else float(
+                        w.detach().pow(2).sum().item()),
+                )
+                self._h_full[name] = (
+                    None if w.is_meta
+                    else torch.zeros(int(w.shape[0]), int(w.shape[1]),
+                                     dtype=torch.float32, device=w.device))
+                self._fwd_handles.append(
+                    mod.register_forward_hook(self._make_fwd(name)))
+                self._bwd_handles.append(mod.register_full_backward_hook(
+                    self._make_grouped_bwd(name, num_groups)))
+                continue
             router_qname, eid = expert_info.get(name, (None, None))
             # Weights loaded under accelerate disk offload start on the
             # meta device and materialize lazily during forward. Defer
@@ -1544,6 +2348,7 @@ class FisherAccumulator:
                 model,
                 accumulator=self._packed_grad_acc,
                 channel_accumulator=self._h_packed_channel,
+                marginal_accumulator=self._packed_marginal_acc,
                 profile=self.model_profile,
             )
             for full_name, meta in packed_meta.items():
@@ -1553,10 +2358,14 @@ class FisherAccumulator:
                 # by layer).
                 experts_qname = meta.pop("_packed_experts_module")
                 meta.pop("_packed_param", None)
-                # Heuristic: include packed entry if any of its conjugate
-                # "in this same parent layer" Linears are tracked. This
-                # makes shard regexes (`model.layers.X.`) work cleanly.
-                parent_layer = ".".join(experts_qname.split(".")[:3])  # e.g. model.layers.7
+                # Include the packed entry iff its BLOCK has tracked
+                # Linears, so shard regexes (`model.layers.X.`) work
+                # cleanly. The block id comes from the shared name
+                # projection (decision_units.block_id_from_qname via
+                # NameProjection.block_id) — not a positional slice of
+                # the qname, which is only correct by accident when the
+                # layer prefix happens to be two components wide.
+                parent_layer = self._name_projection.block_id(experts_qname)
                 if any(t.startswith(parent_layer + ".") for t in self.tracked):
                     self.stats[full_name] = meta
                     # Register a forward hook on the experts module to
@@ -1589,6 +2398,95 @@ class FisherAccumulator:
                     self._fwd_handles.append(
                         experts_mod.register_forward_hook(_exp_fwd))
 
+    @staticmethod
+    def _dense_marginal_chunk(
+        gy2_sq: torch.Tensor,
+        x2_sq: torch.Tensor,
+        x2: torch.Tensor,
+        chunk_h: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Return the closed dense-schema marginals for one hook call."""
+        if x2.size(0) == 0:
+            act_absmax = torch.zeros(
+                x2.size(1), dtype=torch.float32, device=x2.device,
+            )
+        else:
+            act_absmax = torch.maximum(
+                x2.amax(dim=0).abs(), x2.amin(dim=0).abs(),
+            ).to(torch.float32)
+        return [
+            chunk_h.sum(dim=1, dtype=torch.float32),
+            chunk_h.sum(dim=0, dtype=torch.float32),
+            gy2_sq.sum(dim=0, dtype=torch.float32),
+            x2_sq.sum(dim=0, dtype=torch.float32),
+            act_absmax,
+        ]
+
+    def _accumulate_dense_marginals(
+        self,
+        name: str,
+        values: list[torch.Tensor],
+    ) -> None:
+        current = self._gpu_dense_marginals.get(name)
+        if current is None:
+            self._gpu_dense_marginals[name] = [
+                value.detach().clone() for value in values
+            ]
+            return
+        for key, dst, src in zip(
+            _DENSE_FISHER_MARGINAL_KEYS, current, values, strict=True,
+        ):
+            if key == "act_absmax":
+                torch.maximum(dst, src, out=dst)
+            else:
+                dst.add_(src)
+
+    def _flush_dense_marginals(self) -> None:
+        """Drain opt-in dense marginals once per device at finalization."""
+        if not self.emit_dense_marginals:
+            return
+
+        # A tracked Linear whose hook never fires must still carry the exact
+        # schema.  Zeros are identities for all sums and for max(|x|).
+        for name in self.tracked:
+            entry = self.stats.get(name)
+            if entry is None or "out_features" not in entry:
+                continue
+            out_features = int(entry["out_features"])
+            in_features = int(entry["in_features"])
+            entry.update({
+                "fisher_row": np.zeros(out_features, dtype=np.float32),
+                "fisher_col": np.zeros(in_features, dtype=np.float32),
+                "g_sq_sum": np.zeros(out_features, dtype=np.float32),
+                "act_sq_sum": np.zeros(in_features, dtype=np.float32),
+                "act_absmax": np.zeros(in_features, dtype=np.float32),
+            })
+
+        # A sensitivity model can span devices.  Batch all vectors resident on
+        # the same device into one transfer without assuming a single GPU.
+        by_device: dict[torch.device, list[tuple[str, list[torch.Tensor]]]] = (
+            defaultdict(list)
+        )
+        for name, values in self._gpu_dense_marginals.items():
+            by_device[values[0].device].append((name, values))
+        for device_entries in by_device.values():
+            host = torch.cat([
+                value.reshape(-1)
+                for _, values in device_entries
+                for value in values
+            ]).to("cpu")
+            offset = 0
+            for name, values in device_entries:
+                entry = self.stats.get(name)
+                for key, value in zip(
+                    _DENSE_FISHER_MARGINAL_KEYS, values, strict=True,
+                ):
+                    length = int(value.numel())
+                    if entry is not None:
+                        entry[key] = host[offset:offset + length].numpy().copy()
+                    offset += length
+        self._gpu_dense_marginals.clear()
+
     def _make_fwd(self, name: str):
         def hook(module, inp, out):
             x = inp[0] if isinstance(inp, tuple) else inp
@@ -1618,6 +2516,66 @@ class FisherAccumulator:
                         (idx.detach().to("cpu", dtype=torch.long) + base)
                     )
                     self._rows_got[name] += flat.size(0)
+        return hook
+
+    def _make_grouped_bwd(self, name: str, num_groups: int):
+        """Backward hook for a grouped-BMM operand (wo_a shape).
+
+        Same accumulators and same flush discipline as the dense
+        `_make_bwd` (device-resident 0-dim fp32 scalars, `h_full`,
+        per-token grad norms), but the reductions run through
+        `grouped_linear_fisher_chunk`, which keeps the group axis
+        explicit instead of flattening it into the token axis. Scalars
+        land in `self._gpu_h_trace` / `self._gpu_h_w2_sum`, so the
+        existing finalize() flush and the ONE global-token normalization
+        in `finalize_fisher_stats` apply unchanged."""
+        def hook(module, grad_input, grad_output):
+            # Fast skip: same contract as the dense hook.
+            if name in self._fisher_skip:
+                self._saved_inputs.pop(name, None)
+                return
+            gy = grad_output[0]
+            x = self._saved_inputs.pop(name, None)
+            if x is None or gy is None:
+                return
+            pieces = grouped_linear_fisher_chunk(
+                x, gy, num_groups, module.weight)
+            gpu_trace = self._gpu_h_trace.get(name)
+            if gpu_trace is None:
+                gpu_trace = torch.zeros(
+                    (), dtype=torch.float32, device=pieces["h_trace"].device)
+                self._gpu_h_trace[name] = gpu_trace
+            gpu_trace.add_(pieces["h_trace"])
+            w2 = pieces.get("h_w2")
+            if w2 is not None:
+                gpu_w2 = self._gpu_h_w2_sum.get(name)
+                if gpu_w2 is None:
+                    gpu_w2 = torch.zeros(
+                        (), dtype=torch.float32, device=w2.device)
+                    self._gpu_h_w2_sum[name] = gpu_w2
+                gpu_w2.add_(w2)
+            acc = self._h_full.get(name)
+            if acc is None:
+                acc = torch.zeros(
+                    int(pieces["chunk_flat"].shape[0]),
+                    int(pieces["chunk_flat"].shape[1]),
+                    dtype=torch.float32, device="cpu")
+                self._h_full[name] = acc
+            acc.add_(pieces["chunk_flat"].to(acc.device))
+            # Per-(token, group) grad-norm² rows: ‖gy_t,g‖²·‖x_t,g‖² —
+            # the plane-coordinate analog of the dense per-token vector,
+            # so h_detail reconstruction tooling reads it unchanged.
+            gy_sq = gy.detach().reshape(-1, num_groups, gy.shape[-1]).pow(2)
+            x_sq = x.detach().reshape(-1, num_groups, x.shape[-1]).pow(2)
+            pt = (gy_sq.sum(dim=-1) * x_sq.sum(dim=-1)).reshape(-1)
+            self._per_token_grad_norm.setdefault(name, []).append(
+                pt.detach().to("cpu", dtype=torch.float32))
+            # TOKENS, not token-group pairs: one token's group slices are
+            # one token's evidence. The normalization denominator is the
+            # global calibration count either way (`finalize_fisher_stats`);
+            # this field is metadata and must count what a dense row counts.
+            tokens = int(x.detach().numel()) // (num_groups * int(x.shape[-1]))
+            self.stats[name]["n_tokens_seen"] += tokens
         return hook
 
     def _make_moe_block_flush(self, block_name: str):
@@ -1760,19 +2718,33 @@ class FisherAccumulator:
             gy_norm_sq = gy2_sq.sum(dim=1)      # (T,)  = ‖gy_t‖²
             x_norm_sq = x2_sq.sum(dim=1)        # (T,)  = ‖x_t‖²
             per_token_grad_norm_sq = gy_norm_sq * x_norm_sq  # (T,) = ‖∇_t‖²_F
-            # Trace = Σ_t ‖∇_t‖²_F. Accumulate on GPU (0-dim tensor) to
-            # avoid the CUDA→CPU sync that .item() would force per call.
-            # Flushed to the Python scalar at finalize().
-            gpu_trace = self._gpu_h_trace.get(name)
-            if gpu_trace is None:
-                gpu_trace = torch.zeros((), dtype=torch.float32,
-                                        device=per_token_grad_norm_sq.device)
-                self._gpu_h_trace[name] = gpu_trace
-            gpu_trace.add_(per_token_grad_norm_sq.sum())
             # Per-weight diagonal accumulator: h_full[i,j] = Σ_t gy²_{t,i}·x²_{t,j}
             # Compute the matmul once, reuse for both the accumulator and the
             # weight-aware scalar proxy. (Earlier draft computed it twice.)
             chunk_h = gy2_sq.t() @ x2_sq        # (out, in)
+            if self.emit_dense_marginals:
+                self._accumulate_dense_marginals(
+                    name,
+                    self._dense_marginal_chunk(
+                        gy2_sq, x2_sq, x2, chunk_h,
+                    ),
+                )
+            # Trace = Σ_t ‖∇_t‖²_F.  In marginal mode use the same
+            # chunk_h reduction as fisher_row/fisher_col, matching the
+            # incremental producer's closed-schema wiring identity.  The
+            # ordinary path retains its existing per-token reduction exactly.
+            trace_chunk = (
+                chunk_h.sum(dtype=torch.float32)
+                if self.emit_dense_marginals
+                else per_token_grad_norm_sq.sum()
+            )
+            gpu_trace = self._gpu_h_trace.get(name)
+            if gpu_trace is None:
+                gpu_trace = torch.zeros(
+                    (), dtype=torch.float32, device=trace_chunk.device,
+                )
+                self._gpu_h_trace[name] = gpu_trace
+            gpu_trace.add_(trace_chunk)
             acc = self._h_full.get(name)
             if acc is None:
                 # Deferred allocation for disk-offloaded Linears (CPU-resident
@@ -1806,7 +2778,7 @@ class FisherAccumulator:
             self.stats[name]["n_tokens_seen"] += T
         return hook
 
-    def finalize(self, tracker: RouterTracker | None):
+    def finalize(self, tracker: RouterTracker | None, global_tokens: int):
         # Flush GPU-resident scalar accumulators (h_trace, h_w2_sum) into
         # the stats dict. Single sync per Linear here costs one CUDA stall
         # per name, vs. thousands during the backward sweep without it.
@@ -1816,6 +2788,7 @@ class FisherAccumulator:
         for nm, gpu_t in self._gpu_h_w2_sum.items():
             if nm in self.stats:
                 self.stats[nm]["h_w2_sum_raw"] += float(gpu_t.item())
+        self._flush_dense_marginals()
         # Flush packed-expert grad-norm accumulator into stats h_trace_raw.
         # The packed accumulator key matches the stats key by construction
         # (full param name `<experts_qname>.<param_name>`).
@@ -1824,6 +2797,13 @@ class FisherAccumulator:
                 self.stats[full_name]["h_trace_raw"] += float(raw)
                 self.stats[full_name]["n_tokens_seen"] = int(
                     self._packed_sample_count.get(full_name, 0))
+        for full_name, slot in self._packed_marginal_acc.items():
+            entry = self.stats.get(full_name)
+            if entry is None:
+                continue
+            for key, tensor in slot.items():
+                entry[key] = tensor.detach().to("cpu").numpy().astype(
+                    np.float64 if key == "expert_tokens" else np.float32)
 
         if tracker is not None:
             for name, s in self.stats.items():
@@ -1832,18 +2812,22 @@ class FisherAccumulator:
                         s["router_path"], s["expert_id"])
 
         # Single normalization convention (matches incremental_probe, the
-        # production backend): divide by the tokens this entry actually
-        # saw. For unpacked expert Linears `n_tokens_seen` counts ROUTED
-        # tokens, so this is already the per-routed-token mean — i.e. the
-        # one implicit ÷token-fraction the MoE convention prescribes.
-        # A second explicit ÷route_prob (removed here; audit M4) made
-        # this backend disagree with incremental_probe by ~1/p_e and
-        # overweighted sparse-expert rows in the same knapsack.
+        # production backend): ONE shared denominator for every row — the
+        # GLOBAL calibration token count.
+        #
+        # HISTORY: this deliberately reverses the per-`n_tokens_seen`
+        # division that audit M4 documented as "the one implicit
+        # ÷token-fraction the MoE convention prescribes" (the explicit
+        # ÷route_prob was removed then precisely because the implicit
+        # per-routed-token division already applied it). That reading was
+        # wrong for the mean-Δloss objective: tokens never routed to an
+        # expert contribute zero gradient, so dividing an unpacked expert
+        # row by its ROUTED count inflates it by (global/routed) — the
+        # very 1/p_e overweighting M4 set out to remove, merely implicit.
+        # See finalize_fisher_stats for the full derivation + history.
         # `route_prob` stays in the stats as metadata only.
-        for s in self.stats.values():
-            tokens = max(s["n_tokens_seen"], 1)
-            s["h_trace"] = s["h_trace_raw"] / tokens
-            s["h_w2_sum"] = s["h_w2_sum_raw"] / tokens
+        global_tokens = max(int(global_tokens), 1)
+        finalize_fisher_stats(self.stats, global_tokens)
 
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1884,11 +2868,14 @@ class FisherAccumulator:
             for name, acc in self._h_full.items():
                 if name not in self.stats:
                     continue
-                tokens = max(self.stats[name]["n_tokens_seen"], 1)
-                # Same normalization as the scalar trace: per (routed)
-                # token only. (A pre-v3 revision additionally divided
-                # expert entries by route_prob — audit M4; such h-detail
-                # dirs are in different units and must be regenerated.)
+                # Same denominator as the scalar trace: the GLOBAL calib
+                # token count (v4). A v3-era revision divided by this
+                # row's own n_tokens_seen — per-ROUTED-token for unpacked
+                # expert Linears, (global/routed)× hotter than the scalar
+                # — and a pre-v3 revision additionally divided expert
+                # entries by route_prob (audit M4). h-detail dirs from
+                # either era are in different units on expert rows and
+                # must be regenerated.
                 #
                 # Per-token gradient² (g²_t) — concatenate the chunk vectors
                 # collected during the hook. This is the per-token Fisher
@@ -1899,21 +2886,22 @@ class FisherAccumulator:
                                 else torch.empty(0, dtype=torch.float32))
                 fname = sub.sub("__", name) + ".pt"
                 torch.save(
-                    h_detail_blob(acc, tokens, name, kind="linear",
+                    h_detail_blob(acc, global_tokens, name, kind="linear",
                                   g2_per_token=g2_per_token),
                     self.h_detail_dir / fname)
                 self.stats[name]["h_detail_path"] = fname
             for full_name, ch in self._h_packed_channel.items():
                 if full_name not in self.stats:
                     continue
-                tokens = max(self.stats[full_name]["n_tokens_seen"], 1)
                 # Packed experts don't carry a router_path — routing is
                 # baked into the Fisher signal via how often each expert
-                # was selected. Normalize by token count only. (The
-                # channel accumulator may be device-resident; h_detail_blob
-                # lands it on CPU for the saved blob.)
+                # was selected. Normalize by the global token count, same
+                # as the scalar. (The channel accumulator may be
+                # device-resident; h_detail_blob lands it on CPU for the
+                # saved blob.)
                 fname = sub.sub("__", full_name) + ".pt"
-                torch.save(h_detail_blob(ch, tokens, full_name, kind="packed"),
+                torch.save(h_detail_blob(ch, global_tokens, full_name,
+                                         kind="packed"),
                            self.h_detail_dir / fname)
                 self.stats[full_name]["h_detail_path"] = fname
 
@@ -1931,13 +2919,67 @@ class FisherAccumulator:
 def load_calibration(tokenizer, source: str, n_samples: int,
                      seqlen: int, *, calib_seed: int = 42) -> torch.Tensor:
     """Load calibration from a HuggingFace dataset id, a local .jsonl, or
-    a local .txt file. JSONL rows can have either {"text": ...} or
+    a local .txt file. Extensionless regular files are content-sniffed so a
+    bind-mounted JSONL at a canonical container path such as ``/dataset``
+    remains local. JSONL rows can have either {"text": ...} or
     {"messages": [...]} for chat-style data.
     """
     import os
 
+    # A local-file source that does not exist must NOT fall through to the
+    # HuggingFace loader. It used to: the `.jsonl`/`.txt` branches were guarded
+    # by os.path.exists, so a missing file skipped to the generic `else` and
+    # HF reported `Dataset '/home/.../diverse-v1.jsonl' doesn't exist on the
+    # Hub` -- an error that names a filesystem path as a dataset id and sends
+    # the reader looking for something to download. Nothing is downloadable;
+    # the file is simply absent.
+    if (source.endswith((".jsonl", ".txt")) or os.sep in source) \
+            and not os.path.exists(source):
+        raise FileNotFoundError(
+            f"calibration file not found: {source}\n"
+            "This is a local path, not a HuggingFace dataset id, so there is "
+            "nothing to download. Either:\n"
+            "  * build the default corpus:  python tools/"
+            "build_diverse_calibration.py --output <path> --tokenizer <model>\n"
+            "  * point DATASET at your own .jsonl ({\"text\": ...} or "
+            "{\"messages\": [...]} rows) or .txt (one sample per line)\n"
+            "  * point DATASET at a HuggingFace dataset id "
+            "(e.g. ultrachat_200k)"
+        )
+
+    local_kind: str | None = None
+    if source.endswith(".jsonl") and os.path.isfile(source):
+        local_kind = "jsonl"
+    elif source.endswith(".txt") and os.path.isfile(source):
+        local_kind = "txt"
+    elif (
+        os.path.isfile(source)
+        and not os.path.splitext(os.path.basename(source))[1]
+    ):
+        # Docker commonly mounts one host file at a path-neutral canonical
+        # name.  Do not reinterpret that existing regular file as a Hub
+        # dataset merely because the container target has no suffix.  Sniff
+        # only extensionless files; known alternate local formats retain the
+        # generic datasets-loader behavior they had before this contract.
+        first_nonempty = ""
+        with open(source) as handle:
+            for line in handle:
+                if line.strip():
+                    first_nonempty = line
+                    break
+        try:
+            first_value = json.loads(first_nonempty)
+        except (json.JSONDecodeError, TypeError):
+            first_value = None
+        local_kind = (
+            "jsonl"
+            if isinstance(first_value, dict)
+            and ("text" in first_value or "messages" in first_value)
+            else "txt"
+        )
+
     texts: list[str] = []
-    if source.endswith(".jsonl") and os.path.exists(source):
+    if local_kind == "jsonl":
         with open(source) as f:
             for line in f:
                 if not line.strip():
@@ -1962,7 +3004,7 @@ def load_calibration(tokenizer, source: str, n_samples: int,
                             texts.append("\n\n".join(parts))
                 elif "text" in obj:
                     texts.append(obj["text"])
-    elif source.endswith(".txt") and os.path.exists(source):
+    elif local_kind == "txt":
         with open(source) as f:
             texts = [ln.strip() for ln in f if ln.strip()]
     elif source == "ultrachat_200k":
@@ -2272,7 +3314,11 @@ def run_probe_pass(model: nn.Module,
         del out, loss, ids, embed, logits
         acc._saved_inputs.clear()
 
-    acc.finalize(tracker)
+    # Global calib token count — must equal the meta nsamples×seqlen
+    # product below so the allocator's load-time renormalization is
+    # idempotent on probes written by this finalize.
+    fisher_norm_tokens = int(calib.size(0)) * int(seqlen)
+    acc.finalize(tracker, fisher_norm_tokens)
     acc.remove_hooks()
     if tracker is not None:
         tracker.remove_hooks()
@@ -2293,6 +3339,7 @@ def run_probe_pass(model: nn.Module,
                 "dataset": dataset_name,
                 "nsamples": calib.size(0),
                 "seqlen": seqlen,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": dtype_name,
                 "device_map": str(load_device_map),
                 "execution_device": str(exec_device),
@@ -2486,7 +3533,13 @@ def run_multimodal_visual_probe_pass(
         del out, loss, logits
         acc._saved_inputs.clear()
 
-    acc.finalize(tracker)
+    # Global calib token budget. Multimodal samples vary in real token
+    # count, so nsamples×max_text_len is an upper bound — but it is ONE
+    # shared constant across every row (relative Fisher is what the
+    # knapsack prices) and it matches the meta nsamples×seqlen product
+    # the allocator renormalizes by, keeping that recompute idempotent.
+    fisher_norm_tokens = max(int(len(triples)) * int(max_text_len), 1)
+    acc.finalize(tracker, fisher_norm_tokens)
     acc.remove_hooks()
     if tracker is not None:
         tracker.remove_hooks()
@@ -2507,6 +3560,7 @@ def run_multimodal_visual_probe_pass(
                 "dataset": dataset_name,
                 "nsamples": len(triples),
                 "seqlen": max_text_len,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": str(dtype),
                 "device_map": requested_device,
                 "execution_device": str(exec_device),
@@ -2582,7 +3636,11 @@ def run_streaming_multimodal_visual_probe_pass(
         _compute_attention_mask,
         _compute_position_embeddings,
     )
-    from .model_profiles import DefaultProfile, profile_from_model
+    from .model_profiles import (
+        DeadVendoredOverrideError,
+        DefaultProfile,
+        profile_from_model,
+    )
     from .streaming_model import _build_streaming_context
 
     try:
@@ -2637,6 +3695,12 @@ def run_streaming_multimodal_visual_probe_pass(
     visual_prefix = ctx.visual_prefix or ""
     try:
         model_profile = profile_from_model(model)
+    except DeadVendoredOverrideError:
+        # `DefaultProfile()` is the answer for an architecture this build does
+        # not know. On a dead override the build DOES know it, and probing the
+        # visual tower under a default profile records Fisher statistics for a
+        # model assembled from upstream modelling code (#202).
+        raise
     except Exception:
         model_profile = DefaultProfile()
 
@@ -2732,6 +3796,11 @@ def run_streaming_multimodal_visual_probe_pass(
     prefetch_depth = 3
     total_fwd = total_bwd = 0.0
     successes = 0
+    # KV-cotangent path (on by default): route the Fisher cotangent of borrowed
+    # cross-layer state back to the layer that produced it. `=0` restores the
+    # severed-cotangent behavior for an A/B, and makes the KV-sharing Fisher
+    # guard fail loud again (`incremental_probe.kv_shared_fisher_block_reason`).
+    kv_cotangent_path = kv_cotangent_path_enabled()
 
     for i, sample in enumerate(triples):
         # Move inputs to device, casting pixel_values to dtype.
@@ -2788,7 +3857,7 @@ def run_streaming_multimodal_visual_probe_pass(
             causal_mask = _compute_attention_mask(
                 base_model, inputs_embeds, position_ids)
             position_embeddings = _compute_position_embeddings(
-                base_model, inputs_embeds, position_ids)
+                base_model, inputs_embeds, position_ids, model_profile)
             pass_state = model_profile.new_forward_pass_state()
 
             activations_cpu: list[torch.Tensor] = [inputs_embeds.detach().cpu()]
@@ -2843,6 +3912,10 @@ def run_streaming_multimodal_visual_probe_pass(
 
             # ---- Phase 3: streaming reverse sweep ----------------------
             grad_out = grad_at_tail
+            # KV-cotangent path, scoped to THIS sample's sweep: a fresh
+            # accumulator per pass, exactly like the shared state it mirrors,
+            # so sample N never seeds sample N-1's cotangent.
+            kv_cotangents = SharedStateCotangents(enabled=kv_cotangent_path)
             for d in range(prefetch_depth):
                 ctx.schedule_prefetch(num_layers - 1 - d)
             for L in reversed(range(num_layers)):
@@ -2860,12 +3933,26 @@ def run_streaming_multimodal_visual_probe_pass(
                         input_ids=input_ids,
                         captured_pass_state=shared_pass_state,
                         layer=layers[L],
+                        cotangents=kv_cotangents,
                     ),
                 )
-                out.backward(grad_out)
+                # Drive the backward with this layer's output cotangent AND
+                # the cotangent its consumers accumulated on the shared state
+                # it produced. One backward, so each Linear's hook still fires
+                # once with the summed gy.
+                kv_roots, kv_grads = kv_cotangents.produced_roots()
+                if kv_roots:
+                    torch.autograd.backward([out, *kv_roots],
+                                            [grad_out, *kv_grads])
+                else:
+                    out.backward(grad_out)
+                kv_cotangents.harvest()
                 grad_out = x_in.grad.detach().clone()
                 ctx.unload(L)
                 del x_in, out
+            if kv_cotangents.pending_keys():
+                print(f"[probe/mm-stream] sample {i}: "
+                      f"{kv_cotangents.summary()}", flush=True)
 
             total_fwd += (time.time() - t0)
 
@@ -2898,7 +3985,11 @@ def run_streaming_multimodal_visual_probe_pass(
                   f"fwd_avg={total_fwd / max(successes, 1):.2f}s "
                   f"bwd_avg={total_bwd / max(successes, 1):.2f}s", flush=True)
 
-    acc.finalize(tracker)
+    # Same convention as the non-streaming multimodal pass: an upper-bound
+    # but SHARED global token constant, equal to the meta nsamples×seqlen
+    # product so the allocator's renormalization is idempotent.
+    fisher_norm_tokens = max(int(successes) * int(max_text_len), 1)
+    acc.finalize(tracker, fisher_norm_tokens)
     acc.remove_hooks()
     if tracker is not None:
         tracker.remove_hooks()
@@ -2919,6 +4010,7 @@ def run_streaming_multimodal_visual_probe_pass(
                 "dataset": dataset_name,
                 "nsamples": successes,
                 "seqlen": max_text_len,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": str(dtype),
                 "device_map": requested_device,
                 "execution_device": str(device),

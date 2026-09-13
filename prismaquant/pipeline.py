@@ -1,15 +1,17 @@
 """Typed pipeline, artifact, resource, and gate contracts.
 
-This module is intentionally descriptive first.  It lets existing PrismaQuant
-stages advertise their inputs, outputs, gates, and cache ownership without
-replacing the production implementations.  Execution stays in the current
-GPU-bound probe/cache/export paths until call sites opt into these contracts.
+This module is descriptive about stage *shape* and authoritative about one
+thing: **which settings each build artifact's identity is keyed on** (re-vet
+R5).  ``run-pipeline.sh`` executes; this module decides what a reuse of
+``cost.pkl`` (or a 90 GB production cache) is allowed to mean.  Everything
+else here — the artifact/stage/gate declarations — remains a documented view
+of the production flow, not an executor (re-vet R23: no python port).
 """
 from __future__ import annotations
 
-import math
 import argparse
 import json
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,12 +20,635 @@ from typing import Any
 
 APPROVED_RESOURCE_OWNERS: dict[str, frozenset[str]] = {
     "rendered_weights": frozenset({"ProductionWeightCache"}),
-    "perturbed_activations": frozenset({
-        "PerturbedActivationCache",
-        "StreamingActivationCache",
-    }),
-    "streaming_model_weights": frozenset({"StreamingModelPrefetch"}),
+    "perturbed_activations": frozenset({"PerturbedActivationCache"}),
+    # layer_streaming.LayerCache is the real streaming-weight owner
+    # (`class LayerCache` in layer_streaming.py; the cite carried a line
+    # number that had already drifted). The former placeholder names
+    # (StreamingActivationCache / StreamingModelPrefetch) were never
+    # implemented anywhere in the tree and were deleted with re-vet R5/D10.
+    "streaming_model_weights": frozenset({"LayerCache"}),
 }
+
+
+# ``validate_assignments_kl --assignment-materialization=hooks`` keeps the
+# source model and every Pareto assignment's rendered weights in one process.
+# That is fast on small dense checkpoints, but it is not a safe production
+# plan once the checkpoint reaches the 35B class (and routed-MoE models hit the
+# same limit earlier because their packed expert state is especially wide).
+# Keep the threshold decimal, matching public model-size names.
+FRONTIER_HOOKS_MAX_PARAMETERS = 35_000_000_000
+
+
+def _model_config_for_frontier_policy(model_path: str | Path) -> Mapping[str, Any]:
+    path = Path(model_path) / "config.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read model config {path}: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"model config {path} is not a JSON object")
+    return payload
+
+
+def _config_declares_moe(value: object) -> bool:
+    """Conservatively identify routed-expert model configuration.
+
+    Model families do not share one expert-count spelling.  A positive or
+    otherwise non-empty configuration field containing ``expert`` is enough
+    to require the memory-fit path; false positives only choose the safer
+    materializer, while a false negative can OOM-kill a production host.
+    Architecture/model-type names containing ``moe`` are an independent
+    signal for configs whose expert details live in a nested text config.
+    """
+
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key).lower()
+            if key in {"architectures", "model_type"}:
+                names = item if isinstance(item, list) else [item]
+                if any("moe" in str(name).lower() for name in names):
+                    return True
+            if "expert" in key:
+                if isinstance(item, bool):
+                    if item:
+                        return True
+                elif isinstance(item, (int, float)):
+                    if item > 0:
+                        return True
+                elif isinstance(item, str):
+                    if item.strip() and item.strip().lower() not in {
+                        "none",
+                        "null",
+                        "false",
+                        "0",
+                    }:
+                        return True
+                elif item:
+                    return True
+            if _config_declares_moe(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_config_declares_moe(item) for item in value)
+    return False
+
+
+def _safe_model_member(root: Path, relative: str) -> Path:
+    if not relative or Path(relative).is_absolute():
+        raise ValueError(f"unsafe safetensors shard path {relative!r}")
+    base = root.resolve(strict=True)
+    path = (base / relative).resolve(strict=True)
+    if path != base and base not in path.parents:
+        raise ValueError(f"safetensors shard escapes model root: {relative!r}")
+    if not path.is_file():
+        raise ValueError(f"safetensors shard is not a file: {path}")
+    return path
+
+
+def _safetensors_shards(model_path: str | Path) -> tuple[Path, ...]:
+    root = Path(model_path)
+    index_path = root / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"cannot read safetensors index {index_path}: {exc}"
+            ) from exc
+        weight_map = index.get("weight_map") if isinstance(index, Mapping) else None
+        if not isinstance(weight_map, Mapping) or not weight_map:
+            raise ValueError(f"safetensors index has no weight_map: {index_path}")
+        names = sorted({str(name) for name in weight_map.values()})
+        return tuple(_safe_model_member(root, name) for name in names)
+
+    shards = tuple(sorted(root.glob("*.safetensors")))
+    if not shards:
+        raise ValueError(f"model has no safetensors shards: {root}")
+    return tuple(_safe_model_member(root, shard.name) for shard in shards)
+
+
+def _safetensors_parameter_count(model_path: str | Path) -> int:
+    """Count checkpoint parameters from headers without opening tensor data."""
+
+    total = 0
+    for shard in _safetensors_shards(model_path):
+        try:
+            with shard.open("rb") as handle:
+                header_size = int.from_bytes(handle.read(8), "little")
+                if not 0 < header_size <= 512 * 1024 * 1024:
+                    raise ValueError(
+                        f"implausible safetensors header size {header_size}"
+                    )
+                raw_header = handle.read(header_size)
+            if len(raw_header) != header_size:
+                raise ValueError("truncated safetensors header")
+            header = json.loads(raw_header)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"cannot inspect safetensors shard {shard}: {exc}") from exc
+        if not isinstance(header, Mapping):
+            raise ValueError(f"safetensors header is not an object: {shard}")
+        for name, metadata in header.items():
+            if name == "__metadata__":
+                continue
+            if not isinstance(metadata, Mapping):
+                raise ValueError(f"malformed tensor metadata for {name!r} in {shard}")
+            shape = metadata.get("shape")
+            if (
+                not isinstance(shape, list)
+                or any(type(dim) is not int or dim < 0 for dim in shape)
+            ):
+                raise ValueError(f"malformed tensor shape for {name!r} in {shard}")
+            total += math.prod(shape)
+    if total <= 0:
+        raise ValueError("safetensors headers contain no positive-size parameters")
+    return total
+
+
+def frontier_materialization_policy(model_path: str | Path) -> dict[str, Any]:
+    """Return the fail-closed hooks/inplace policy for one source checkpoint."""
+
+    config = _model_config_for_frontier_policy(model_path)
+    is_moe = _config_declares_moe(config)
+    parameters = _safetensors_parameter_count(model_path)
+    reasons: list[str] = []
+    if is_moe:
+        reasons.append("model config declares routed experts")
+    if parameters >= FRONTIER_HOOKS_MAX_PARAMETERS:
+        reasons.append(
+            f"checkpoint has {parameters:,} parameters "
+            f"(threshold {FRONTIER_HOOKS_MAX_PARAMETERS:,})"
+        )
+    return {
+        "model_path": str(Path(model_path).resolve(strict=False)),
+        "parameters": parameters,
+        "is_moe": is_moe,
+        "requires_inplace": bool(reasons),
+        "reasons": reasons,
+    }
+
+
+def check_frontier_materialization(model_path: str | Path, mode: str) -> tuple[int, str]:
+    """Validate one requested frontier materializer without touching weights."""
+
+    normalized = str(mode).strip().lower()
+    if normalized not in {"hooks", "inplace"}:
+        return 2, "VALIDATED_FRONTIER_MATERIALIZATION must be hooks or inplace"
+    if normalized == "inplace":
+        return 0, "validated-frontier materialization=inplace (memory-fit path)"
+    try:
+        policy = frontier_materialization_policy(model_path)
+    except (OSError, ValueError) as exc:
+        return 2, (
+            "cannot prove that hooks materialization is safe; use "
+            f"VALIDATED_FRONTIER_MATERIALIZATION=inplace: {exc}"
+        )
+    if policy["requires_inplace"]:
+        return 2, (
+            "hooks materialization is refused for this production model; use "
+            "VALIDATED_FRONTIER_MATERIALIZATION=inplace: "
+            + "; ".join(str(reason) for reason in policy["reasons"])
+        )
+    return 0, (
+        "validated-frontier materialization=hooks admitted for proven dense "
+        f"checkpoint below 35B ({int(policy['parameters']):,} parameters)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Settings-hash authority (re-vet R5 / debt D6).
+#
+# `run-pipeline.sh`'s `require_stage_settings` used to hand-pass `k=v` pairs at
+# each call site, which meant every new stage arrived with its own opinion of
+# what keys its artifact depends on — and ten stages arrived with none at all.
+# The key SET now lives here, in one reviewable table, and the shell only
+# supplies values.
+#
+# Declaring a key means "a change to this setting makes the stored artifact a
+# DIFFERENT artifact". Over-keying is the named risk: hashing a setting an
+# artifact does not depend on forces a spurious rebuild, and some of these
+# artifacts are 90 GB. The rule used below: key an artifact on the inputs that
+# change its BYTES, and key expensive artifacts conservatively.
+#
+# Each entry is (manifest_key, settings_source). They differ where a stage
+# historically recorded a short manifest key (`NS`) for a specific setting
+# (`PRODUCTION_RENDER_COST_NSAMPLES`); keeping the historical manifest key
+# means artifacts built before R5 stay valid instead of forcing a rebuild.
+# ---------------------------------------------------------------------------
+
+STAGE_SETTINGS_SCHEMA = "prismaquant.stage_settings/1"
+STAGE_MANIFEST_SCHEMA = "prismaquant.stage_settings_manifest/2"
+
+# Render-affecting environment, shared by every artifact that stores rendered
+# weights. Mirrors RENDER_ENV_SETTINGS in run-pipeline.sh.
+_RENDER_SETTINGS: tuple[str, ...] = (
+    "PRISMAQUANT_NVFP4_SCALE_RULE",
+    "PRISMAQUANT_GPTQ_DAMP_SWEEP",
+    "PRISMAQUANT_GPTQ_DAMP",
+    "PRISMAQUANT_ACT_CLIP_QUANTILE",
+    "PRODUCTION_CACHE_LEVERS",
+    "PRODUCTION_CACHE_DISABLE_LEVERS",
+)
+
+# Every CB producer choice below changes either the fitted/assigned values or
+# their byte layout. Persisted cost/render artifacts must invalidate on any
+# change, including assignment-only LDLQ even though serving stays unchanged.
+_CB_SERIALIZATION_SETTINGS: tuple[str, ...] = (
+    "CB_SCALE_CODING",
+    "CB_CODEBOOK_SOURCE",
+    "CB_CODEBOOK_SOURCE_SCOPE",
+    "CB_CODEBOOK_BUNDLE",
+    "CB_ROUTED_MOE_BOOK_SELECTION_SHA256",
+    "CB_SCALE_SWEEP",
+    "CB_SCALE_SWEEP_SCOPE",
+    # The strict FP8-only lane selects the existing no-activation payload
+    # schema.  Reusing a cache produced under the historical NVFP4 activation
+    # contract would make its stamped bytes disagree with export.
+    "CB_ACTIVATION_SCOPE",
+    # Probe marginals cover the full calibration corpus; activation-cache
+    # rows are intentionally capped.  They are different render inputs even
+    # when MODEL_PATH/DATASET/NSAMPLES/SEQLEN are identical.
+    "CB_IMATRIX_SOURCE",
+    "PRISMAQUANT_CB_LDLQ",
+    "PRISMAQUANT_CB_MINCHAIN",
+    "PRISMAQUANT_CB_MINCHAIN_ANCHORS",
+    "PRISMAQUANT_CB_MINCHAIN_HOLDBACKS",
+    "PRISMAQUANT_CB_MINCHAIN_AUDIT_SEED",
+    "PRISMAQUANT_CB_MINCHAIN_BACKSTOP",
+    "PRISMAQUANT_CB_MINCHAIN_AUDIT_MEDIAN",
+    "PRISMAQUANT_CB_MINCHAIN_AUDIT_P95",
+    "PRISMAQUANT_CB_ENCODE_TIER",
+)
+
+# A head policy changes both the qname census rendered into a menu cache and
+# whether AURA measures that row or the hybrid cost backfills it. Keep these
+# axes on every persisted cost/cache stage that can contain lm_head.
+_HEAD_SETTINGS: tuple[str, ...] = (
+    "LM_HEAD_FORMAT",
+    "LM_HEAD_RENDER_ACTIVE",
+    "LM_HEAD_DP_UNPINNED",
+)
+
+# Scoped Tessera exports carry explicit runtime input in the plan identity.
+# These fields are absent from legacy unscoped manifests, preserving reuse of
+# existing plans. The endpoint, not this projection, refuses incomplete input.
+_TESSERA_SCOPE_SETTINGS: tuple[str, ...] = (
+    "TESSERA_PLATFORM", "TESSERA_RUNTIME_IMAGE", "TESSERA_EXECUTION_MODE",
+    "TESSERA_RESIDENCY", "TESSERA_TARGET_PROFILE",
+)
+
+
+def _key_pairs(*specs: str) -> tuple[tuple[str, str], ...]:
+    """``"NS<-PRODUCTION_RENDER_COST_NSAMPLES"`` -> ``("NS", "PRODUCTION_…")``."""
+    out: list[tuple[str, str]] = []
+    for spec in specs:
+        if "<-" in spec:
+            manifest_key, source = spec.split("<-", 1)
+            out.append((manifest_key.strip(), source.strip()))
+        else:
+            out.append((spec.strip(), spec.strip()))
+    return tuple(out)
+
+
+STAGE_SETTINGS_KEYS: dict[str, tuple[tuple[str, str], ...]] = {
+    # --- probe / cost ------------------------------------------------------
+    # The Fisher trace is a function of (model, calibration corpus, window
+    # count/length, modality). NOT of FORMATS: the probe is format-blind.
+    "probe": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "CALIBRATION_MODALITY",
+    ),
+    # Per-(Linear, format) baseline error. Adds FORMATS; drops modality
+    # (the cost stage reads the probe's activation cache, whose modality the
+    # probe guard already pins).
+    "base-cost": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
+        "FORMATS<-COST_FORMATS", *_HEAD_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    # production-render-score: the rendered format-menu cache the score reads.
+    "render-cost-cache": _key_pairs(
+        "MODEL_PATH", "DATASET", "FORMATS<-COST_FORMATS",
+        "NS<-PRODUCTION_RENDER_COST_NSAMPLES",
+        "SL<-PRODUCTION_RENDER_COST_SEQLEN",
+        "SEED<-PRODUCTION_RENDER_COST_SEED",
+        *_HEAD_SETTINGS,
+        *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    # …and the allocator cost table synthesized from it. Cheap to rebuild, so
+    # it carries the score field and the require-flags too.
+    "render-cost": _key_pairs(
+        "MODEL_PATH", "FORMATS<-COST_FORMATS", "COST_MODE",
+        "SCORE_FIELD<-PRODUCTION_RENDER_COST_SCORE_FIELD",
+        "REQUIRE_SCORES<-PRODUCTION_RENDER_COST_REQUIRE_SCORES",
+        "REQUIRE_OUTPUT<-PRODUCTION_RENDER_COST_REQUIRE_OUTPUT",
+        *_HEAD_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    # AURA dW cache. FORMATS is the derived non-BF16 menu (AURA_CACHE_FORMATS);
+    # SELECTION_MODE is keyed because validated-surrogate redirects this cache
+    # to the frontier path and renders packed experts into it.
+    "aura-dw-cache": _key_pairs(
+        "MODEL_PATH", "DATASET",
+        "FORMATS<-AURA_CACHE_FORMATS",
+        "NS<-NSAMPLES", "SL<-SEQLEN", "SELECTION_MODE",
+        *_HEAD_SETTINGS,
+        *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    "aura-cost": _key_pairs(
+        "MODEL_PATH", "DATASET", "FORMATS<-COST_FORMATS", "COST_MODE",
+        "NPROBES<-AURA_COST_NPROBES",
+        "NS<-AURA_COST_NSAMPLES",
+        "SL<-AURA_COST_SEQLEN",
+        "SEED<-AURA_COST_CALIB_SEED",
+        "DTYPE<-AURA_COST_DTYPE",
+        "AURA_COST_STREAMING",
+        "AURA_COST_CHECKPOINT_DIR",
+        *_HEAD_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    "aura-hybrid-cost": _key_pairs(
+        "MODEL_PATH", "DATASET", "FORMATS<-COST_FORMATS", "COST_MODE",
+        "EXPERT_NS<-AURA_EXPERT_NSAMPLES",
+        "EXPERT_SL<-AURA_EXPERT_SEQLEN",
+        # When streamed AURA is enabled, the empirical routed-expert tail is
+        # streamed and resumed too.  Its checkpoint path is the deterministic
+        # ``expert-empirical-cost`` child of AURA_COST_CHECKPOINT_DIR, so these
+        # two inputs fully bind that resume identity without a second knob.
+        "AURA_COST_STREAMING",
+        "AURA_COST_CHECKPOINT_DIR",
+        *_HEAD_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    # --- CB lane -----------------------------------------------------------
+    # The imatrix harvest reads the probe's activation cache; key it on what
+    # produced that cache. Minutes to rebuild, so keying is generous.
+    "cb-col-weights": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "ACTIVATION_ROWS_LIMIT",
+        "CB_IMATRIX_SOURCE",
+    ),
+    "cb-learned-bundle": _key_pairs(
+        "MODEL_PATH", "FORMATS", "CB_CODEBOOK_SOURCE_SCOPE",
+        "CB_CODEBOOK_BUNDLE", "CB_COL_WEIGHTS_SHA256",
+        "CB_ROUTED_MOE_BOOK_SELECTION_SHA256",
+        "CB_ROUTED_BOOK_KEYING",
+        "CB_LEARNED_TRAINER_VERSION",
+        "CB_LEARNED_PROMOTION_RECEIPT_SHA256",
+        "CB_LEARNED_SOURCE_MODEL_IDENTITY_SHA256",
+    ),
+    "cb-hybrid-cost": _key_pairs(
+        "MODEL_PATH", "FORMATS", "COST_MODE",
+        "EXPERT_NS<-CB_EXPERT_NSAMPLES",
+        "EXPERT_SL<-CB_EXPERT_SEQLEN",
+        "EXPERT_SAMPLE<-CB_EXPERT_SAMPLE",
+        "LADDER_INTERP<-CB_LADDER_INTERP",
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    # --- production caches -------------------------------------------------
+    "frontier-cache": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
+        "FORMATS<-CACHE_FORMATS",
+        *_HEAD_SETTINGS,
+        *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    "frontier-recache": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
+        *_HEAD_SETTINGS,
+        *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    "production-cache-recached": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN", "FORMATS", "TARGET_BITS",
+        "ASSIGNMENT_DIGEST",
+        *_HEAD_SETTINGS,
+        *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    "production-cache-raw": _key_pairs(
+        "MODEL_PATH", "DATASET", "NSAMPLES", "SEQLEN",
+        "FORMATS<-CACHE_FORMATS", "ASSIGNMENT_DIGEST",
+        "RENDER_SCOPE<-PRODUCTION_CACHE_RENDER_SCOPE",
+        *_HEAD_SETTINGS,
+        *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    # --- validated frontier ------------------------------------------------
+    # One JSON per Pareto point; the point's identity is in the filename, so
+    # the manifest keys the measurement conditions and the render env behind
+    # the weights being measured.
+    "frontier-kl-point": _key_pairs(
+        "MODEL_PATH", "FORMATS",
+        "DATASET<-VALIDATED_FRONTIER_DATASET",
+        "NS<-VALIDATED_FRONTIER_NSAMPLES",
+        "SL<-VALIDATED_FRONTIER_SEQLEN",
+        "REPEATS<-VALIDATED_FRONTIER_CALIB_REPEATS",
+        "SKIP_CALIB<-VALIDATED_FRONTIER_CALIB_SKIP_FIRST",
+        "KL_SCOPE<-VALIDATED_FRONTIER_KL_SCOPE",
+        *_RENDER_SETTINGS,
+        *_CB_SERIALIZATION_SETTINGS,
+    ),
+    # --- GGUF lane ---------------------------------------------------------
+    # llama.cpp's converter reads only the checkpoint.
+    "gguf-skeleton": _key_pairs("MODEL_PATH"),
+    # --- Tessera lane ------------------------------------------------------
+    # The plan is a projection of the allocation onto the exporter's per-tensor
+    # vocabulary, so its identity includes the exact allocation content,
+    # checkpoint, coverage decision and explicitly supplied serving scope.
+    # The allocator can rewrite layer_config.json on every invocation; its
+    # path is not an identity. What is NOT recoverable from that file is the coverage mode, and
+    # it is the one setting that changes the artifact without changing the
+    # allocation: `broadcast-by-role` extrapolates a single-layer allocation to
+    # every depth, `as-allocated` does not. A skip-if-exists plan built under
+    # the other mode is a different artifact.
+    "tessera-plan": _key_pairs("MODEL_PATH", "COVER<-TESSERA_PLAN_COVER", "ASSIGNMENT_DIGEST",
+                               "PLAN_ASSIGNMENT_DIGEST",
+                               *_TESSERA_SCOPE_SETTINGS),
+}
+
+
+def parse_settings(pairs: Iterable[str]) -> dict[str, str]:
+    """Parse ``K=V`` strings into a settings mapping (later wins)."""
+    out: dict[str, str] = {}
+    for raw in pairs:
+        if not raw:
+            continue
+        if "=" not in raw:
+            raise ValueError(f"setting {raw!r} is not K=V")
+        key, value = raw.split("=", 1)
+        out[key.strip()] = value
+    return out
+
+
+def stage_settings_projection(
+    stage: str,
+    settings: Mapping[str, str],
+) -> tuple[dict[str, str], list[str]]:
+    """Project ``settings`` onto ``stage``'s declared key set.
+
+    Returns ``(manifest_key -> value, unresolved_source_names)``.
+    """
+    try:
+        keys = STAGE_SETTINGS_KEYS[stage]
+    except KeyError:
+        raise KeyError(
+            f"unknown settings-hash stage {stage!r}; declare it in "
+            "pipeline.STAGE_SETTINGS_KEYS (known: "
+            f"{sorted(STAGE_SETTINGS_KEYS)})"
+        ) from None
+    projection: dict[str, str] = {}
+    unresolved: list[str] = []
+    for manifest_key, source in keys:
+        if (stage == "tessera-plan"
+                and (source in _TESSERA_SCOPE_SETTINGS or source == "PLAN_ASSIGNMENT_DIGEST")
+                and not settings.get(source)):
+            continue
+        if source in settings:
+            projection[manifest_key] = str(settings[source])
+        else:
+            unresolved.append(source)
+    return projection, unresolved
+
+
+def stage_settings_document(settings: Mapping[str, str]) -> dict[str, Any]:
+    """Emit the per-artifact key sets, already projected onto ``settings``."""
+    artifacts: dict[str, dict[str, str]] = {}
+    unresolved: dict[str, list[str]] = {}
+    for stage in STAGE_SETTINGS_KEYS:
+        projection, missing = stage_settings_projection(stage, settings)
+        artifacts[stage] = projection
+        if missing:
+            unresolved[stage] = missing
+    return {
+        "schema": STAGE_SETTINGS_SCHEMA,
+        "artifacts": artifacts,
+        "unresolved": unresolved,
+    }
+
+
+def _load_stage_manifest(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: settings manifest is not a JSON object")
+    if payload.get("schema") == STAGE_MANIFEST_SCHEMA:
+        return payload
+    # Pre-R5 manifests are a flat {manifest_key: value} dict written by one
+    # anonymous stage. Keep them under "legacy" so upgrading the file never
+    # drops the guard that was already there.
+    return {
+        "schema": STAGE_MANIFEST_SCHEMA,
+        "stages": {},
+        "legacy": {str(k): str(v) for k, v in payload.items()},
+    }
+
+
+def check_stage_settings(
+    artifact: str | Path,
+    stage: str,
+    document: Mapping[str, Any],
+    *,
+    overrides: Mapping[str, str] | None = None,
+) -> tuple[int, list[str]]:
+    """Guard one skip-if-exists artifact. Returns ``(exit_code, messages)``.
+
+    * artifact absent -> record this stage's projection, exit 0.
+    * artifact present with a matching recorded projection -> exit 0.
+    * artifact present, projection differs -> exit 2, naming every diff.
+    * artifact present, this stage never recorded -> WARN and record
+      (trust-on-first-use: artifacts predating a stage's guard are not
+      invalidated, which is the pre-R5 contract for missing manifests).
+      Tessera plans are the exception: an old plan cannot be bound to a new
+      allocation by recording today's hash after translation already happened.
+    """
+    declared = dict((document.get("artifacts") or {}).get(stage) or {})
+    unresolved = list((document.get("unresolved") or {}).get(stage) or [])
+    if overrides:
+        extra, still_missing = stage_settings_projection(stage, overrides)
+        declared.update(extra)
+        unresolved = [name for name in unresolved if name not in overrides]
+    if unresolved:
+        return 2, [
+            f"[pipeline] ERROR: {stage}: settings-hash key(s) "
+            f"{sorted(set(unresolved))} were declared in "
+            "pipeline.STAGE_SETTINGS_KEYS but no value was supplied by "
+            "run-pipeline.sh; the guard refuses to hash a partial key set.",
+        ]
+
+    artifact_path = Path(artifact)
+    manifest_path = Path(f"{artifact_path}.settings.json")
+    messages: list[str] = []
+
+    if artifact_path.exists():
+        if not manifest_path.exists():
+            if stage == "tessera-plan":
+                return 2, [
+                    f"[pipeline] ERROR: {stage}: {artifact_path} has no recorded "
+                    "allocation content binding; refusing silent reuse. "
+                    "Rebuild the plan from the current allocation.",
+                ]
+            return 0, [
+                f"[pipeline] WARNING: {stage}: reusing {artifact_path} which "
+                "has no settings manifest (predates the settings-hash guard); "
+                "cannot verify it matches the current settings",
+            ]
+        stored = _load_stage_manifest(manifest_path)
+        prev = (stored.get("stages") or {}).get(stage)
+        if prev is None:
+            legacy = stored.get("legacy")
+            if isinstance(legacy, Mapping) and set(legacy) == set(declared):
+                prev = dict(legacy)
+        if prev is None:
+            if stage == "tessera-plan":
+                return 2, [
+                    f"[pipeline] ERROR: {stage}: {artifact_path} has no recorded "
+                    "allocation content binding for this stage; refusing silent reuse. "
+                    "Rebuild the plan from the current allocation.",
+                ]
+            messages.append(
+                f"[pipeline] WARNING: {stage}: {artifact_path} predates this "
+                "stage's settings guard; recording the current settings "
+                "instead of invalidating it"
+            )
+            _record_stage_settings(manifest_path, stage, declared)
+            return 0, messages
+        diffs = {
+            key: (prev.get(key), declared.get(key))
+            for key in sorted(set(prev) | set(declared))
+            if prev.get(key) != declared.get(key)
+        }
+        if diffs:
+            messages.append(
+                f"[pipeline] ERROR: {stage}: {artifact_path} was built under "
+                "DIFFERENT settings; refusing silent reuse:"
+            )
+            for key, (was, now) in diffs.items():
+                messages.append(f"    {key}: artifact={was!r}  current={now!r}")
+            messages.append(
+                f"    -> delete {artifact_path} (and its .settings.json) to "
+                "rebuild, or restore the original settings"
+            )
+            return 2, messages
+        return 0, messages
+
+    _record_stage_settings(manifest_path, stage, declared)
+    return 0, messages
+
+
+def _record_stage_settings(
+    manifest_path: Path,
+    stage: str,
+    projection: Mapping[str, str],
+) -> None:
+    if manifest_path.exists():
+        payload = _load_stage_manifest(manifest_path)
+    else:
+        payload = {"schema": STAGE_MANIFEST_SCHEMA, "stages": {}}
+    stages = dict(payload.get("stages") or {})
+    stages[stage] = dict(projection)
+    payload["stages"] = stages
+    payload["schema"] = STAGE_MANIFEST_SCHEMA
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(payload, indent=1, sort_keys=True) + "\n")
 
 
 @dataclass(frozen=True)
@@ -848,6 +1473,16 @@ def default_production_pipeline_spec(
             resident=True,
         ),
         ArtifactSpec("kl_metrics", "validation_metrics"),
+        # R5 discovery-walker export gate: the structured verdict the walk
+        # gate refuses on (prismaquant.model_walk.WALK_GATE_SCHEMA).
+        ArtifactSpec(
+            "walk_coverage_report",
+            "walk_coverage_report",
+            description=(
+                "Discovery-walker coverage ledger + fail-closed export-gate "
+                "verdict over the source model"
+            ),
+        ),
         ArtifactSpec("compressed_artifact", "hf_checkpoint"),
         ArtifactSpec("vllm_smoke", "validation_metrics"),
         ArtifactSpec("render.baseline_weight", "tensor", provided=True),
@@ -889,7 +1524,7 @@ def default_production_pipeline_spec(
             outputs=("probe_stats",),
             resources=(ResourceContract(
                 resource="streaming_model_weights",
-                owner="StreamingModelPrefetch",
+                owner="LayerCache",
                 residency="required",
             ),),
             tags=("probe", "gpu_bound"),
@@ -901,7 +1536,7 @@ def default_production_pipeline_spec(
             outputs=("quant_costs",),
             resources=(ResourceContract(
                 resource="streaming_model_weights",
-                owner="StreamingModelPrefetch",
+                owner="LayerCache",
                 residency="required",
             ),),
             tags=("cost", "gpu_bound"),
@@ -967,6 +1602,40 @@ def default_production_pipeline_spec(
                 ),
             ),
             tags=("validation", "gpu_bound"),
+        ),
+        PipelineStageSpec(
+            name="export.walk_coverage_gate",
+            component="model_walk:walk_export_gate",
+            inputs=("source_model",),
+            outputs=("walk_coverage_report",),
+            tags=("walk", "gate", "fail_closed", "meta_intake_cpu"),
+            metadata={
+                "schema": "prismaquant.model_walk_gate.v1",
+                "policy": (
+                    "refuse on an unclaimed matmul-fed node, an unresolved "
+                    "floating multiplicand, or any unknown walk failure kind"
+                ),
+                # TP stance: identity and dispositions live on the whole
+                # logical tensor; byte fields are totals with a reserved
+                # additive shard_policy annotation.
+                "decision_unit": "whole_logical_tensor",
+                "byte_accounting": "total_logical_tensor_bytes",
+                "override_env": "PRISMAQUANT_WALK_GATE_OVERRIDE",
+                "override_scope": "trace_incompleteness_only_never_claims",
+                # Deliberately NOT a MetricGateSpec: the refusal is
+                # structural (a named node), not a metric comparison, and
+                # runtime enforcement lives in the stage code
+                # (run-pipeline.sh -> python3 -m prismaquant.model_walk).
+                "gate_kind": "structural_refusal",
+            },
+            description=(
+                "R5 discovery-walker export gate (§8.8): walks the source "
+                "model — module tree plus one FakeTensorMode forward — "
+                "against the profile's claim rules, immediately before every "
+                "export lane. An unclaimed matmul-fed parameter refuses the "
+                "export with the node named and the op cited. Meta-device "
+                "intake: no GPU, no weight I/O, no cache residency."
+            ),
         ),
         PipelineStageSpec(
             name="export.native_compressed",
@@ -1128,7 +1797,85 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="List registered opt-in pipeline components and exit.",
     )
+    ap.add_argument(
+        "--check-frontier-materialization",
+        metavar="MODEL_PATH",
+        help=(
+            "Fail closed when hooks materialization is requested for a MoE, "
+            "a checkpoint with at least 35B parameters, or a model whose "
+            "header-only classification cannot be proven."
+        ),
+    )
+    ap.add_argument(
+        "--frontier-materialization",
+        metavar="MODE",
+        help="Requested validated-frontier materializer: hooks or inplace.",
+    )
+    ap.add_argument(
+        "--setting",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="A pipeline setting value. Consumed by --write-stage-settings "
+             "(projected onto each artifact's declared key set) and by "
+             "--check-stage-settings (late-computed overrides).",
+    )
+    ap.add_argument(
+        "--write-stage-settings",
+        metavar="PATH",
+        help="Write the per-artifact settings-hash key sets, already "
+             "projected onto --setting values, to PATH (re-vet R5).",
+    )
+    ap.add_argument(
+        "--check-stage-settings",
+        action="store_true",
+        help="Guard one skip-if-exists artifact against its recorded "
+             "settings. Requires --stage-settings/--artifact/--stage.",
+    )
+    ap.add_argument("--stage-settings", metavar="PATH", default=None,
+                    help="Path written by --write-stage-settings.")
+    ap.add_argument("--artifact", metavar="PATH", default=None)
+    ap.add_argument("--stage", metavar="ID", default=None)
     args = ap.parse_args(argv)
+
+    if args.check_frontier_materialization:
+        if args.frontier_materialization is None:
+            print(
+                "[pipeline] ERROR: --check-frontier-materialization needs "
+                "--frontier-materialization"
+            )
+            return 2
+        code, message = check_frontier_materialization(
+            args.check_frontier_materialization,
+            args.frontier_materialization,
+        )
+        prefix = "[pipeline]" if code == 0 else "[pipeline] ERROR:"
+        print(f"{prefix} {message}")
+        return code
+
+    if args.check_stage_settings:
+        if not (args.stage_settings and args.artifact and args.stage):
+            print("[pipeline] ERROR: --check-stage-settings needs "
+                  "--stage-settings, --artifact and --stage")
+            return 2
+        document = json.loads(Path(args.stage_settings).read_text())
+        code, messages = check_stage_settings(
+            args.artifact,
+            args.stage,
+            document,
+            overrides=parse_settings(args.setting),
+        )
+        for message in messages:
+            print(message, flush=True)
+        return code
+
+    if args.write_stage_settings:
+        document = stage_settings_document(parse_settings(args.setting))
+        out = Path(args.write_stage_settings)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(document, indent=1, sort_keys=True) + "\n")
+        print(f"[pipeline-spec] wrote {out}")
+        return 0
 
     if args.list_components:
         for component in registered_pipeline_components().values():

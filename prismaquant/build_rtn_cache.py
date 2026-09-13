@@ -102,6 +102,40 @@ def stage_multimodal(model_path: str):
     if not needs_staging:
         return model_path, None
 
+    # A family with no <Arch>ForCausalLM auto-route (e.g. glm5_next on
+    # transformers 5.16) cannot survive the text-only flatten below: the
+    # flattened text config resolves no model class and the arch rewrite
+    # names a class that does not exist. Keep the composite config intact
+    # for those profiles — the streaming loader builds the multimodal
+    # skeleton from it (streaming_model._build_streaming_context).
+    keep_composite = False
+    if "vision_config" in cfg or "text_config" in cfg:
+        from .model_profiles import DeadVendoredOverrideError, detect_profile
+        try:
+            keep_composite = detect_profile(
+                model_path).requires_multimodal_skeleton()
+        except DeadVendoredOverrideError:
+            # Not the tolerated case (#202). `keep_composite = False` is the
+            # right answer for a checkpoint no profile claims; for one whose
+            # vendored modelling path is dead it silently picks the text-only
+            # flatten -- the exact staging the comment above says such a family
+            # "cannot survive" -- and the run continues against upstream code.
+            raise
+        except Exception:
+            keep_composite = False
+
+    if keep_composite:
+        # No-op, mirroring sensitivity_probe.stage_multimodal (the probe
+        # path): the streamed loader needs quantization_config intact —
+        # layer_streaming._declared_weight_block_size refuses fp8 scale
+        # pairs without weight_block_size — and the multimodal skeleton
+        # needs the composite config and real architectures. The streaming
+        # context does its own verbatim staging downstream.
+        print("[stage] profile requires the multimodal skeleton; passing "
+              "the checkpoint through unstaged (streamed loader owns fp8 "
+              "dequant and skeleton construction)")
+        return model_path, None
+
     # Strip quantization_config (e.g. fp8) so the model loads as raw tensors
     if "quantization_config" in cfg:
         qc = cfg.pop("quantization_config")
@@ -255,9 +289,18 @@ def iter_quantizable_tensors(model, profile=None):
     Caller uses module.{param_attr}.data to read, and can REPLACE the data
     attribute to free storage. Handles nn.Linear and 3D packed MoE experts."""
     if profile is None:
+        from prismaquant.model_profiles import (
+            DeadVendoredOverrideError,
+            profile_from_model,
+        )
         try:
-            from prismaquant.model_profiles import profile_from_model
             profile = profile_from_model(model)
+        except DeadVendoredOverrideError:
+            # The profile owns which packed-MoE parameter names are
+            # quantizable. `None` drops to the legacy class-name fallback
+            # below, which silently yields a DIFFERENT set of tensors to
+            # quantize -- a wrong answer, not a missing one (#202).
+            raise
         except Exception:
             profile = None
     for name, mod in model.named_modules():
@@ -468,9 +511,17 @@ def main():
         )
         tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
         device = next(model.parameters()).device
+        from prismaquant.model_profiles import (
+            DeadVendoredOverrideError,
+            detect_profile,
+        )
         try:
-            from prismaquant.model_profiles import detect_profile
             profile = detect_profile(args.model)
+        except DeadVendoredOverrideError:
+            # This profile is handed straight to `iter_quantizable_tensors`
+            # below, so a dead override here decides what the whole RTN cache
+            # quantizes (#202).
+            raise
         except Exception:
             profile = None
         print(f"[rtn-cache]   {sum(p.numel() for p in model.parameters()):,} params", flush=True)

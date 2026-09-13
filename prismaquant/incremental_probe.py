@@ -11,17 +11,28 @@ layer resident; large models drain the cache to disk as needed.
 Each shard (body layer range, MTP, lm_head) runs one streaming pass: the
 exact phase-1 / phase-2 / phase-3 flow from `streaming_probe.run_streaming_probe`,
 specialized to Fisher-instrument only the Linears matching that shard's
-regex. MTP is a built-in shard kind: after the body forward we synthesize
-a `MtpModule`, load `mtp.*` weights directly from safetensors, and run
-its own forward+backward for Fisher collection. The per-shard pickle
+regex. MTP is a built-in shard kind: after the body forward we ask the
+model profile to build its MTP module (`profile.build_mtp_module`), load
+the source MTP weights straight from safetensors
+(`profile.read_mtp_source_state_dict` / `profile.load_mtp_state_dict`),
+and run its own forward+backward for Fisher collection. The per-shard pickle
 output format matches `sensitivity_probe.run_probe_pass` / `streaming_probe`
 unchanged — the allocator consumes either. The two backends also agree on
 the estimator and normalization conventions: per-token-summed empirical
 Fisher (Σ_t ‖∇_t‖², including packed experts via the F.linear
-interception in `install_packed_expert_hooks`), divided by the tokens
-each entry actually saw (routed tokens for MoE experts — the single
-implicit ÷token-fraction; `run_probe_pass` used to apply a second
-÷route_prob, removed per audit M4).
+interception in `install_packed_expert_hooks`), divided by the GLOBAL
+calibration token count for every row -- dense and MoE expert alike.
+(This paragraph used to say "the tokens each entry actually saw (routed
+tokens for MoE experts)". That was audit M4's convention and PR #14
+reversed it: a per-routed-token denominator inflates a rarely-routed
+expert by global/routed, which is inverted importance weighting for the
+mean-Δloss objective. `finalize_fisher_stats` carries the derivation.)
+
+The one quantity that is still per-routed-token is the AQUA A-side's
+activation VARIANCE fit, and deliberately so: `expert_act_sq_sum` is
+divided by `expert_tokens[e]` because it models the per-token noise
+magnitude of the rows that flow through expert e, not that expert's
+share of the objective. See `_accumulate_packed_per_token_fisher`.
 """
 from __future__ import annotations
 
@@ -32,11 +43,13 @@ import json
 import os
 import pickle
 import re
+import tempfile
 import time
 import types
+from collections.abc import Mapping
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from prismaquant.incremental_shards import (
     annotate_incremental_shard as annotate_probe_shard,
@@ -49,6 +62,7 @@ from prismaquant.incremental_shards import (
 # while torch's bookkeeping still thinks it has headroom.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import numpy as np
 import torch
 
 
@@ -62,6 +76,148 @@ def _env_flag(name: str, *, default: bool) -> bool:
     if raw is None:
         return default
     return raw not in ("0", "", "false", "False", "FALSE", "no", "NO")
+
+
+# ---- Per-channel Fisher marginals -------------------------------------
+# The per-element diagonal H[o,i] = Σ_t g[t,o]²·x[t,i]² is unstorable at
+# scale (47k Linears × 17 MB ≈ 800 GB — the reason only two scalars
+# survive today). Its two MARGINALS are storable, and they are what a
+# per-channel sensitivity contract actually needs:
+#
+#   fisher_row[o] = Σ_i H[o,i]      fisher_col[i] = Σ_o H[o,i]
+#
+# plus the two pure factors (g_sq_sum, act_sq_sum) that let a consumer
+# separate "this output channel has hot gradients" from "this input
+# channel has hot activations", and act_absmax for clipping decisions.
+#
+# The row/col marginals are read off the `chunk_h` every accumulation
+# site already materializes, so they cost no extra matmul AND satisfy
+# sum(fisher_row) == sum(fisher_col) == chunk_h.sum() by construction —
+# that identity is the wiring check (tests/test_probe_marginals.py).
+_MARGINAL_KEYS = (
+    "fisher_row", "fisher_col", "g_sq_sum", "act_sq_sum", "act_absmax")
+# act_absmax is a BOUND, not a total: it merges by elementwise maximum
+# across chunks/shards. Summing it would inflate it without bound.
+_MARGINAL_MAX_KEYS = frozenset({"act_absmax"})
+
+# The packed-expert (AQUA) counterparts. Separate from `_MARGINAL_KEYS`
+# because these are [E, *] per-expert arrays produced by the F.linear
+# interception, not the 1-D per-Linear vectors the dense backward hook
+# flushes through `_marginal_flush`.
+_PACKED_MARGINAL_KEYS = (
+    "expert_g_sq_sum", "expert_act_sq_sum", "expert_act_absmax",
+    "expert_tokens")
+
+
+def _marginals_enabled() -> bool:
+    return _env_flag("PRISMAQUANT_PROBE_MARGINALS", default=True)
+
+
+def _marginal_chunk(gy2_sq: torch.Tensor, x2_sq: torch.Tensor,
+                    x2: torch.Tensor,
+                    chunk_h: torch.Tensor) -> list[torch.Tensor]:
+    """Five per-channel reductions of one (gy², x², H) chunk, in
+    `_MARGINAL_KEYS` order, device-resident fp32.
+
+    Reductions force fp32 accumulation: the inputs are bf16 and a
+    T-long running sum in bf16 loses real precision for free.
+    act_absmax comes off `x2` directly via amax/amin rather than
+    sqrt(x2_sq.amax) — same value, but exact in the input dtype and
+    without materializing a [T, in] abs() copy on the hot path.
+    """
+    if x2.size(0) == 0:
+        # A routed expert can be handed zero tokens; the sums are all
+        # zero anyway but amax/amin raise on an empty reduction dim.
+        absmax = torch.zeros(x2.size(1), dtype=torch.float32,
+                             device=x2.device)
+    else:
+        absmax = torch.maximum(x2.amax(dim=0).abs(),
+                               x2.amin(dim=0).abs()).to(torch.float32)
+    return [
+        chunk_h.sum(dim=1, dtype=torch.float32),
+        chunk_h.sum(dim=0, dtype=torch.float32),
+        gy2_sq.sum(dim=0, dtype=torch.float32),
+        x2_sq.sum(dim=0, dtype=torch.float32),
+        absmax,
+    ]
+
+
+def _marginal_accumulate(slot: dict, name: str,
+                         vecs: list[torch.Tensor]) -> None:
+    """Fold one chunk's marginals into `slot[name]`, staying
+    DEVICE-RESIDENT. The v21 #1 optimization batches every device→host
+    scalar transfer to one sync per layer; a `.cpu()` here would put
+    ~94k syncs back on the backward hot path."""
+    cur = slot.get(name)
+    if cur is None:
+        slot[name] = [v.detach().clone() for v in vecs]
+        return
+    for key, c, v in zip(_MARGINAL_KEYS, cur, vecs):
+        if key in _MARGINAL_MAX_KEYS:
+            torch.maximum(c, v, out=c)
+        else:
+            c.add_(v)
+
+
+def merge_marginals(dst: dict, src) -> None:
+    """Fold per-channel marginals from `src` into `dst` in place.
+
+    Sums add elementwise; act_absmax merges by MAXIMUM. Used both for
+    the per-layer host flush and for the cross-shard partial-stats
+    merge, so the two cannot drift apart on the max-vs-sum rule.
+    """
+    for key in _MARGINAL_KEYS:
+        new = src.get(key)
+        if new is None:
+            continue
+        new = np.asarray(new, dtype=np.float32)
+        old = dst.get(key)
+        if old is None:
+            dst[key] = new.copy()
+        elif key in _MARGINAL_MAX_KEYS:
+            dst[key] = np.maximum(old, new)
+        else:
+            dst[key] = old + new
+
+
+def _marginal_flush(device_slot: dict, stats: dict) -> None:
+    """Drain device-resident marginal accumulators into `stats` as
+    numpy fp32, using ONE device→host transfer for the whole layer:
+    every vector is concatenated flat, copied once, then sliced. Same
+    discipline as the h_trace/h_w2_sum stack above it."""
+    if not device_slot:
+        return
+    names = list(device_slot.keys())
+    host = torch.cat(
+        [v.reshape(-1) for n in names for v in device_slot[n]]).cpu()
+    off = 0
+    for n in names:
+        payload = {}
+        for key, v in zip(_MARGINAL_KEYS, device_slot[n]):
+            ln = v.numel()
+            # .copy() so the per-Linear arrays do not each pin the one
+            # big host buffer alive.
+            payload[key] = host[off:off + ln].numpy().copy()
+            off += ln
+        entry = stats.get(n)
+        if entry is not None:
+            merge_marginals(entry, payload)
+    device_slot.clear()
+
+
+def _marginal_zeros(out_features: int, in_features: int) -> dict:
+    """Zero-initialized marginal keys for a stats entry. Zeros are the
+    identity for both merge rules (sum and max over |x| ≥ 0), so a
+    Linear whose hook never fires ships zeros rather than missing keys."""
+    return {
+        "fisher_row": np.zeros(int(out_features), dtype=np.float32),
+        "fisher_col": np.zeros(int(in_features), dtype=np.float32),
+        "g_sq_sum": np.zeros(int(out_features), dtype=np.float32),
+        "act_sq_sum": np.zeros(int(in_features), dtype=np.float32),
+        "act_absmax": np.zeros(int(in_features), dtype=np.float32),
+    }
+
+
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -71,12 +227,20 @@ from .layer_streaming import (
     _compute_position_embeddings,
     _get_final_norm,
 )
+from .perturbed_x_cache import calibration_data_hash
 from .sensitivity_probe import (
     FisherAccumulator,
     RouterTracker,
+    SharedStateCotangents,
     discover_moe_structure,
+    discover_moe_routers,
+    finalize_fisher_stats,
+    grouped_linear_fisher_chunk,
+    grouped_linear_groups,
+    grouped_linear_stats_entry,
     h_detail_blob,
     install_packed_expert_hooks,
+    kv_cotangent_path_enabled,
     load_calibration,
     per_token_ce,
     read_top_k,
@@ -93,7 +257,7 @@ from .streaming_model import (
 
 
 # ---------------------------------------------------------------------------
-# MiniMax-M2 fast MoE replay
+# ModuleList-of-experts fast MoE replay (MiniMax-M2 is the motivating arch)
 # ---------------------------------------------------------------------------
 # HF MiniMax-M2 represents the 256 experts as a ModuleList and its
 # `MiniMaxM2Experts.forward` loops over every hit expert in Python:
@@ -110,16 +274,46 @@ from .streaming_model import (
 # ---------------------------------------------------------------------------
 
 
-def _is_minimax_m2_experts_module(
-    module: nn.Module, proj_names: tuple[str, ...] = ("w1", "w2", "w3")
+def _is_unpacked_experts_module(
+    module: nn.Module,
+    proj_names: tuple[str, ...] = ("w1", "w2", "w3"),
+    class_names: frozenset[str] | tuple[str, ...] = (),
 ) -> bool:
-    return (
-        type(module).__name__ == "MiniMaxM2Experts"
-        and hasattr(module, "num_experts")
-        and hasattr(module, "top_k")
-        and len(module) > 0
-        and all(hasattr(module[0], n) for n in (*proj_names, "act_fn"))
-    )
+    """Recognize a ModuleList-style expert container the fast replay can swap.
+
+    Two conditions, both required:
+
+      - the container class is one the *profile* declares
+        (`packed_expert_module_class_names()` -> the spec's
+        `packed_experts.module_class_names`, `base.py:182-192`). This used to
+        be the literal string `"MiniMaxM2Experts"` in this file. It cannot be
+        dropped in favour of pure structure: the replacement forward
+        (`_minimax_fast_experts_forward`) implements one specific expert-loop
+        signature, so applying it to a container that merely *looks* similar
+        would silently change a forward pass. Declaring the class is the
+        architecture opting in.
+      - the container really has the ModuleList-of-experts shape the replay
+        needs: `num_experts`/`top_k`, indexable, and a first expert carrying
+        the profile's per-expert projection attributes plus `act_fn`. Packed
+        (3D-parameter) expert containers declare a class name too and fail
+        here, which is correct — they are not what this path replays.
+
+    A profile that declares no container class keeps today's behaviour: no
+    swap, per-Linear hooks only. That is a probe-speed loss, not a
+    correctness one.
+    """
+    if not class_names or type(module).__name__ not in set(class_names):
+        return False
+    try:
+        return (
+            hasattr(module, "num_experts")
+            and hasattr(module, "top_k")
+            and len(module) > 0
+            and all(hasattr(module[0], n) for n in (*proj_names, "act_fn"))
+        )
+    except (TypeError, KeyError, IndexError):
+        # Not indexable / not list-like: the swap does not apply.
+        return False
 
 
 def _minimax_fast_experts_forward(
@@ -286,18 +480,21 @@ def _set_minimax_fast_moe(
     *,
     chunk_size: int = 32,
     proj_names: tuple[str, ...] = ("w1", "w2", "w3"),
+    class_names: frozenset[str] | tuple[str, ...] = (),
 ) -> int:
-    """Enable/disable chunked batched MiniMax-M2 expert replay on a layer.
+    """Enable/disable chunked batched unpacked-expert replay on a layer.
 
-    Returns the number of MiniMax expert containers patched under `layer`.
-    The patch is instance-local and falls back to the original forward
-    whenever `_pq_fast_moe_enabled` is False. ``proj_names`` are the per-expert
-    projection attribute names (from the model profile; default Qwen/MiniMax
-    ``('w1','w2','w3')``).
+    Returns the number of expert containers patched under `layer`. The patch
+    is instance-local and falls back to the original forward whenever
+    `_pq_fast_moe_enabled` is False. ``proj_names`` are the per-expert
+    projection attribute names and ``class_names`` the declared container
+    classes — both from the model profile
+    (`unpacked_expert_projection_names()` / `packed_expert_module_class_names()`),
+    defaulting to the Qwen/MiniMax ``('w1','w2','w3')`` and "no class filter".
     """
     patched = 0
     for module in layer.modules():
-        if not _is_minimax_m2_experts_module(module, proj_names):
+        if not _is_unpacked_experts_module(module, proj_names, class_names):
             continue
         if not hasattr(module, "_pq_original_forward"):
             module._pq_original_forward = module.forward
@@ -364,14 +561,46 @@ def build_layer_shard_regexes(num_hidden_layers: int,
 
 
 def _detect_profile_for_shards(model_path: str):
-    try:
-        from .model_profiles.registry import detect_profile
+    """The checkpoint's profile, or `DefaultProfile` for an unknown one.
 
+    `DeadVendoredOverrideError` is not that case and is re-raised (#201): the
+    architecture IS known, its vendored modelling path is dead, and answering
+    `DefaultProfile` here would shard and probe the model against upstream
+    modelling code under a profile that promises the vendored copy.
+    """
+    from .model_profiles.registry import DeadVendoredOverrideError, detect_profile
+
+    try:
         return detect_profile(model_path)
+    except DeadVendoredOverrideError:
+        raise
     except Exception:
         from .model_profiles.default import DefaultProfile
 
         return DefaultProfile()
+
+
+# Router/gate Linears carry routing logits, not quantizable weights.
+_BASE_LINEAR_EXCLUDE = (
+    r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)"
+)
+
+
+def resolve_linear_exclude(model_path: str) -> str:
+    """The probe's Linear exclusion: the router baseline OR'd with any
+    profile-declared extra (`ModelProfile.probe_linear_exclude_extra`),
+    for live Linears outside the serving contract's quantizable set.
+    All meta stamps and hook installs must use this one resolver so
+    shard-reuse keys stay consistent."""
+    profile = _detect_profile_for_shards(model_path)
+    extra = ""
+    try:
+        extra = str(profile.probe_linear_exclude_extra() or "")
+    except AttributeError:
+        pass
+    if extra:
+        return f"(?:{_BASE_LINEAR_EXCLUDE}|{extra})"
+    return _BASE_LINEAR_EXCLUDE
 
 
 def build_extended_shard_regexes(
@@ -683,14 +912,29 @@ def build_shard_schedule(
             sidx += len(vis_entries)
 
     if include_lm_head:
-        extras.append(ShardEntry(
-            shard_idx=sidx,
-            linear_include=rf"^{re.escape(lm_head_name)}$",
-            kind="lm_head",
-            layer_indices=frozenset(),
-            layer_prefix=None,
-        ))
-        sidx += 1
+        # A tied head (`tie_word_embeddings` declared AND no head tensor
+        # in the index) is an alias of the input embedding: same storage,
+        # no source bytes of its own. It is structurally passthrough-only
+        # — re-encoding it would re-encode the non-quantizable embedding
+        # — so it gets no Fisher row and no cost row. Same shape as the
+        # MTP skip above: config declares it, the index does not have it.
+        from .tied_embeddings import lm_head_is_tied_alias
+        if lm_head_is_tied_alias(model_path, profile=profile):
+            print(f"[shard-schedule] `{lm_head_name}` is a tied alias of the "
+                  "input embedding (config declares tie_word_embeddings and "
+                  "the safetensors index has no head tensor); skipping the "
+                  "lm_head shard — a tied head shares storage with the "
+                  "non-quantizable embedding and is never quantized",
+                  flush=True)
+        else:
+            extras.append(ShardEntry(
+                shard_idx=sidx,
+                linear_include=rf"^{re.escape(lm_head_name)}$",
+                kind="lm_head",
+                layer_indices=frozenset(),
+                layer_prefix=None,
+            ))
+            sidx += 1
 
     return ShardSchedule(entries=tuple(body_entries + extras))
 
@@ -738,7 +982,7 @@ def _expected_probe_shard_meta(args, *,
                                linear_include: str,
                                shard_idx: int,
                                activation_cache_dir: str) -> dict[str, Any]:
-    return {
+    meta = {
         "model": args.model,
         "dataset": args.dataset,
         "nsamples": args.nsamples,
@@ -749,13 +993,141 @@ def _expected_probe_shard_meta(args, *,
         "importance_weighting": args.importance_weighting,
         "activation_cache_dir": str(Path(activation_cache_dir)),
         "linear_include": linear_include,
-        "linear_exclude": (
-            r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)"
-        ),
+        "linear_exclude": resolve_linear_exclude(args.model),
         "h_detail_dir": str(Path(args.h_detail_dir)) if args.h_detail_dir else None,
         "activation_rows_limit": int(args.activation_rows_limit),
         "shard_idx": shard_idx,
+        "router_coverage_version": _ROUTER_COVERAGE_VERSION,
+        # Not a grouping axis: it decides whether the shard's stats
+        # carry per-channel marginals at all. Reusing a flag-off shard
+        # in a flag-on run would silently ship marginal-less entries.
+        "emit_marginals": _marginals_enabled(),
     }
+    sample_parallel = getattr(args, "sample_parallel_contract", None)
+    if sample_parallel is not None:
+        meta["sample_parallel"] = dict(sample_parallel)
+    sample_importance = getattr(args, "sample_parallel_importance", None)
+    if sample_importance is not None:
+        meta["sample_parallel_importance"] = dict(sample_importance)
+    activation_scope = getattr(args, "sample_parallel_activation_scope", None)
+    if activation_scope is not None:
+        meta["sample_parallel_activation_scope"] = dict(activation_scope)
+    execution_identity = getattr(
+        args, "sample_parallel_execution_identity", None
+    )
+    if execution_identity is not None:
+        meta["sample_parallel_execution_identity"] = dict(execution_identity)
+    qname_census = getattr(args, "sample_parallel_qname_census", None)
+    if qname_census is not None:
+        meta["sample_parallel_qname_census"] = dict(qname_census)
+    return meta
+
+
+def _validate_sample_activation_directory_cover(
+    directory: Path,
+    expected_qnames: set[str],
+    *,
+    require_complete: bool,
+) -> None:
+    """Refuse stale or unsafe worker-cache entries before GPU work."""
+    if not directory.exists():
+        if require_complete:
+            raise ValueError("sample activation-cache directory is absent")
+        return
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("sample activation-cache path is not a regular directory")
+    expected_files = {
+        re.sub(r"[^A-Za-z0-9_-]", "__", name) + ".pt"
+        for name in expected_qnames
+    }
+    entries = list(directory.iterdir())
+    observed = {path.name for path in entries}
+    if any(path.is_symlink() or not path.is_file() for path in entries):
+        raise ValueError("sample activation cache contains an unsafe entry")
+    if not observed.issubset(expected_files) or (
+        require_complete and observed != expected_files
+    ):
+        raise ValueError(
+            "sample activation-cache filename cover differs from the "
+            "authoritative qname census"
+        )
+
+
+def _validate_sample_activation_blob(
+    path: Path,
+    *,
+    qname: str,
+    expected_width: int,
+    partition_contract: Mapping[str, object],
+    rows_limit: int,
+    execution_identity_sha256: str,
+) -> None:
+    """Replay one worker activation blob's closed row-selection contract."""
+    from prismaquant.sample_parallel_probe import activation_cache_shard_stamp
+    from prismaquant.sample_parallel_probe_contract import (
+        activation_row_priorities as _activation_row_priorities,
+    )
+
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"sample activation blob is not a regular file: {path}")
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(blob, dict) or set(blob) != {
+        "inputs", "name", "row_indices", "row_priorities",
+        "sample_parallel_activation",
+    }:
+        raise ValueError(f"sample activation blob fields differ for {qname}")
+    local_samples = partition_contract.get("local_samples")
+    seqlen = partition_contract.get("seqlen")
+    if type(local_samples) is not int or type(seqlen) is not int:
+        raise ValueError("sample activation partition dimensions are malformed")
+    candidate_rows = local_samples * seqlen
+    expected_stamp = activation_cache_shard_stamp(
+        partition_contract,
+        qname=qname,
+        rows_limit=rows_limit,
+        candidate_rows=candidate_rows,
+        execution_identity_sha256=execution_identity_sha256,
+    )
+    inputs = blob.get("inputs")
+    rows = blob.get("row_indices")
+    priorities = blob.get("row_priorities")
+    if (
+        blob.get("name") != qname
+        or blob.get("sample_parallel_activation") != expected_stamp
+        or not isinstance(inputs, torch.Tensor)
+        or inputs.dtype != torch.float32
+        or inputs.ndim != 2
+        or int(inputs.shape[1]) != int(expected_width)
+        or not bool(torch.isfinite(inputs).all().item())
+        or not isinstance(rows, torch.Tensor)
+        or rows.dtype != torch.int64
+        or rows.ndim != 1
+        or not isinstance(priorities, torch.Tensor)
+        or priorities.dtype != torch.int64
+        or priorities.ndim != 1
+        or int(inputs.shape[0]) != min(rows_limit, candidate_rows)
+        or int(rows.numel()) != int(inputs.shape[0])
+        or int(priorities.numel()) != int(inputs.shape[0])
+    ):
+        raise ValueError(f"sample activation tensor contract differs for {qname}")
+    all_local = torch.arange(candidate_rows, dtype=torch.int64)
+    all_global = all_local + int(partition_contract["sample_start"]) * seqlen
+    all_priorities = _activation_row_priorities(
+        str(partition_contract["global_calibration_hash"]),
+        qname,
+        all_global,
+    )
+    order = torch.topk(
+        all_priorities,
+        min(rows_limit, candidate_rows),
+        largest=False,
+        sorted=True,
+    ).indices
+    if (
+        not torch.equal(rows, all_local.index_select(0, order))
+        or not torch.equal(priorities, all_priorities.index_select(0, order))
+    ):
+        raise ValueError(f"sample activation priority rows differ for {qname}")
 
 
 def probe_shard_is_reusable(path: Path, expected_meta: dict[str, Any]) -> bool:
@@ -775,6 +1147,82 @@ def probe_shard_is_reusable(path: Path, expected_meta: dict[str, Any]) -> bool:
     for key, expected in expected_meta.items():
         if probe_meta.get(key) != expected:
             return False
+    sample_partition = expected_meta.get("sample_parallel")
+    sample_census = expected_meta.get("sample_parallel_qname_census")
+    if isinstance(sample_partition, dict) and isinstance(sample_census, dict):
+        try:
+            raw_pattern = str(expected_meta["linear_include"])
+            pattern = re.compile(
+                raw_pattern[3:] if raw_pattern.startswith("re:")
+                else raw_pattern
+            )
+            raw_exclude = str(expected_meta.get("linear_exclude", ""))
+            exclude = (
+                re.compile(raw_exclude[3:] if raw_exclude.startswith("re:")
+                           else raw_exclude)
+                if raw_exclude else None
+            )
+            probe_entries = sample_census["probe_qname_manifest"]["entries"]
+            expected_stats = {
+                str(name) for name in probe_entries
+                if pattern.search(str(name))
+                and (exclude is None or not exclude.search(str(name)))
+            }
+            if set(data["stats"]) != expected_stats:
+                return False
+            local_samples = int(sample_partition["local_samples"])
+            sample_seqlen = int(sample_partition["seqlen"])
+            from prismaquant.sample_parallel_probe_merge import (
+                validate_sample_parallel_stat_row,
+            )
+            for name in expected_stats:
+                entry = probe_entries[name]
+                stats = data["stats"][name]
+                shape = tuple(int(dim) for dim in entry["shape"])
+                token_rule = entry["token_rows_per_sample"]
+                per_sample = {
+                    "seqlen": sample_seqlen,
+                    "seqlen_minus_1": sample_seqlen - 1,
+                    "seqlen_minus_2": sample_seqlen - 2,
+                }.get(token_rule, -1)
+                if not isinstance(stats, dict):
+                    return False
+                validate_sample_parallel_stat_row(
+                    stats,
+                    qname=name,
+                    expected_tokens=local_samples * per_sample,
+                    expected_shape=shape,
+                    require_marginals=bool(expected_meta["emit_marginals"]),
+                )
+
+            activation_entries = sample_census[
+                "activation_qname_manifest"
+            ]["entries"]
+            expected_activation = {
+                str(name) for name in activation_entries
+                if pattern.search(str(name))
+                and (exclude is None or not exclude.search(str(name)))
+            }
+            activation_dir = Path(str(expected_meta["activation_cache_dir"]))
+            rows_limit = int(expected_meta["activation_rows_limit"])
+            for name in expected_activation:
+                activation_path = activation_dir / (
+                    re.sub(r"[^A-Za-z0-9_-]", "__", name) + ".pt"
+                )
+                shape = tuple(int(dim) for dim in activation_entries[name]["shape"])
+                _validate_sample_activation_blob(
+                    activation_path,
+                    qname=name,
+                    expected_width=shape[1],
+                    partition_contract=sample_partition,
+                    rows_limit=rows_limit,
+                    execution_identity_sha256=str(
+                        expected_meta["sample_parallel_execution_identity"]
+                        ["identity_sha256"]
+                    ),
+                )
+        except (KeyError, TypeError, ValueError, OSError, RuntimeError):
+            return False
     return True
 
 
@@ -788,6 +1236,20 @@ _CONTENT_META_KEYS: tuple[str, ...] = (
     "requested_device", "requested_device_map",
     "importance_weighting", "activation_cache_dir",
     "linear_exclude", "h_detail_dir", "activation_rows_limit",
+    "router_coverage_version",
+    # Marginal emission changes WHICH KEYS a stats entry carries, not
+    # just its grouping, so a flag-off shard is not poolable into a
+    # flag-on run — it would contribute entries with no marginals and
+    # nothing downstream would notice.
+    "emit_marginals",
+    # A different sample partition has the same qname scope but different
+    # sufficient statistics. It may only meet its siblings in the dedicated
+    # raw-stat sample merger, never in LPS-invariant first-seen reuse.
+    "sample_parallel",
+    "sample_parallel_importance",
+    "sample_parallel_activation_scope",
+    "sample_parallel_execution_identity",
+    "sample_parallel_qname_census",
 )
 
 
@@ -806,6 +1268,46 @@ def _content_meta_compatible(raw_meta: dict[str, Any],
     return all(probe_meta.get(k) == anchor.get(k) for k in _CONTENT_META_KEYS)
 
 
+def _cached_value_exact_equal(left: object, right: object) -> bool:
+    """Bit/exact structural equality for duplicate cached stat rows."""
+    if isinstance(left, torch.Tensor) or isinstance(right, torch.Tensor):
+        return (
+            isinstance(left, torch.Tensor)
+            and isinstance(right, torch.Tensor)
+            and left.dtype == right.dtype
+            and tuple(left.shape) == tuple(right.shape)
+            and torch.equal(left.detach().to("cpu"), right.detach().to("cpu"))
+        )
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        return (
+            isinstance(left, np.ndarray)
+            and isinstance(right, np.ndarray)
+            and left.dtype == right.dtype
+            and left.shape == right.shape
+            and np.array_equal(left, right)
+        )
+    if isinstance(left, dict) or isinstance(right, dict):
+        return (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and set(left) == set(right)
+            and all(
+                _cached_value_exact_equal(left[key], right[key])
+                for key in left
+            )
+        )
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        return (
+            type(left) is type(right)
+            and len(left) == len(right)  # type: ignore[arg-type]
+            and all(
+                _cached_value_exact_equal(a, b)
+                for a, b in zip(left, right, strict=True)  # type: ignore[arg-type]
+            )
+        )
+    return type(left) is type(right) and left == right
+
+
 def scan_cached_linear_stats(
     shard_dir: Path,
     content_meta_anchor: dict[str, Any],
@@ -819,8 +1321,9 @@ def scan_cached_linear_stats(
     Used for LPS-invariant shard reuse: Fisher stats are intrinsic to
     each Linear, so a shard at lps=5 (L0-L4) and a shard at lps=3
     (L0-L2) share identical numbers for L0-L2, even though neither
-    pickle directly equals the other. We pool them at the Linear level
-    and synthesize new shards by filtering on regex.
+    pickle directly equals the other. We pool them at the Linear level only
+    when every duplicate qname is bit/exactly identical, then synthesize new
+    shards by filtering on regex.
     """
     pooled: dict[str, dict[str, Any]] = {}
     if not shard_dir.exists():
@@ -840,6 +1343,13 @@ def scan_cached_linear_stats(
         if not isinstance(stats, dict):
             continue
         for name, s in stats.items():
+            if name in pooled and not _cached_value_exact_equal(pooled[name], s):
+                print(
+                    "[incremental] cached Linear pool has divergent duplicate "
+                    f"qname {name!r}; refusing all synthesized reuse",
+                    flush=True,
+                )
+                return {}
             if name not in pooled:
                 pooled[name] = s
     return pooled
@@ -851,6 +1361,8 @@ def synthesize_shard_from_linear_cache(
     cache: dict[str, dict[str, Any]],
     expected_meta: dict[str, Any],
     output_path: Path,
+    expected_layers: "frozenset[int] | set[int] | None" = None,
+    layer_prefix: str | None = None,
 ) -> bool:
     """Produce `output_path` by filtering `cache` through the shard's
     include / exclude regexes. Returns True iff any Linear matches
@@ -879,6 +1391,70 @@ def synthesize_shard_from_linear_cache(
         selected[name] = stats
     if not selected:
         return False
+    sample_census = expected_meta.get("sample_parallel_qname_census")
+    sample_partition = expected_meta.get("sample_parallel")
+    if isinstance(sample_census, dict) and isinstance(sample_partition, dict):
+        try:
+            from prismaquant.sample_parallel_probe_merge import (
+                validate_sample_parallel_stat_row,
+            )
+
+            manifest_entries = sample_census["probe_qname_manifest"]["entries"]
+            expected_names = {
+                str(name) for name in manifest_entries
+                if inc.search(str(name))
+                and (exc is None or not exc.search(str(name)))
+            }
+            if set(selected) != expected_names:
+                return False
+            local_samples = int(sample_partition["local_samples"])
+            sample_seqlen = int(sample_partition["seqlen"])
+            for name, stats in selected.items():
+                entry = manifest_entries[name]
+                shape = tuple(int(dim) for dim in entry["shape"])
+                token_rule = entry["token_rows_per_sample"]
+                per_sample = (
+                    sample_seqlen
+                    if token_rule == "seqlen"
+                    else sample_seqlen - 1
+                    if token_rule == "seqlen_minus_1"
+                    else sample_seqlen - 2
+                    if token_rule == "seqlen_minus_2"
+                    else -1
+                )
+                if not isinstance(stats, dict):
+                    return False
+                validate_sample_parallel_stat_row(
+                    stats,
+                    qname=name,
+                    expected_tokens=local_samples * per_sample,
+                    expected_shape=shape,
+                    require_marginals=bool(expected_meta["emit_marginals"]),
+                )
+        except (KeyError, TypeError, ValueError):
+            return False
+    # Layer-completeness gate. "Any Linear matches" is NOT shard
+    # coverage: after a mid-run LAYERS_PER_SHARD change, the pooled
+    # cache can cover a strict subset of this shard's layers (Laguna
+    # 2026-07-23: cache held layers 0-4 of shard [0-6]; the shard was
+    # declared complete and layers 5-6 silently fell out of the probe,
+    # the cost table, and the allocation). A shard may only be
+    # synthesized when EVERY expected layer contributes stats.
+    if expected_layers and layer_prefix:
+        # Profiles return the prefix both with and without the trailing
+        # dot ('model.layers' vs 'model.layers.') — normalize before
+        # building name probes or every membership test silently fails.
+        _lp = layer_prefix.rstrip(".") + "."
+        covered = {
+            i for i in expected_layers
+            if any(f"{_lp}{i}." in n for n in selected)
+        }
+        missing = sorted(set(expected_layers) - covered)
+        if missing:
+            print(f"[incremental] synthesize refused: cached stats miss "
+                  f"layers {missing} of this shard — running fresh compute",
+                  flush=True)
+            return False
 
     payload = {
         "stats": selected,
@@ -898,7 +1474,9 @@ def synthesize_shard_from_linear_cache(
     return True
 
 
-def merge_probe_pickles(paths: list[Path], output_path: Path):
+def merge_probe_pickles(
+    paths: list[Path], output_path: Path, *, write_output: bool = True,
+):
     merged = None
     merged_stats = {}
     merged_router_counts = {}
@@ -942,15 +1520,34 @@ def merge_probe_pickles(paths: list[Path], output_path: Path):
         "n_shards": len(paths),
         "shards": shard_metas,
     }
+    # R14: union of the per-shard calibration identities. Multi-chunk runs give
+    # each shard its own calib draw, so the merged pickle must carry the SET —
+    # a single combined digest could not be intersected against a validator's
+    # per-repeat hashes. Keep `calib_hash` as the single-draw convenience only
+    # when the run really had one draw.
+    shard_calib_hashes = sorted({
+        str(meta["calib_hash"])
+        for meta in shard_metas
+        if isinstance(meta, dict) and meta.get("calib_hash")
+    })
+    if shard_calib_hashes:
+        merged_meta["calib_hashes"] = shard_calib_hashes
+        merged_meta["calib_hash"] = (
+            shard_calib_hashes[0] if len(shard_calib_hashes) == 1 else None
+        )
+    else:
+        merged_meta.pop("calib_hash", None)
     # Propagate the calibration-chunk domain label into the merged pickle meta.
     domain_env = os.environ.get("PRISMAQUANT_PROBE_DOMAIN")
     if domain_env:
         merged_meta["domain"] = domain_env
     merged["meta"] = merged_meta
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "wb") as f:
-        pickle.dump(merged, f)
+    if write_output:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            pickle.dump(merged, f)
+    return merged
 
 
 def load_num_hidden_layers(model_path: str) -> int:
@@ -967,12 +1564,13 @@ def load_num_hidden_layers(model_path: str) -> int:
 def config_num_kv_shared_layers(model_path: str) -> int:
     """``num_kv_shared_layers`` from the config (text_config or top-level).
 
-    Returns 0 when absent. Used by the MINOR-M33 guard: KV-sharing models
-    (num_kv_shared_layers>0, e.g. some Gemma4 variants) reuse one layer's
-    K/V in later layers, but the streaming Fisher probe captures and
-    ``.detach()``s borrowed K/V per isolated phase-3 forward, severing the
-    Fisher cotangent that should flow back to the *storing* layer's
-    k_proj/v_proj — under-counting their h_trace.
+    Returns 0 when absent. KV-sharing models (num_kv_shared_layers>0, e.g. some
+    Gemma4 variants) reuse one layer's K/V in later layers. The phase-3 sweep
+    forwards each layer in isolation from a ``.detach()``ed capture of that K/V,
+    and that borrowed tensor severed the Fisher cotangent belonging to the
+    *storing* layer's k_proj/v_proj — under-counting their h_trace (review
+    finding MINOR-M33). ``SharedStateCotangents`` reconnects it, so this lookup
+    now only feeds the guard that fires if that path is switched off.
     """
     staged = stage_text_only(model_path)
     cfg_path = Path(staged) / "config.json"
@@ -990,21 +1588,31 @@ def config_num_kv_shared_layers(model_path: str) -> int:
 def kv_shared_fisher_block_reason(model_path: str) -> str | None:
     """Fail-fast message if the streaming Fisher probe must not run here.
 
-    Returns a message string when the model has ``num_kv_shared_layers>0`` and
-    the ``PRISMAQUANT_ALLOW_KV_SHARED_FISHER`` override is unset, else ``None``
-    (MINOR-M33). Extracted so the guard decision is unit-testable.
+    INVERTED (MINOR-M33 closed): KV-sharing models are now probed normally,
+    because the reverse sweep routes each consumer's cotangent back to the
+    layer that produced the borrowed K/V (``SharedStateCotangents``, verified
+    against an end-to-end backward in
+    ``tests/test_kv_cotangent_path.py``). The guard therefore fires only when
+    that path is UNAVAILABLE — today the single way to get there is switching
+    it off with ``PRISMAQUANT_KV_COTANGENT=0``, which restores the severed
+    cotangent and its k/v_proj under-count. ``PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1``
+    still overrides, for anyone deliberately reproducing a pre-fix probe.
     """
     kv = config_num_kv_shared_layers(model_path)
-    if kv > 0 and os.environ.get("PRISMAQUANT_ALLOW_KV_SHARED_FISHER", "0") == "0":
-        return (
-            f"[incremental] model has num_kv_shared_layers={kv}: the streaming "
-            "Fisher probe under-counts the storing layer's k_proj/v_proj "
-            "h_trace (shared-consumer cotangent severed by the phase-3 K/V "
-            "detach; review finding MINOR-M33). Set "
-            "PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1 to probe anyway, accepting "
-            "the k/v_proj under-count, until the KV-cotangent path lands."
-        )
-    return None
+    if kv <= 0 or kv_cotangent_path_enabled():
+        return None
+    if os.environ.get("PRISMAQUANT_ALLOW_KV_SHARED_FISHER", "0") != "0":
+        return None
+    return (
+        f"[incremental] model has num_kv_shared_layers={kv} and "
+        "PRISMAQUANT_KV_COTANGENT=0 disables the KV-cotangent path: the "
+        "streaming Fisher probe would under-count the storing layer's "
+        "k_proj/v_proj h_trace (shared-consumer cotangent severed by the "
+        "phase-3 K/V detach; review finding MINOR-M33). Unset "
+        "PRISMAQUANT_KV_COTANGENT to probe correctly, or set "
+        "PRISMAQUANT_ALLOW_KV_SHARED_FISHER=1 to probe anyway, accepting the "
+        "k/v_proj under-count."
+    )
 
 
 # Streaming infrastructure — `StreamingContext`, `_build_streaming_context`,
@@ -1045,9 +1653,16 @@ def _resident_linear_fqns(model: nn.Module, layers_prefix: str,
 def _compute_precompute_key(model_path: str, dataset_name: str,
                             nsamples: int, seqlen: int, dtype_name: str,
                             device: str, importance_weighting: bool,
-                            resident_include_union: str) -> dict[str, Any]:
+                            resident_include_union: str,
+                            emit_marginals: bool = False) -> dict[str, Any]:
     """Fingerprint for the global precompute cache. If any of these
-    inputs change, recompute; otherwise reuse the cached tensors."""
+    inputs change, recompute; otherwise reuse the cached tensors.
+
+    `emit_marginals` belongs in the key because the resident marginal
+    vectors are written *into* the cached stats: a cache built with the
+    flag off carries no marginals, and silently reusing it with the flag
+    on would yield a probe that claims marginals and has none.
+    """
     return {
         "model": model_path,
         "dataset": dataset_name,
@@ -1057,6 +1672,8 @@ def _compute_precompute_key(model_path: str, dataset_name: str,
         "device": device,
         "importance_weighting": importance_weighting,
         "resident_include_union": resident_include_union,
+        "router_coverage_version": _ROUTER_COVERAGE_VERSION,
+        "emit_marginals": bool(emit_marginals),
     }
 
 
@@ -1066,6 +1683,16 @@ def _compute_precompute_key(model_path: str, dataset_name: str,
 # across N calibration chunks instead of paying the offload + tokenizer
 # rebuild cost N times.
 _PROBE_CTX_CACHE: dict = {}
+
+
+def _persistent_probe_context_enabled(
+    sample_parallel_contract: dict[str, object] | None,
+) -> bool:
+    """Legacy warm model reuse is forbidden on the source-attested lane."""
+    return (
+        os.environ.get("PRISMAQUANT_PROBE_CTX_CACHE") == "1"
+        and sample_parallel_contract is None
+    )
 
 
 # v22 Fix A: lazy weight-stats cache.
@@ -1083,6 +1710,7 @@ _PROBE_CTX_CACHE: dict = {}
 # probe run the weights are immutable, so the cache holds for the whole
 # multi-chunk driver lifetime.
 _W_STATS_CACHE: dict[tuple[str, int, tuple[int, ...]], tuple[float, float]] = {}
+_ROUTER_COVERAGE_VERSION = 2
 
 
 def _get_or_compute_w_stats(fqn: str, weight) -> tuple[float, float]:
@@ -1145,6 +1773,102 @@ class GlobalPrecompute:
     # Reusable forward-state derivable from ids + model; recomputed on demand.
 
 
+_PRECOMPUTE_CACHE_SCHEMA = "prismaquant.incremental_probe.precompute_cache.v1"
+_PRECOMPUTE_CACHE_KEYS = frozenset({
+    "schema", "activations_cpu", "grad_at_tail", "ids_cpu",
+    "resident_stats", "resident_h_full", "resident_g2_per_token",
+    "resident_act_snaps", "resident_act_row_indices", "expert_info",
+    "router_counts", "router_totals", "router_active_counts",
+    "expert_route_stats", "shared_pass_state", "meta",
+})
+_SAMPLE_PRECOMPUTE_RESIDENT_STAT_KEYS = frozenset({
+    "h_trace_raw", "h_w2_sum_raw", "w_max_abs", "w_norm_sq",
+    "n_params", "in_features", "out_features", "n_tokens_seen",
+    "route_prob", "router_path", "expert_id",
+    "fisher_row", "fisher_col", "g_sq_sum", "act_sq_sum",
+    "act_absmax",
+})
+_SAMPLE_PRECOMPUTE_RESIDENT_FLOAT_FIELDS = (
+    "h_trace_raw", "h_w2_sum_raw", "w_max_abs", "w_norm_sq",
+)
+_SAMPLE_PRECOMPUTE_RESIDENT_INT_FIELDS = (
+    "n_params", "in_features", "out_features", "n_tokens_seen",
+)
+_SAMPLE_PRECOMPUTE_RESIDENT_MARGINAL_FIELDS = (
+    "fisher_row", "fisher_col", "g_sq_sum", "act_sq_sum",
+    "act_absmax",
+)
+
+
+def _scored_lm_head_logits(
+    lm_head: nn.Linear,
+    hidden: torch.Tensor,
+    *,
+    start: int,
+    scored_tokens: int,
+) -> torch.Tensor:
+    """Invoke the terminal Linear on shifted-token rows only (never T pad)."""
+    begin = int(start)
+    width = int(scored_tokens)
+    if hidden.ndim != 3 or begin < 0 or width < 1 or begin + width > hidden.size(1):
+        raise ValueError("lm_head scored-token slice is outside hidden states")
+    return lm_head(hidden[:, begin:begin + width, :]).float()
+
+
+def _validate_sample_parallel_publication_state(
+    *,
+    model: str,
+    qname_census: Mapping[str, object],
+    producer_snapshot_root: str,
+    execution_identity: Mapping[str, object],
+) -> None:
+    """Replay source and runtime identity immediately before publication.
+
+    The *source* half of that replay retired on 2026-09-02:
+    `validate_worker_local_source_census` was built on
+    `prismaquant.rtx4090_artifact_census`, the strict-Ada FP8-CB campaign's
+    closed Qwen3.8-27B layout, which went to
+    archive/gridbook_lane_2026-09-02/ with the Gridbook lane. The runtime half
+    below is unaffected. The sample-parallel worker entry refuses up front
+    rather than publishing with one leg of the replay missing (see the
+    `--sample-run-contract` branch in `main`).
+    """
+    from prismaquant.sample_parallel_probe import (
+        validate_local_producer_snapshot,
+    )
+
+    validate_local_producer_snapshot(
+        producer_snapshot_root,
+        expected_closure_sha256=execution_identity[
+            "producer_snapshot_sha256"
+        ],
+        expected_commit=execution_identity["producer_snapshot_commit"],
+        expected_tree=execution_identity["producer_snapshot_tree"],
+    )
+
+
+def _publish_sample_parallel_importance_stats(
+    output: str | Path,
+    *,
+    partition_contract: Mapping[str, object],
+    execution_identity_sha256: str,
+    ce_sum: float,
+    ce_count: int,
+    publication_postflight: Callable[[], None],
+) -> None:
+    """Publish stage-1 CE only after the same final source/runtime replay."""
+    from prismaquant.sample_parallel_probe import write_local_importance_stats
+
+    publication_postflight()
+    write_local_importance_stats(
+        output,
+        partition_contract=partition_contract,
+        execution_identity_sha256=execution_identity_sha256,
+        ce_sum=ce_sum,
+        ce_count=ce_count,
+    )
+
+
 def _compute_global_precompute(
     ctx: StreamingContext,
     *,
@@ -1156,6 +1880,11 @@ def _compute_global_precompute(
     resident_include_union: str,
     resident_exclude: str,
     activation_cache_dir: str | None,
+    sample_parallel_contract: dict[str, object] | None = None,
+    sample_importance_stats_output: str | None = None,
+    sample_importance_execution_sha256: str | None = None,
+    sample_publication_postflight: Callable[[], None] | None = None,
+    body_global_ce_mean: float | None = None,
 ) -> GlobalPrecompute:
     """Run Phase-1 (streaming forward, cache activations on CPU) and
     Phase-2 (chunked CE backward through lm_head). Install resident
@@ -1188,12 +1917,21 @@ def _compute_global_precompute(
 
     # ---- Phase 1: streaming forward, cache activations on CPU ----
     phase1_expert_info = discover_moe_structure(model, profile=_profile)
+    if sample_parallel_contract is not None and phase1_expert_info:
+        raise RuntimeError(
+            "sample-parallel v1 is dense-only; routed expert Fisher/cache "
+            "rows cannot be assigned exact global sample/token identities"
+        )
+    phase1_router_names = sorted(discover_moe_routers(
+        model, profile=_profile))
+    phase1_tracker = RouterTracker(
+        model, phase1_router_names, top_k=read_top_k(model))
 
     t_phase = time.time()
     with torch.no_grad():
         hidden = base_model.embed_tokens(ids).to(dtype)
     position_embeddings = _compute_position_embeddings(
-        base_model, hidden, position_ids)
+        base_model, hidden, position_ids, _profile)
     causal_mask = _compute_attention_mask(base_model, hidden, position_ids)
 
     hidden = _profile.expand_hidden_for_layers(hidden, base_model)
@@ -1208,61 +1946,98 @@ def _compute_global_precompute(
 
     for d in range(prefetch_depth):
         ctx.schedule_prefetch(d)
-    # Phase-1 activations are captured to host per layer (see the note at
-    # the append below). The pickled precompute cache (and downstream
-    # phase-3) want CPU tensors, which this produces directly.
-    host_acts: list[torch.Tensor] = [hidden.detach().to("cpu")]
-    for L in range(num_layers):
-        load_t0 = time.time()
-        src = ctx.install(L)
-        ctx.schedule_prefetch(L + prefetch_depth)
-        load_s = time.time() - load_t0
-        if minimax_fast_moe:
-            _set_minimax_fast_moe(
-                layers[L], True, chunk_size=minimax_fast_moe_chunk_size)
-        fwd_t0 = time.time()
-        with torch.no_grad():
-            out = _call_layer(
-                layers[L], hidden,
-                position_embeddings=position_embeddings,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                **_profile.extra_layer_kwargs(input_ids=ids),
-                **pass_state,
-            )
-        fwd_s = time.time() - fwd_t0
-        hidden = out
-        # Capture each activation to host inside the loop: stacking all
-        # L+1 activations device-resident before one .cpu() doubles the
-        # peak device memory of the activation working set, at the exact
-        # phase-1/2 transition where the probe's high-water mark already
-        # sits. The copy is per-layer and off the hot path (the layer
-        # forward dominates), so there is nothing worth batching.
-        host_acts.append(hidden.detach().to("cpu"))
-        ctx.unload(L)
-        if L % 8 == 0 or L == num_layers - 1:
-            print(f"[incremental/global] fwd L{L:02d}  src={src}  "
-                  f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
+    # Phase-1 activation capture. Default: stream each layer's activation
+    # to host inside the loop — stacking all L+1 activations
+    # device-resident and doing one batched .cpu() at the end (v22 Fix
+    # E1) doubles the peak device memory of the activation working set at
+    # the exact phase-1/2 transition where the probe's high-water mark
+    # already sits, which DSv4's multi-stream hidden (hc_mult x wider)
+    # can't afford. Honest accounting: the memory saving is real; the
+    # relative *transfer-time* cost of per-layer vs batched copies is
+    # unmeasured — PRISMAQUANT_PROBE_BATCHED_ACT_TRANSFER=1 restores the
+    # v22 batched single-transfer behavior for an A/B. Read once per
+    # probe run (per-layer probe path, not a per-token hot path); both
+    # variants report their true copy time as `host transfer` below.
+    batched_act_transfer = os.environ.get(
+        "PRISMAQUANT_PROBE_BATCHED_ACT_TRANSFER", ""
+    ).lower() in {"1", "true", "yes"}
+    t_h2h_total = 0.0
+    acts: list[torch.Tensor] = []
+
+    def _capture_act(t: torch.Tensor) -> None:
+        nonlocal t_h2h_total
+        if batched_act_transfer:
+            acts.append(t.detach())
+            return
+        t0 = time.time()
+        acts.append(t.detach().to("cpu"))
+        t_h2h_total += time.time() - t0
+
+    _capture_act(hidden)
+    try:
+        for L in range(num_layers):
+            load_t0 = time.time()
+            src = ctx.install(L)
+            ctx.schedule_prefetch(L + prefetch_depth)
+            load_s = time.time() - load_t0
+            if minimax_fast_moe:
+                _set_minimax_fast_moe(
+                    layers[L], True,
+                    chunk_size=minimax_fast_moe_chunk_size,
+                    proj_names=tuple(_profile.unpacked_expert_projection_names()),
+                    class_names=tuple(_profile.packed_expert_module_class_names()),
+                )
+            fwd_t0 = time.time()
+            with torch.no_grad():
+                out = _call_layer(
+                    layers[L], hidden,
+                    position_embeddings=position_embeddings,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    **_profile.extra_layer_kwargs(input_ids=ids),
+                    pass_state=pass_state,
+                )
+            fwd_s = time.time() - fwd_t0
+            hidden = out
+            _capture_act(hidden)
+            ctx.unload(L)
+            if L % 8 == 0 or L == num_layers - 1:
+                print(f"[incremental/global] fwd L{L:02d}  src={src}  "
+                      f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
+    finally:
+        phase1_tracker.remove_hooks()
     # Snapshot the cross-layer shared state (e.g. Gemma4 shared_kv_states)
     # now that the full sequential forward is done — it holds the K/V the
     # KV-sharing layers reuse. Captured to CPU for the pickled precompute so
     # phase-3's isolated forwards can reconstruct it.
     shared_pass_state = _profile.capture_forward_pass_state(pass_state)
 
-    # (v22 Fix E1 — the batched stack-then-.cpu() transfer — is intentionally
-    # NOT used here: activations are captured host-side per layer in the
-    # loop above, so they are already CPU tensors in the expected layout.)
-    t_h2h = time.time()
-    activations_cpu: list[torch.Tensor] = host_acts
-    host_acts = []
+    if batched_act_transfer:
+        # v22 Fix E1: all captures share one (B, T, ..., H) shape — stack
+        # into a single (L+1, ...) tensor, one device→host copy, then
+        # split back into the list layout the precompute pickle and
+        # phase-3 expect.
+        t0 = time.time()
+        stacked = torch.stack(acts, dim=0).cpu()
+        activations_cpu: list[torch.Tensor] = [
+            stacked[i].clone() for i in range(stacked.size(0))
+        ]
+        del stacked
+        t_h2h_total = time.time() - t0
+    else:
+        activations_cpu = acts
+    acts = []
     print(f"[incremental/global] phase-1 forward: {time.time()-t_phase:.1f}s  "
-          f"(host transfer {time.time()-t_h2h:.1f}s)  "
+          f"(host transfer {t_h2h_total:.1f}s)  "
           f"{ctx.layer_cache.summary()}", flush=True)
 
-    phase1_router_counts = {}
-    phase1_router_totals = {}
-    phase1_router_active_counts = {}
-    phase1_expert_route_stats = {}
+    phase1_router_counts = phase1_tracker.counts
+    phase1_router_totals = dict(phase1_tracker.total_tokens)
+    phase1_router_active_counts = phase1_tracker.active_counts
+    phase1_expert_route_stats = phase1_tracker.route_stats
+    print(f"[incremental/global] router coverage: "
+          f"{len(phase1_router_counts)}/{len(phase1_router_names)} routers "
+          f"recorded", flush=True)
 
     # ---- Phase 2: final norm + lm_head + CE loss; grad at final hidden ----
     ctx.layer_cache.clear()
@@ -1281,6 +2056,10 @@ def _compute_global_precompute(
     resident_stats: dict[str, dict] = {}
     resident_h_full: dict[str, torch.Tensor] = {}
     resident_g2_per_token: dict[str, list[torch.Tensor]] = defaultdict(list)
+    # Device-resident per-channel marginals, drained once after phase-2's
+    # backward completes (below) rather than per hook call.
+    resident_marginals: dict[str, list[torch.Tensor]] = {}
+    _emit_marginals = _marginals_enabled()
     resident_saved_inputs: dict[str, torch.Tensor] = {}
     resident_handles: list = []
     resident_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
@@ -1288,7 +2067,15 @@ def _compute_global_precompute(
     resident_act_rows: dict[str, int] = defaultdict(int)
     resident_act_token_offsets: dict[str, int] = defaultdict(int)
     resident_input_rows_limit = 256
-    _resident_cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
+    # v1 intentionally omits resident/MTP activation blobs from the strict
+    # merge cover.  lm_head is terminal BF16 for the target campaign, and its
+    # chunk-major phase-2 calls do not expose a direct sample/token row map to
+    # the generic hook. Body dense Linears retain the exact cache lane below.
+    _resident_cache_dir = (
+        Path(activation_cache_dir)
+        if activation_cache_dir and sample_parallel_contract is None
+        else None
+    )
     if _resident_cache_dir is not None:
         _resident_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1341,10 +2128,34 @@ def _compute_global_precompute(
                     dtype=torch.float32, device="cpu")
                 resident_h_full[name] = acc
             acc.add_(chunk_h.float().to("cpu"))
-            # Trace via the outer-product-norm identity (avoids a second
-            # full matmul, just two reductions of size T).
-            resident_stats[name]["h_trace_raw"] += float(
-                (gy2_sq.sum(dim=1) * x2_sq.sum(dim=1)).sum().item())
+            # Trace from the SAME fp32 object the marginals reduce, which is
+            # how both body-layer sites do it (`h_trace_dev = chunk_h.sum()`).
+            # This makes `sum(fisher_row) == sum(fisher_col) == h_trace_raw`
+            # hold BY CONSTRUCTION rather than as a numerical coincidence.
+            #
+            # It used to use the outer-product-norm identity
+            # `Σ_t (Σ_o gy²)(Σ_i x²)`, justified as "avoids a second full
+            # matmul". That justification was stale on THIS path: `chunk_h` is
+            # materialized unconditionally three lines up (it has to be — it
+            # feeds `resident_h_full`), so summing it is free and no second
+            # matmul was ever avoided.
+            #
+            # The identity route was also numerically wrong here, and lm_head
+            # is where it showed. Both reductions ran in bf16 (no
+            # `dtype=torch.float32`, unlike `_marginal_chunk`, which forces
+            # fp32 precisely because "a T-long running sum in bf16 loses real
+            # precision for free"). `gy2_sq.sum(dim=1)` reduces over the OUTPUT
+            # dim, which for lm_head is the vocabulary — ~152k bf16 addends on
+            # Qwen3 against ~1-5k for a body Linear. With 8 mantissa bits that
+            # cost ~1e-3 relative on lm_head and ~1e-8 elsewhere, which is
+            # exactly the split the first real-model run measured: lm_head was
+            # the ONLY unit of 197 whose h_trace disagreed with its own
+            # marginals, and it failed `SensitivityCard.validate()` alone.
+            resident_stats[name]["h_trace_raw"] += float(chunk_h.sum().item())
+            if _emit_marginals:
+                _marginal_accumulate(
+                    resident_marginals, name,
+                    _marginal_chunk(gy2_sq, x2_sq, x2, chunk_h))
             w = mod_ref.weight
             if w is not None and not w.is_meta:
                 resident_stats[name]["h_w2_sum_raw"] += float(
@@ -1353,12 +2164,59 @@ def _compute_global_precompute(
             resident_stats[name]["n_tokens_seen"] += x2.size(0)
         return hook
 
+    def _make_resident_grouped_bwd(name: str, mod_ref: nn.Linear,
+                                   num_groups: int):
+        """Resident-path grouped fold (wo_a shape). Immediate like the
+        dense resident hook; reductions via `grouped_linear_fisher_chunk`
+        so both backends share one mechanism. Marginals land in the same
+        five-key slot and index the flat [G*R, D] plane."""
+        def hook(module, grad_input, grad_output):
+            gy = grad_output[0]
+            x = resident_saved_inputs.pop(name, None)
+            if x is None or gy is None:
+                return
+            pieces = grouped_linear_fisher_chunk(x, gy, num_groups,
+                                                 mod_ref.weight)
+            resident_stats[name]["h_trace_raw"] += float(
+                pieces["h_trace"].item())
+            if _emit_marginals:
+                _marginal_accumulate(
+                    resident_marginals, name,
+                    [pieces["fisher_row"], pieces["fisher_col"],
+                     pieces["g_sq_sum"], pieces["act_sq_sum"],
+                     pieces["act_absmax"]])
+            w = mod_ref.weight
+            if w is not None and not w.is_meta:
+                if pieces["h_w2"] is not None:
+                    resident_stats[name]["h_w2_sum_raw"] += float(
+                        pieces["h_w2"].item())
+            # TOKENS, not token-group pairs (metadata parity with dense).
+            tokens = int(x.numel()) // (num_groups * int(x.shape[-1]))
+            resident_stats[name]["n_tokens_seen"] += tokens
+        return hook
+
     for fqn in resident_tracked:
         mod = model.get_submodule(fqn)
         if not isinstance(mod, nn.Linear):
             continue
         w = mod.weight
         if w.is_meta:
+            continue
+        num_groups_res = grouped_linear_groups(mod, _profile)
+        if num_groups_res is not None:
+            resident_stats[fqn] = grouped_linear_stats_entry(
+                mod, num_groups_res,
+                w_max_abs=float(w.detach().abs().max().item()),
+                w_norm_sq=float(w.detach().pow(2).sum().item()))
+            if _emit_marginals:
+                resident_stats[fqn].update(
+                    _marginal_zeros(mod.out_features, mod.in_features))
+            for p in mod.parameters():
+                p.requires_grad_(True)
+            resident_handles.append(
+                mod.register_forward_hook(_make_resident_fwd(fqn)))
+            resident_handles.append(mod.register_full_backward_hook(
+                _make_resident_grouped_bwd(fqn, mod, num_groups_res)))
             continue
         resident_stats[fqn] = {
             "h_trace_raw": 0.0,
@@ -1373,6 +2231,9 @@ def _compute_global_precompute(
             "router_path": None,
             "expert_id": None,
         }
+        if _emit_marginals:
+            resident_stats[fqn].update(
+                _marginal_zeros(mod.out_features, mod.in_features))
         for p in mod.parameters():
             p.requires_grad_(True)
         resident_handles.append(mod.register_forward_hook(_make_resident_fwd(fqn)))
@@ -1391,22 +2252,60 @@ def _compute_global_precompute(
     grad_buf = torch.zeros_like(norm_out_d)
     chunk_T = 256
     N, T, _ = norm_out_d.shape
-    if importance_weighting:
+    if importance_weighting and body_global_ce_mean is None:
         total_ce, total_count = 0.0, 0
         for start in range(0, T - 1, chunk_T):
             end = min(start + chunk_T, T)
+            cut = end - 1 - start if end >= T else end - start
+            if cut <= 0:
+                continue
             with torch.no_grad():
-                preds = model.lm_head(norm_out_d[:, start:end, :]).float()
-                cut = end - 1 - start if end >= T else end - start
-                if cut <= 0:
-                    continue
-                preds = preds[:, :cut, :]
+                preds = _scored_lm_head_logits(
+                    model.lm_head, norm_out_d,
+                    start=start, scored_tokens=cut,
+                )
                 tgt = ids[:, start + 1:start + 1 + cut]
                 lp_c = F.log_softmax(preds.reshape(-1, preds.size(-1)), dim=-1)
                 tok_ce = -lp_c.gather(1, tgt.reshape(-1, 1)).squeeze(1)
                 total_ce += float(tok_ce.sum().item())
                 total_count += int(tok_ce.numel())
         ce_mean = total_ce / max(total_count, 1)
+        if sample_importance_stats_output is not None:
+            if sample_parallel_contract is None:
+                raise RuntimeError(
+                    "sample importance collection lacks a partition contract"
+                )
+            for handle in resident_handles:
+                handle.remove()
+            resident_handles.clear()
+            resident_saved_inputs.clear()
+            if sample_publication_postflight is None:
+                raise RuntimeError(
+                    "sample importance publication lacks source/runtime "
+                    "postflight validation"
+                )
+            _publish_sample_parallel_importance_stats(
+                sample_importance_stats_output,
+                partition_contract=sample_parallel_contract,
+                execution_identity_sha256=str(
+                    sample_importance_execution_sha256
+                ),
+                ce_sum=total_ce,
+                ce_count=total_count,
+                publication_postflight=sample_publication_postflight,
+            )
+            print(
+                "[incremental/global] wrote sample-parallel local CE "
+                f"summary to {sample_importance_stats_output}; phase1 will "
+                "be rerun after the global scalar barrier "
+                "(duplicate_phase1_forward_v1)",
+                flush=True,
+            )
+            raise SystemExit(0)
+    elif importance_weighting:
+        ce_mean = float(body_global_ce_mean)
+        if not np.isfinite(ce_mean) or ce_mean <= 0.0:
+            raise RuntimeError("global importance CE mean must be finite and positive")
     else:
         ce_mean = None
 
@@ -1415,7 +2314,10 @@ def _compute_global_precompute(
         cut = end - 1 - start if end >= T else end - start
         if cut <= 0:
             continue
-        preds = model.lm_head(norm_out_d[:, start:end, :]).float()[:, :cut, :]
+        preds = _scored_lm_head_logits(
+            model.lm_head, norm_out_d,
+            start=start, scored_tokens=cut,
+        )
         tgt = ids[:, start + 1:start + 1 + cut]
         lp_c = F.log_softmax(preds.reshape(-1, preds.size(-1)), dim=-1)
         tok_ce = -lp_c.gather(1, tgt.reshape(-1, 1)).squeeze(1)
@@ -1434,6 +2336,9 @@ def _compute_global_precompute(
         h.remove()
     resident_handles.clear()
     resident_saved_inputs.clear()
+    # One device→host transfer for every resident Linear's marginals,
+    # after the backward is done — the hooks themselves never synced.
+    _marginal_flush(resident_marginals, resident_stats)
     del grad_buf, norm_out, norm_out_d, final_hidden
     gc.collect()
     if device.type == "cuda":
@@ -1471,7 +2376,8 @@ def _save_precompute_cache(path: Path, pre: GlobalPrecompute,
     format; this file is on the order of (num_layers+1) * act_size,
     typically hundreds of MB for 122B with N=4 T=256."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    payload = {
+        "schema": _PRECOMPUTE_CACHE_SCHEMA,
         "activations_cpu": pre.activations_cpu,
         "grad_at_tail": pre.grad_at_tail,
         "ids_cpu": pre.ids.detach().cpu(),
@@ -1485,12 +2391,350 @@ def _save_precompute_cache(path: Path, pre: GlobalPrecompute,
         "router_totals": pre.router_totals,
         "router_active_counts": pre.router_active_counts,
         "expert_route_stats": pre.expert_route_stats,
+        # Per-pass cross-layer shared state captured at the end of phase-1
+        # (Gemma4 `shared_kv_states`). MUST be persisted: phase-3's isolated
+        # forwards rebuild each KV-sharing layer's borrowed K/V from it, and
+        # the shard runners routinely read the precompute back from this
+        # cache (resume, or one shard process per body shard). Without it a
+        # resumed run hands KV-sharing layers an empty dict and the layer
+        # raises `KeyError: <source layer idx>` inside attention.
+        "shared_pass_state": pre.shared_pass_state,
         "meta": meta,
-    }, str(path))
+    }
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            torch.save(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _precompute_tensors_are_finite(value: object) -> bool:
+    if isinstance(value, torch.Tensor):
+        return (
+            value.layout == torch.strided
+            and (
+                not torch.is_floating_point(value)
+                or bool(torch.isfinite(value).all().item())
+            )
+        )
+    if isinstance(value, np.ndarray):
+        return value.dtype.kind not in "fc" or bool(np.isfinite(value).all())
+    if isinstance(value, Mapping):
+        return all(
+            _precompute_tensors_are_finite(item) for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return all(_precompute_tensors_are_finite(item) for item in value)
+    if isinstance(value, (float, np.floating)):
+        return bool(np.isfinite(value))
+    return True
+
+
+def _sample_precompute_close(
+    observed: object,
+    expected: object,
+) -> bool:
+    return bool(np.allclose(
+        np.asarray(observed, dtype=np.float64),
+        np.asarray(expected, dtype=np.float64),
+        rtol=1e-5,
+        atol=1e-6,
+    ))
+
+
+def _validate_sample_precompute_resident_payload(
+    data: Mapping[str, object],
+    ids: torch.Tensor,
+    activations: list[torch.Tensor],
+    expected_meta: Mapping[str, Any],
+) -> None:
+    """Close the sample-v1 phase-2 resident-Fisher cache contract.
+
+    The qualified dense Qwen lane has one resident probed Linear: ``lm_head``.
+    MTP is sourced and probed separately, while every decoder Linear is
+    phase-3/layer scoped.  A resumable cache must therefore reproduce the
+    exact lm-head raw accumulator rather than merely naming an arbitrary
+    finite subset of the broader probe census.
+    """
+    from prismaquant.sample_parallel_probe import (
+        LM_HEAD_STATS_ONLY,
+        validate_qname_census,
+    )
+
+    sample_contract = expected_meta.get("sample_parallel")
+    census_raw = expected_meta.get("sample_parallel_qname_census")
+    if not isinstance(sample_contract, Mapping):
+        raise ValueError("sample precompute partition contract differs")
+    if not isinstance(census_raw, Mapping):
+        raise ValueError("sample precompute lacks qname census binding")
+    try:
+        census = validate_qname_census(census_raw)
+    except Exception as exc:
+        raise ValueError("sample precompute qname census differs") from exc
+
+    n_samples, seqlen = (int(ids.shape[0]), int(ids.shape[1]))
+    if (
+        type(sample_contract.get("local_samples")) is not int
+        or sample_contract.get("local_samples") != n_samples
+        or type(sample_contract.get("seqlen")) is not int
+        or sample_contract.get("seqlen") != seqlen
+        or seqlen < 2
+    ):
+        raise ValueError("sample precompute partition geometry differs")
+    expected_tokens = n_samples * (seqlen - 1)
+
+    probe_entries = census["probe_qname_manifest"]["entries"]
+    resident_entries = {
+        str(name): entry
+        for name, entry in probe_entries.items()
+        if entry["disposition"] == LM_HEAD_STATS_ONLY
+    }
+    # This cache contract is deliberately lane-specific.  A future profile
+    # with another terminal resident module must define its own cover rather
+    # than becoming silently reusable under the Qwen sample-v1 identity.
+    if set(resident_entries) != {"lm_head"}:
+        raise ValueError("sample precompute resident qname census differs")
+    expected_qnames = set(resident_entries)
+
+    resident_maps = (
+        "resident_stats", "resident_h_full", "resident_g2_per_token",
+    )
+    for field in resident_maps:
+        if set(data[field]) != expected_qnames:
+            raise ValueError(
+                f"sample precompute exact resident cover differs in {field}"
+            )
+    for field in ("resident_act_snaps", "resident_act_row_indices"):
+        if data[field]:
+            raise ValueError(
+                f"sample precompute resident activation map {field} is nonempty"
+            )
+    if data.get("shared_pass_state") is not None:
+        raise ValueError("sample precompute Qwen shared pass state is nonempty")
+
+    for qname, entry in resident_entries.items():
+        shape = entry.get("shape")
+        if (
+            not isinstance(shape, list)
+            or len(shape) != 2
+            or any(type(value) is not int or value < 1 for value in shape)
+        ):
+            raise ValueError(
+                f"sample precompute source geometry differs for {qname}"
+            )
+        out_features, in_features = int(shape[0]), int(shape[1])
+        row = data["resident_stats"][qname]
+        if (
+            not isinstance(row, dict)
+            or set(row) != _SAMPLE_PRECOMPUTE_RESIDENT_STAT_KEYS
+        ):
+            raise ValueError(
+                f"sample precompute raw resident stat schema differs for {qname}"
+            )
+        for field in _SAMPLE_PRECOMPUTE_RESIDENT_FLOAT_FIELDS:
+            value = row[field]
+            if type(value) is not float or not np.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"sample precompute raw resident {field} differs for {qname}"
+                )
+        expected_ints = {
+            "n_params": out_features * in_features,
+            "in_features": in_features,
+            "out_features": out_features,
+            "n_tokens_seen": expected_tokens,
+        }
+        for field in _SAMPLE_PRECOMPUTE_RESIDENT_INT_FIELDS:
+            value = row[field]
+            if type(value) is not int or value != expected_ints[field]:
+                raise ValueError(
+                    f"sample precompute raw resident {field} differs for {qname}"
+                )
+        if any(row[field] is not None for field in (
+            "route_prob", "router_path", "expert_id",
+        )):
+            raise ValueError(
+                f"sample precompute resident routed markers differ for {qname}"
+            )
+
+        marginals: dict[str, np.ndarray] = {}
+        for field in _SAMPLE_PRECOMPUTE_RESIDENT_MARGINAL_FIELDS:
+            value = row[field]
+            expected_length = (
+                out_features
+                if field in {"fisher_row", "g_sq_sum"}
+                else in_features
+            )
+            if (
+                not isinstance(value, np.ndarray)
+                or value.dtype != np.dtype(np.float32)
+                or value.shape != (expected_length,)
+                or not bool(np.isfinite(value).all())
+                or bool((value < 0.0).any())
+            ):
+                raise ValueError(
+                    f"sample precompute resident marginal {field} differs "
+                    f"for {qname}"
+                )
+            marginals[field] = value
+
+        h_full = data["resident_h_full"][qname]
+        g2 = data["resident_g2_per_token"][qname]
+        if (
+            not isinstance(h_full, torch.Tensor)
+            or h_full.layout != torch.strided
+            or h_full.dtype != torch.float32
+            or h_full.device.type != "cpu"
+            or tuple(h_full.shape) != (out_features, in_features)
+            or not bool(torch.isfinite(h_full).all().item())
+            or bool((h_full < 0.0).any().item())
+        ):
+            raise ValueError(
+                f"sample precompute resident h_full differs for {qname}"
+            )
+        if (
+            not isinstance(g2, torch.Tensor)
+            or g2.layout != torch.strided
+            or g2.dtype != torch.float32
+            or g2.device.type != "cpu"
+            or tuple(g2.shape) != (expected_tokens,)
+            or not bool(torch.isfinite(g2).all().item())
+            or bool((g2 < 0.0).any().item())
+        ):
+            raise ValueError(
+                f"sample precompute resident g2-per-token differs for {qname}"
+            )
+
+        h_numpy = h_full.numpy()
+        trace = row["h_trace_raw"]
+        if not all((
+            _sample_precompute_close(marginals["fisher_row"].sum(), trace),
+            _sample_precompute_close(marginals["fisher_col"].sum(), trace),
+            _sample_precompute_close(h_numpy.sum(), trace),
+            _sample_precompute_close(
+                h_numpy.sum(axis=1), marginals["fisher_row"]
+            ),
+            _sample_precompute_close(
+                h_numpy.sum(axis=0), marginals["fisher_col"]
+            ),
+            _sample_precompute_close(
+                g2.sum().item(), marginals["g_sq_sum"].sum()
+            ),
+        )):
+            raise ValueError(
+                f"sample precompute resident Fisher consistency differs for {qname}"
+            )
+
+    activation_entries = census["activation_qname_manifest"]["entries"]
+    layer_indices = {
+        int(match.group(1))
+        for name in activation_entries
+        if (match := re.search(
+            r"(?:^|[.])layers[.](\d+)(?:[.]|$)", str(name)
+        ))
+    }
+    if (
+        not layer_indices
+        or layer_indices != set(range(max(layer_indices) + 1))
+        or len(activations) != max(layer_indices) + 2
+    ):
+        raise ValueError("sample precompute layer activation cover differs")
+
+
+def _validate_precompute_cache_payload(
+    data: object,
+    expected_meta: Mapping[str, Any],
+    *,
+    sample_calibration: torch.Tensor | None,
+) -> tuple[dict[str, object], torch.Tensor]:
+    if (
+        not isinstance(data, dict)
+        or set(data) != _PRECOMPUTE_CACHE_KEYS
+        or data.get("schema") != _PRECOMPUTE_CACHE_SCHEMA
+        or not isinstance(data.get("meta"), dict)
+        or data["meta"] != dict(expected_meta)
+    ):
+        raise ValueError("precompute cache schema/meta differs")
+    ids = data.get("ids_cpu")
+    activations = data.get("activations_cpu")
+    grad = data.get("grad_at_tail")
+    if (
+        not isinstance(ids, torch.Tensor)
+        or ids.dtype != torch.int64
+        or ids.ndim != 2
+        or not isinstance(activations, list)
+        or not activations
+        or any(
+            not isinstance(value, torch.Tensor)
+            or value.ndim != 3
+            or not torch.is_floating_point(value)
+            or tuple(value.shape[:2]) != tuple(ids.shape)
+            or not bool(torch.isfinite(value).all().item())
+            for value in activations
+        )
+        or len({tuple(value.shape) for value in activations}) != 1
+        or not isinstance(grad, torch.Tensor)
+        or not torch.is_floating_point(grad)
+        or tuple(grad.shape) != tuple(activations[-1].shape)
+        or not bool(torch.isfinite(grad).all().item())
+    ):
+        raise ValueError("precompute cache activation/gradient geometry differs")
+    mapping_fields = (
+        "resident_stats", "resident_h_full", "resident_g2_per_token",
+        "resident_act_snaps", "resident_act_row_indices", "expert_info",
+        "router_counts", "router_totals", "router_active_counts",
+        "expert_route_stats",
+    )
+    if any(not isinstance(data.get(name), dict) for name in mapping_fields):
+        raise ValueError("precompute cache resident/routed containers differ")
+    if not _precompute_tensors_are_finite(data):
+        raise ValueError("precompute cache contains a non-finite tensor/value")
+
+    sample_contract = expected_meta.get("sample_parallel")
+    if sample_contract is not None:
+        expected_ids = (
+            sample_calibration.detach().to("cpu")
+            if isinstance(sample_calibration, torch.Tensor) else None
+        )
+        if (
+            not isinstance(sample_contract, Mapping)
+            or expected_ids is None
+            or expected_ids.dtype != torch.int64
+            or tuple(ids.shape) != tuple(expected_ids.shape)
+            or not torch.equal(ids, expected_ids)
+            or calibration_data_hash(ids)
+            != sample_contract.get("local_calibration_hash")
+        ):
+            raise ValueError("sample precompute ids differ")
+        for map_name in (
+            "expert_info", "router_counts", "router_totals",
+            "router_active_counts", "expert_route_stats",
+        ):
+            if data[map_name]:
+                raise ValueError(
+                    f"sample precompute routed map {map_name!r} is nonempty"
+                )
+        _validate_sample_precompute_resident_payload(
+            data, ids, activations, expected_meta
+        )
+    return data, ids
 
 
 def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
-                           device: torch.device) -> GlobalPrecompute | None:
+                           device: torch.device,
+                           sample_calibration: torch.Tensor | None = None,
+                           ) -> GlobalPrecompute | None:
     """Load cached precompute if meta matches; return None otherwise."""
     if not path.exists():
         return None
@@ -1500,57 +2744,61 @@ def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
         print(f"[incremental/global] cache load failed ({e}); recomputing",
               flush=True)
         return None
-    cached_meta = data.get("meta") or {}
-    for key, expected in expected_meta.items():
-        if cached_meta.get(key) != expected:
-            print(f"[incremental/global] cache meta mismatch on {key!r}: "
-                  f"cached={cached_meta.get(key)!r} expected={expected!r}; "
-                  "recomputing", flush=True)
-            return None
+    try:
+        data, ids_cpu = _validate_precompute_cache_payload(
+            data,
+            expected_meta,
+            sample_calibration=sample_calibration,
+        )
+    except Exception as exc:
+        print(
+            f"[incremental/global] cache validation failed ({exc}); "
+            "recomputing",
+            flush=True,
+        )
+        return None
+    sample_contract = expected_meta.get("sample_parallel")
     return GlobalPrecompute(
         activations_cpu=data["activations_cpu"],
         grad_at_tail=data["grad_at_tail"],
-        ids=data["ids_cpu"].to(device),
+        ids=ids_cpu.to(device),
         resident_stats=data["resident_stats"],
         resident_h_full=data["resident_h_full"],
         resident_g2_per_token=data.get("resident_g2_per_token", {}),
         resident_act_snaps=data["resident_act_snaps"],
         resident_act_row_indices=data.get("resident_act_row_indices", {}),
-        expert_info=data.get("expert_info", {}),
-        router_counts={},
-        router_totals={},
-        router_active_counts={},
-        expert_route_stats={},
+        expert_info=(
+            data["expert_info"] if sample_contract is not None
+            else data.get("expert_info", {})
+        ),
+        router_counts=(
+            data["router_counts"] if sample_contract is not None else {}
+        ),
+        router_totals=(
+            data["router_totals"] if sample_contract is not None else {}
+        ),
+        router_active_counts=(
+            data["router_active_counts"]
+            if sample_contract is not None else {}
+        ),
+        expert_route_stats=(
+            data["expert_route_stats"]
+            if sample_contract is not None else {}
+        ),
+        # Restore the phase-1 cross-layer shared state (Gemma4
+        # `shared_kv_states`); `None` for every architecture that declares no
+        # per-pass shared kwargs, and for caches written before this key
+        # existed — on a KV-sharing model those hit the profile's loud
+        # "delete the precompute cache" error instead of a bare KeyError.
+        shared_pass_state=data.get("shared_pass_state"),
     )
 
 
-def finalize_fisher_stats(merged_stats: dict, global_tokens: int) -> None:
-    """Normalize raw Fisher accumulators into ``h_trace`` (etc.), in place.
-
-    Fisher normalization must share ONE denominator across every row: the
-    global calibration token count (nsamples x seqlen). Dense trunk Linears
-    accumulate exactly that many tokens in ``n_tokens_seen``, so their
-    values are unchanged by dividing by the global count. Per-expert
-    Linears, however, only see their ROUTED tokens; a per-row
-    ``h_trace_raw / n_tokens_seen`` inflates a rarely-routed expert's
-    Fisher by (global/routed) — exactly inverted importance weighting (the
-    least-used experts look the most sensitive). Tokens never routed to an
-    expert contribute zero gradient, so the empirical Fisher over the
-    calibration set divides by the GLOBAL count for every row.
-    ``n_tokens_seen`` is kept raw (routed count) — the h_detail blob writer
-    still normalizes per-Linear and stamps units="per_token" for its own
-    single-tensor consumers.
-    """
-    for s in merged_stats.values():
-        s["h_trace"] = s.get("h_trace_raw", 0.0) / global_tokens
-        s["h_w2_sum"] = s.get("h_w2_sum_raw", 0.0) / global_tokens
-        # Per-expert Fisher trace (only present on packed-3D stat entries;
-        # dense Linears have no per-expert dimension). Normalize by the
-        # same token count so it shares units with `h_trace`.
-        per = s.get("h_trace_per_expert_raw")
-        if per is not None:
-            s["h_trace_per_expert"] = [float(v) / global_tokens for v in per]
-        s["h_trace_norm_tokens"] = global_tokens
+# `finalize_fisher_stats` lives in sensitivity_probe (next to
+# h_detail_blob, so both probe backends and every h-detail writer share
+# the single global-token normalization convention); it is re-exported
+# here because this module is the production backend consumers import
+# it from.
 
 
 # ---------------------------------------------------------------------------
@@ -1578,6 +2826,8 @@ def _run_body_streaming_shard(
     minimax_fast_moe_chunk_size: int = 32,
     activation_rows_limit: int = 256,
     precomputed: GlobalPrecompute | None = None,
+    sample_parallel_contract: dict[str, object] | None = None,
+    sample_parallel_execution_identity_sha256: str | None = None,
 ):
     if precomputed is None:
         raise ValueError(
@@ -1606,6 +2856,14 @@ def _run_body_streaming_shard(
     ]
     all_tracked = [n for n in all_linears
                    if inc.search(n) and not exc.search(n)]
+    if sample_parallel_contract is not None:
+        routed = sorted(set(all_tracked) & set(precomputed.expert_info))
+        if routed:
+            raise RuntimeError(
+                "sample-parallel v1 activation capture is dense-only; "
+                "routed expert qnames lack exact sample/token row origins: "
+                f"{routed[:4]}"
+            )
     layer_linear_names: list[list[str]] = []
     for L in range(num_layers):
         pref = f"{layers_prefix}{L}."
@@ -1639,6 +2897,10 @@ def _run_body_streaming_shard(
                     "model": model_path,
                     "dataset": dataset_name,
                     "nsamples": int(calib.size(0)),
+                    # R14: calibration identity, so held-out disjointness is
+                    # verifiable from the artifact instead of resting on the
+                    # driver passing the right --calib-skip-first.
+                    "calib_hash": calibration_data_hash(calib),
                     "seqlen": seqlen,
                     "dtype": dtype_name,
                     "device_map": "streaming-layerwise",
@@ -1657,6 +2919,11 @@ def _run_body_streaming_shard(
           f"across {sum(1 for x in layer_linear_names if x)} layers "
           f"+ {len(resident_linears)} resident Linears "
           f"(include={linear_include!r})", flush=True)
+
+    # One shared Fisher denominator for every row AND every h-detail blob
+    # — the global calib token count (see finalize_fisher_stats for why
+    # per-row n_tokens_seen is wrong for routed-expert Linears).
+    global_tokens = max(int(calib.size(0)) * int(seqlen), 1)
 
     top_k = read_top_k(model, default=2)
 
@@ -1681,7 +2948,7 @@ def _run_body_streaming_shard(
         # produced activations_cpu[0]; call on an on-device copy once.
         embed0 = activations_cpu[0].to(device).to(dtype)
         position_embeddings = _compute_position_embeddings(
-            base_model, embed0, position_ids)
+            base_model, embed0, position_ids, _shard_profile)
         causal_mask = _compute_attention_mask(base_model, embed0, position_ids)
         del embed0
     print(f"[incremental] shard reuses global precompute "
@@ -1720,12 +2987,26 @@ def _run_body_streaming_shard(
     # Linears; resident snaps were populated during Phase-2 hooks above).
     activation_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
     activation_row_indices: dict[str, list[torch.Tensor]] = defaultdict(list)
+    activation_row_priorities: dict[str, list[torch.Tensor]] = defaultdict(list)
+    activation_candidate_rows: dict[str, int] = defaultdict(int)
     activation_rows: dict[str, int] = defaultdict(int)
     activation_token_offsets: dict[str, int] = defaultdict(int)
     input_rows_limit = max(1, int(activation_rows_limit))
     cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
+    activation_priority_plan = None
+    if sample_parallel_contract is not None and cache_dir is not None:
+        from prismaquant.sample_parallel_probe import (
+            ActivationPriorityPlanCache,
+        )
+
+        # Layer-scoped deterministic selection metadata.  It lives beside the
+        # existing activation accumulators, never owns activations/weights,
+        # and is cleared at the existing per-layer flush below.
+        activation_priority_plan = ActivationPriorityPlanCache(
+            sample_parallel_contract
+        )
     act_fname_sub = re.compile(r"[^A-Za-z0-9_-]")
 
     # v22 Fix C: async + batched activation cache writes.
@@ -1754,6 +3035,8 @@ def _run_body_streaming_shard(
     def flush_activation_snapshots(
         snaps_by_name: dict[str, list[torch.Tensor]],
         indices_by_name: dict[str, list[torch.Tensor]] | None = None,
+        priorities_by_name: dict[str, list[torch.Tensor]] | None = None,
+        candidate_rows_by_name: dict[str, int] | None = None,
     ):
         if cache_dir is None:
             return
@@ -1769,9 +3052,12 @@ def _run_body_streaming_shard(
             # #43: PRISMAQUANT_ACT_CACHE_FP32 keeps activations at FP32
             # for better Hessian numerical stability in the cost step.
             # 2× storage cost; recommended when disk is plentiful.
-            cache_dtype = (torch.float32
-                           if os.environ.get("PRISMAQUANT_ACT_CACHE_FP32", "1") != "0"
-                           else torch.bfloat16)
+            cache_dtype = (
+                torch.float32
+                if sample_parallel_contract is not None
+                or os.environ.get("PRISMAQUANT_ACT_CACHE_FP32", "1") != "0"
+                else torch.bfloat16
+            )
             X = torch.cat(snaps, dim=0).to(
                 "cpu", dtype=cache_dtype
             ).contiguous()
@@ -1780,11 +3066,47 @@ def _run_body_streaming_shard(
                 index_parts = indices_by_name.pop(name, [])
                 if index_parts:
                     row_indices = torch.cat(index_parts, dim=0).to(
-                        torch.long
+                        "cpu", dtype=torch.long
+                    ).contiguous()
+            row_priorities = None
+            if priorities_by_name is not None:
+                priority_parts = priorities_by_name.pop(name, [])
+                if priority_parts:
+                    row_priorities = torch.cat(priority_parts, dim=0).to(
+                        "cpu", dtype=torch.long
                     ).contiguous()
             payload = {"inputs": X, "name": name}
             if row_indices is not None and row_indices.numel() == X.shape[0]:
                 payload["row_indices"] = row_indices
+            if sample_parallel_contract is not None:
+                if sample_parallel_execution_identity_sha256 is None:
+                    raise RuntimeError(
+                        "sample-parallel activation lacks execution identity"
+                    )
+                if (
+                    row_indices is None
+                    or row_priorities is None
+                    or row_priorities.numel() != X.shape[0]
+                    or candidate_rows_by_name is None
+                ):
+                    raise RuntimeError(
+                        f"sample-parallel activation provenance incomplete for {name}"
+                    )
+                from prismaquant.sample_parallel_probe import (
+                    activation_cache_shard_stamp,
+                )
+                payload["row_priorities"] = row_priorities
+                payload["sample_parallel_activation"] = (
+                    activation_cache_shard_stamp(
+                        sample_parallel_contract,
+                        qname=name,
+                        rows_limit=input_rows_limit,
+                        candidate_rows=int(candidate_rows_by_name.pop(name, 0)),
+                        execution_identity_sha256=(
+                            sample_parallel_execution_identity_sha256
+                        ),
+                    )
+                )
             fname = act_fname_sub.sub("__", name) + ".pt"
             target = cache_dir / fname
             if _act_pool is not None:
@@ -1838,16 +3160,44 @@ def _run_body_streaming_shard(
         in_scope_layers = {L for L in range(num_layers) if layer_linear_names[L]}
         ctx.layer_cache.set_priority_layers(in_scope_layers)
         ctx.configure_runtime_pressure_floor()
+        # The reverse sweep exists to deliver gradients to the tracked
+        # layers; backward below the LOWEST tracked layer computes VJPs
+        # nobody consumes (weight-Fisher for layer a needs only the
+        # cached boundary input at a and the grad at a's output). Stop
+        # there — for high shards this removes most of the sweep's
+        # layer loads.
+        stop_L = min(in_scope_layers)
+        # Cap lookahead so protected demand (priority in-scope layers +
+        # pinned prefetches + the layer being consumed) fits the cache.
+        # Oversubscription forces last-resort eviction of pinned entries,
+        # and every such eviction is a full re-read of a multi-GB layer
+        # (measured: evicted_pinned=37/sweep = ~152 GB of doubled disk
+        # traffic on Laguna-117B at depth 12 with 7 in-scope layers).
+        cache_slots = max(1, int(ctx.layer_cache.max_bytes
+                                 // max(1, ctx.estimated_layer_bytes)))
+        prefetch_depth = max(2, min(
+            prefetch_depth, cache_slots - len(in_scope_layers) - 4))
+        # KV-cotangent path: a fresh accumulator per SWEEP. A consumer of
+        # shared state always sits above its producer, so the reverse walk
+        # collects every consumer's cotangent before a producer at or above
+        # stop_L is forwarded — no cross-shard or cross-sweep state. A
+        # producer BELOW stop_L is untracked in this shard (its h_trace is
+        # measured by the shard that tracks it, whose stop_L sits at or
+        # below it); its never-delivered cotangents are discarded at sweep
+        # end and surface in the pending_keys diagnostic.
+        kv_cotangents = SharedStateCotangents(
+            enabled=kv_cotangent_path_enabled())
         # Reverse-prefetch (Task #5): prefetcher should now look BACKWARD
-        # in layer index since reverse sweep walks num_layers-1 → 0.
+        # in layer index since reverse sweep walks num_layers-1 → stop_L.
         # Schedule lookahead in the direction we're actually going.
         for d in range(prefetch_depth):
             ctx.schedule_prefetch(num_layers - 1 - d)
 
-        for L in reversed(range(num_layers)):
+        for L in reversed(range(stop_L, num_layers)):
             load_t0 = time.time()
             src = ctx.install(L)
-            ctx.schedule_prefetch(L - prefetch_depth)
+            if L - prefetch_depth >= stop_L:
+                ctx.schedule_prefetch(L - prefetch_depth)
             load_s = time.time() - load_t0
             phase_load_s += load_s
             load_by_src[src] += load_s
@@ -1913,6 +3263,8 @@ def _run_body_streaming_shard(
                         pending = moe_block_pending.pop(_block_name, None)
                         if not pending:
                             return
+                        _emit_marginals_blk = _marginals_enabled()
+                        blk_marginals: dict[str, list[torch.Tensor]] = {}
                         from collections import defaultdict as _dd
                         by_w: dict[str, list] = _dd(list)
                         for (eid, w_name), (X, gy, lname, T, w_ref) in pending.items():
@@ -1951,6 +3303,15 @@ def _run_body_streaming_shard(
                                 chunk_h_batch = gy_sq.transpose(1, 2).bmm(X_sq)  # (n_e, out, in)
                                 gy_norm = gy_sq.sum(dim=2)
                                 x_norm = X_sq.sum(dim=2)
+                                # Per-channel factors must be reduced out
+                                # of the batched tensors BEFORE the del.
+                                # Padded rows are zero, so they are inert
+                                # for both the sums and the max (x² ≥ 0)
+                                # — no T_valid mask needed here.
+                                if _emit_marginals_blk:
+                                    g_sq_e = gy_sq.sum(dim=1, dtype=torch.float32)
+                                    act_sq_e = X_sq.sum(dim=1, dtype=torch.float32)
+                                    act_absmax_e = X_sq.amax(dim=1).sqrt()
                                 del X_sq, gy_sq
                                 per_token = gy_norm * x_norm
                                 mask = (torch.arange(max_T, device=device).unsqueeze(0)
@@ -1975,7 +3336,20 @@ def _run_body_streaming_shard(
                                         acc_stats[lname]["h_w2_sum_raw"] += float(
                                             (chunk_h_batch[i] * w_ref.detach().float().pow(2)
                                              .to(chunk_h_batch.device)).sum().item())
+                                    if _emit_marginals_blk:
+                                        _marginal_accumulate(
+                                            blk_marginals, lname, [
+                                                chunk_h_batch[i].sum(
+                                                    dim=1, dtype=torch.float32),
+                                                chunk_h_batch[i].sum(
+                                                    dim=0, dtype=torch.float32),
+                                                g_sq_e[i], act_sq_e[i],
+                                                act_absmax_e[i],
+                                            ])
                                 del chunk_h_batch, per_token, trace_per_e
+                        # One transfer for the whole block, not one per
+                        # expert — same discipline as the v21 #1 stack.
+                        _marginal_flush(blk_marginals, acc_stats)
                     return flush
 
                 moe_block_handles.append(
@@ -1984,16 +3358,147 @@ def _run_body_streaming_shard(
                 # Flag so the per-Linear hook short-circuits to deferred path.
                 pass  # (no-op, used as documentation; lookup happens per-call)
 
+            def _fold_grouped_layer_stat(name: str, x, gy, mod_ref,
+                                         num_groups: int):
+                """Grouped-BMM Fisher fold for ONE (x, gy) pair on the
+                body-shard path. Shares the dense path's storage exactly —
+                device_accums scalar slots, device_marginals five-vector
+                slot, acc_h_full, acc_g2_per_token — so every flush and
+                merge below this line is unchanged. The math comes from
+                `grouped_linear_fisher_chunk` (one mechanism with the
+                non-streaming backend); only the folding differs because
+                this site honors deferred_sync."""
+                pieces = grouped_linear_fisher_chunk(x, gy, num_groups,
+                                                     mod_ref.weight)
+                per_group_slot = grouped_per_group_acc.get(name)
+                if per_group_slot is None:
+                    grouped_per_group_acc[name] = pieces["trace_per_group"]
+                else:
+                    per_group_slot.add_(pieces["trace_per_group"])
+                if emit_marginals:
+                    _marginal_accumulate(
+                        device_marginals, name,
+                        [pieces["fisher_row"], pieces["fisher_col"],
+                         pieces["g_sq_sum"], pieces["act_sq_sum"],
+                         pieces["act_absmax"]])
+                if collect_h_full:
+                    # Per-(token, group) rows: the plane-coordinate
+                    # analog of the dense per-token vector.
+                    gy_sq = gy.detach().reshape(
+                        -1, num_groups, gy.shape[-1]).pow(2)
+                    x_sq = x.detach().reshape(
+                        -1, num_groups, x.shape[-1]).pow(2)
+                    pt = (gy_sq.sum(dim=-1) * x_sq.sum(dim=-1)).reshape(-1)
+                    acc_g2_per_token[name].append(
+                        pt.detach().to("cpu", dtype=torch.float32))
+                    acc = acc_h_full.get(name)
+                    if acc is None:
+                        acc = torch.zeros(
+                            int(pieces["chunk_flat"].shape[0]),
+                            int(pieces["chunk_flat"].shape[1]),
+                            dtype=torch.float32, device="cpu")
+                        acc_h_full[name] = acc
+                    acc.add_(pieces["chunk_flat"].to(acc.device).to(acc.dtype))
+                h_trace_dev = pieces["h_trace"]
+                if deferred_sync:
+                    slot = device_accums.get(name)
+                    if slot is None:
+                        slot = (
+                            torch.zeros((), device=h_trace_dev.device,
+                                        dtype=torch.float32),
+                            torch.zeros((), device=h_trace_dev.device,
+                                        dtype=torch.float32),
+                        )
+                        device_accums[name] = slot
+                    slot[0].add_(h_trace_dev)
+                    if pieces["h_w2"] is not None:
+                        slot[1].add_(pieces["h_w2"])
+                else:
+                    acc_stats[name]["h_trace_raw"] += float(
+                        h_trace_dev.item())
+                    if pieces["h_w2"] is not None:
+                        acc_stats[name]["h_w2_sum_raw"] += float(
+                            pieces["h_w2"].item())
+                tokens = int(x.numel()) // (
+                    num_groups * int(x.shape[-1]))
+                acc_stats[name]["n_tokens_seen"] += tokens
+
             def make_fwd(name: str):
                 def hook(module, inp, out):
                     x = inp[0] if isinstance(inp, tuple) else inp
                     saved_inputs[name] = x.detach()
                     if cache_dir is not None:
-                        need = input_rows_limit - activation_rows[name]
                         flat = x.detach().reshape(-1, x.size(-1))
                         base = int(activation_token_offsets[name])
                         activation_token_offsets[name] += int(flat.size(0))
-                        if need > 0:
+                        if sample_parallel_contract is not None:
+                            prior_x = (
+                                activation_snaps[name][0]
+                                if activation_snaps[name] else None
+                            )
+                            prior_rows = (
+                                activation_row_indices[name][0]
+                                if activation_row_indices[name] else None
+                            )
+                            prior_priorities = (
+                                activation_row_priorities[name][0]
+                                if activation_row_priorities[name] else None
+                            )
+                            if (
+                                activation_priority_plan is not None
+                                and prior_x is None
+                                and base == 0
+                                and int(flat.size(0))
+                                == activation_priority_plan.candidate_rows
+                            ):
+                                # The ordinary dense Linear call exposes the
+                                # complete local sample/token grid at once.
+                                # Resolve top-R once per fused group; sibling
+                                # q/k/v and gate/up hooks reuse these exact
+                                # device tensors and only gather their own X.
+                                rows, priorities = (
+                                    activation_priority_plan.top_rows(
+                                        name,
+                                        device=flat.device,
+                                        rows_limit=input_rows_limit,
+                                    )
+                                )
+                                selected = flat.index_select(0, rows)
+                            else:
+                                from prismaquant.sample_parallel_probe import (
+                                    merge_activation_priority_reservoir,
+                                )
+
+                                local_rows = torch.arange(
+                                    flat.size(0), device=flat.device,
+                                    dtype=torch.long,
+                                ) + base
+                                selected, rows, priorities = (
+                                    merge_activation_priority_reservoir(
+                                        prior_inputs=prior_x,
+                                        prior_local_rows=prior_rows,
+                                        prior_priorities=prior_priorities,
+                                        new_inputs=flat,
+                                        new_local_rows=local_rows,
+                                        qname=name,
+                                        partition_contract=(
+                                            sample_parallel_contract
+                                        ),
+                                        rows_limit=input_rows_limit,
+                                        priority_plan_cache=(
+                                            activation_priority_plan
+                                        ),
+                                    )
+                                )
+                            activation_snaps[name] = [selected.detach()]
+                            activation_row_indices[name] = [rows]
+                            activation_row_priorities[name] = [priorities]
+                            activation_candidate_rows[name] += int(flat.size(0))
+                            activation_rows[name] = int(selected.size(0))
+                        else:
+                            need = input_rows_limit - activation_rows[name]
+                            if need <= 0:
+                                return
                             if flat.size(0) > need:
                                 idx = torch.randperm(flat.size(0), device=flat.device)[:need]
                                 flat = flat.index_select(0, idx)
@@ -2027,6 +3532,7 @@ def _run_body_streaming_shard(
             # path; only the device→host scalar transfers are batched).
             deferred_sync = _env_flag(
                 "PRISMAQUANT_DEFERRED_FISHER_SYNC", default=True)
+            emit_marginals = _marginals_enabled()
             # v22 Fix B: deferred Fisher COMPUTE. Beyond just deferring the
             # device→host syncs (above), this defers the per-Linear matmul
             # itself out of the autograd engine's per-Linear callback path.
@@ -2059,6 +3565,11 @@ def _run_body_streaming_shard(
             # Per-Linear device-resident accumulators built lazily inside
             # the hook so we know the stream / device the kernel ran on.
             device_accums: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            # Per-channel marginals, same device-resident discipline.
+            # Kept in its own dict (not the scalar tuple) because the
+            # five vectors have per-Linear shapes and cannot be stacked;
+            # they are flushed with one flat cat + one .cpu() per layer.
+            device_marginals: dict[str, list[torch.Tensor]] = {}
             # Per-layer deferred-compute queue: (name, x, gy, mod_ref).
             # Drained immediately after `out.backward(grad_out)` returns.
             deferred_queue: list[tuple[str, torch.Tensor, torch.Tensor, "nn.Linear"]] = []
@@ -2080,6 +3591,14 @@ def _run_body_streaming_shard(
                     gy = grad_output[0]
                     x = saved_inputs.pop(name, None)
                     if x is None or gy is None:
+                        return
+                    # Grouped-BMM operand: same immediate path, grouped
+                    # reductions (never the dense flatten below — it would
+                    # broadcast-fail against the [G*R, D] plane anyway).
+                    g_count = grouped_map.get(name)
+                    if g_count is not None:
+                        _fold_grouped_layer_stat(
+                            name, x.detach(), gy.detach(), mod_ref, g_count)
                         return
                     gy2 = gy.reshape(-1, gy.size(-1))
                     x2 = x.reshape(-1, x.size(-1))
@@ -2107,6 +3626,10 @@ def _run_body_streaming_shard(
                     gy2_sq = gy2.pow(2)                        # bf16
                     x2_sq = x2.pow(2)                          # bf16
                     chunk_h = (gy2_sq.t() @ x2_sq).float()    # bf16 matmul + fp32 cast
+                    if emit_marginals:
+                        _marginal_accumulate(
+                            device_marginals, name,
+                            _marginal_chunk(gy2_sq, x2_sq, x2, chunk_h))
                     if collect_h_full:
                         acc_g2_per_token[name].append(
                             gy2_sq.sum(dim=1).detach().to(
@@ -2164,6 +3687,18 @@ def _run_body_streaming_shard(
                     acc_stats[name]["n_tokens_seen"] += T
                 return hook
 
+            # Grouped-BMM operands in this shard's scope (wo_a shape):
+            # dispatched to `_fold_grouped_layer_stat` at backward time.
+            grouped_map: dict[str, int] = {}
+            for fqn in tracked_here:
+                try:
+                    g_mod = model.get_submodule(fqn)
+                except AttributeError:
+                    continue
+                g_count = grouped_linear_groups(g_mod, _shard_profile)
+                if g_count is not None:
+                    grouped_map[fqn] = g_count
+
             for fqn in tracked_here:
                 mod = model.get_submodule(fqn)
                 if not isinstance(mod, nn.Linear):
@@ -2175,6 +3710,19 @@ def _run_body_streaming_shard(
                 # batched .stack().cpu() and memoizes; subsequent shards
                 # / chunks return instantly with no device sync.
                 w_max_abs, w_norm_sq = _get_or_compute_w_stats(fqn, w)
+                if fqn in grouped_map:
+                    acc_stats[fqn] = grouped_linear_stats_entry(
+                        mod, grouped_map[fqn],
+                        w_max_abs=w_max_abs, w_norm_sq=w_norm_sq)
+                    if emit_marginals:
+                        acc_stats[fqn].update(
+                            _marginal_zeros(mod.out_features, mod.in_features))
+                    for p in mod.parameters():
+                        p.requires_grad_(True)
+                    handles.append(mod.register_forward_hook(make_fwd(fqn)))
+                    handles.append(mod.register_full_backward_hook(
+                        make_bwd(fqn, mod)))
+                    continue
                 acc_stats[fqn] = {
                     "h_trace_raw": 0.0,
                     "h_w2_sum_raw": 0.0,
@@ -2188,6 +3736,9 @@ def _run_body_streaming_shard(
                     "router_path": None,
                     "expert_id": None,
                 }
+                if emit_marginals:
+                    acc_stats[fqn].update(
+                        _marginal_zeros(mod.out_features, mod.in_features))
                 for p in mod.parameters():
                     p.requires_grad_(True)
                 handles.append(mod.register_forward_hook(make_fwd(fqn)))
@@ -2203,6 +3754,11 @@ def _run_body_streaming_shard(
             # Values are device-resident 0-dim fp32 tensors (flushed via
             # float() below — one sync per packed param per layer).
             packed_grad_acc: dict[str, torch.Tensor] = {}
+            # Per-GROUP Fisher trace [G] for grouped-BMM operands (wo_a
+            # shape) in this layer. Same device-resident discipline; the
+            # flush below lands it on the stats entry as a plain float
+            # list (pickle/merge-safe, like `h_trace_per_expert_raw`).
+            grouped_per_group_acc: dict[str, torch.Tensor] = {}
             # Per-expert per-channel Fisher [E, M] — enables per-expert
             # h_trace decomposition for the allocator's packed-3D prune
             # cost without re-measuring cost per expert. Always enabled
@@ -2212,6 +3768,15 @@ def _run_body_streaming_shard(
             packed_channel_acc: dict[str, torch.Tensor] = {}
             packed_full_acc: dict[str, torch.Tensor] | None = (
                 {} if h_detail_dir is not None else None)
+            # AQUA A-side marginals per expert. Dense Linears get theirs
+            # from `_marginal_accumulate` on the nn.Linear backward hook;
+            # a packed [E, M, N] expert parameter is not an nn.Linear and
+            # has no such hook, which is why an AQUA card built before
+            # this carried an A-side for the dense trunk only -- 5.5% of
+            # this model's parameters. The F.linear interception is the
+            # equivalent site: it already holds (x, gy) for the slice.
+            packed_marginal_acc: dict[str, dict[str, torch.Tensor]] = (
+                {} if _marginals_enabled() else None)
             # Reverse-sweep visits every layer (gradient chain-rule needs
             # all of them), but Fisher stats should only be recorded for
             # layers in this shard's scope. Skip the packed-expert install
@@ -2225,18 +3790,28 @@ def _run_body_streaming_shard(
             if minimax_fast_moe:
                 _mmx_proj = getattr(
                     _shard_profile, "unpacked_expert_projection_names", None)
+                _mmx_cls = getattr(
+                    _shard_profile, "packed_expert_module_class_names", None)
                 _set_minimax_fast_moe(
                     layers[L],
                     enabled=not layer_in_scope,
                     chunk_size=minimax_fast_moe_chunk_size,
                     proj_names=tuple(_mmx_proj()) if callable(_mmx_proj) else ("w1", "w2", "w3"),
+                    class_names=tuple(_mmx_cls()) if callable(_mmx_cls) else (),
                 )
             packed_meta = install_packed_expert_hooks(
                 layers[L], accumulator=packed_grad_acc,
                 channel_accumulator=packed_channel_acc,
                 full_accumulator=packed_full_acc,
+                marginal_accumulator=packed_marginal_acc,
                 profile=_shard_profile,
             ) if layer_in_scope else {}
+            if sample_parallel_contract is not None and packed_meta:
+                raise RuntimeError(
+                    "sample-parallel v1 activation capture is dense-only; "
+                    "packed expert activation rows lack exact sample/token "
+                    "origins"
+                )
             layer_prefix = f"{layers_prefix}{L}."
             layer_packed_handles: list = []
             for key, md in packed_meta.items():
@@ -2284,10 +3859,32 @@ def _run_body_streaming_shard(
                     input_ids=calib.to(device) if calib is not None else None),
                 # KV-sharing layers (Gemma4) reuse K/V captured in phase-1;
                 # reconstruct that per-layer slice for this isolated forward.
-                **_shard_profile.isolated_layer_pass_state(
-                    precomputed.shared_pass_state, layers[L]),
+                # One-layer scope, so the "once per pass" rule is trivially
+                # satisfied: a fresh container per isolated forward.
+                # `graft` swaps the borrowed tensors for grad-enabled leaves so
+                # this layer's cotangent on them can be read back below; it
+                # returns the caller's own object untouched when the profile
+                # declares no shared state.
+                pass_state=kv_cotangents.graft(
+                    _shard_profile.isolated_layer_pass_state(
+                        precomputed.shared_pass_state, layers[L])),
             )
-            out.backward(grad_out.to(device))
+            # Drive the backward with this layer's output cotangent AND the
+            # cotangent its consumers accumulated on the shared state it
+            # produced (empty for every architecture without cross-layer
+            # sharing — then this is exactly `out.backward(grad_out)`). One
+            # backward call, so autograd sums both contributions at the shared
+            # tensor before its grad_fn runs and each Linear's full-backward
+            # hook still fires ONCE, with the total gy.
+            kv_roots, kv_grads = kv_cotangents.produced_roots()
+            if kv_roots:
+                torch.autograd.backward([out, *kv_roots],
+                                        [grad_out.to(device), *kv_grads])
+            else:
+                out.backward(grad_out.to(device))
+            # Fold this layer's borrowed-state gradients into the accumulator
+            # (and end the layer) while the graph is still alive.
+            kv_cotangents.harvest()
             bwd_s = time.time() - bwd_t0
             phase_bwd_s += bwd_s
 
@@ -2303,12 +3900,25 @@ def _run_body_streaming_shard(
             # h_trace / h_w2_sum stay device-resident here too.
             if deferred_compute and deferred_queue:
                 for name, x, gy, mod_ref in deferred_queue:
+                    # Grouped-BMM operand: fold through the grouped
+                    # reductions; the dense flatten below would compute
+                    # the wrong-shaped marginals against the [G*R, D]
+                    # plane.
+                    g_count = grouped_map.get(name)
+                    if g_count is not None:
+                        _fold_grouped_layer_stat(name, x, gy, mod_ref,
+                                                 g_count)
+                        continue
                     gy2 = gy.reshape(-1, gy.size(-1))
                     x2 = x.reshape(-1, x.size(-1))
                     T = x2.size(0)
                     gy2_sq = gy2.pow(2)
                     x2_sq = x2.pow(2)
                     chunk_h = (gy2_sq.t() @ x2_sq).float()
+                    if emit_marginals:
+                        _marginal_accumulate(
+                            device_marginals, name,
+                            _marginal_chunk(gy2_sq, x2_sq, x2, chunk_h))
                     if collect_h_full:
                         acc_g2_per_token[name].append(
                             gy2_sq.sum(dim=1).detach().to(
@@ -2373,6 +3983,12 @@ def _run_body_streaming_shard(
                     acc_stats[n]["h_trace_raw"] += float(tr_v)
                     acc_stats[n]["h_w2_sum_raw"] += float(w2_v)
                 device_accums.clear()
+            # Marginals get their own flush (one flat cat, one .cpu()):
+            # the five vectors are per-Linear-shaped so they cannot join
+            # the (2, N) scalar stack, and they must drain even when
+            # deferred_sync is off — otherwise the legacy per-Linear
+            # `.item()` path would have no flush site at all.
+            _marginal_flush(device_marginals, acc_stats)
 
             for local_key, raw in packed_grad_acc.items():
                 full_key = f"{layer_prefix}{local_key}"
@@ -2401,6 +4017,48 @@ def _run_body_streaming_shard(
                     acc_stats[full_key]["h_trace_per_expert_raw"] = summed
             packed_channel_acc.clear()
 
+            # Per-group Fisher trace flush (grouped-BMM operands). One
+            # .cpu() per grouped param — same honesty as the packed
+            # per-expert list: plain floats, elementwise-merged across
+            # shard splits, normalized by the global token count in
+            # `finalize_fisher_stats`.
+            for local_key, per_group in grouped_per_group_acc.items():
+                full_key = f"{layer_prefix}{local_key}"
+                entry = acc_stats.get(full_key)
+                if entry is None:
+                    continue
+                vals = per_group.detach().to(torch.float64).tolist()
+                prev = entry.get("h_trace_per_group_raw")
+                if prev is None:
+                    entry["h_trace_per_group_raw"] = vals
+                else:
+                    entry["h_trace_per_group_raw"] = [
+                        p + float(v) for p, v in zip(prev, vals)]
+            grouped_per_group_acc.clear()
+
+            # Per-expert AQUA marginals. One .cpu() per array (four per
+            # packed param per layer -- the arrays are [E, M] / [E, N] /
+            # [E], so ~8 MB per MoE layer at E=256; the dense marginals'
+            # single-concat discipline buys nothing at that count).
+            for local_key, slot in (packed_marginal_acc or {}).items():
+                full_key = f"{layer_prefix}{local_key}"
+                entry = acc_stats.get(full_key)
+                if entry is None:
+                    continue
+                for key, tensor in slot.items():
+                    host = tensor.detach().to("cpu").numpy()
+                    host = host.astype(
+                        np.float64 if key == "expert_tokens" else np.float32)
+                    prev = entry.get(key)
+                    if prev is None:
+                        entry[key] = host.copy()
+                    elif key == "expert_act_absmax":
+                        entry[key] = np.maximum(prev, host)
+                    else:
+                        entry[key] = prev + host
+            if packed_marginal_acc:
+                packed_marginal_acc.clear()
+
             grad_out = x_in.grad.detach().clone().cpu()
 
             for h in handles:
@@ -2417,6 +4075,8 @@ def _run_body_streaming_shard(
                     prev["h_trace_raw"] += s.get("h_trace_raw", 0.0)
                     prev["h_w2_sum_raw"] += s.get("h_w2_sum_raw", 0.0)
                     prev["n_tokens_seen"] += s.get("n_tokens_seen", 0)
+                    # Per-channel marginals: sums add, act_absmax maxes.
+                    merge_marginals(prev, s)
                     # Per-expert Fisher is a list of floats on the packed
                     # stat entry; sum element-wise across shard splits.
                     per_prev = prev.get("h_trace_per_expert_raw")
@@ -2428,6 +4088,34 @@ def _run_body_streaming_shard(
                             prev["h_trace_per_expert_raw"] = [
                                 a + b for a, b in zip(per_prev, per_new)
                             ]
+                    # Per-group Fisher (grouped-BMM operands): identical
+                    # elementwise-sum rule, same reason — it is a [G]
+                    # decomposition of the one h_trace across shard splits.
+                    grp_prev = prev.get("h_trace_per_group_raw")
+                    grp_new = s.get("h_trace_per_group_raw")
+                    if grp_new is not None:
+                        if grp_prev is None:
+                            prev["h_trace_per_group_raw"] = list(grp_new)
+                        else:
+                            prev["h_trace_per_group_raw"] = [
+                                a + b for a, b in zip(grp_prev, grp_new)
+                            ]
+                    # Per-expert AQUA marginals follow the SAME merge
+                    # rules as the dense ones: sums add, an absmax bound
+                    # maxes. Kept beside `h_trace_per_expert_raw` rather
+                    # than inside `merge_marginals` because those arrays
+                    # are 1-D per-Linear and these are [E, *] per-expert.
+                    for key in _PACKED_MARGINAL_KEYS:
+                        new = s.get(key)
+                        if new is None:
+                            continue
+                        old_v = prev.get(key)
+                        if old_v is None:
+                            prev[key] = np.asarray(new).copy()
+                        elif key == "expert_act_absmax":
+                            prev[key] = np.maximum(old_v, np.asarray(new))
+                        else:
+                            prev[key] = np.asarray(old_v) + np.asarray(new)
             if collect_h_full:
                 for fqn, h in acc_h_full.items():
                     if fqn in merged_h_full:
@@ -2444,13 +4132,15 @@ def _run_body_streaming_shard(
                     full_key = f"{layer_prefix}{local_key}"
                     fname = re.sub(r"[^A-Za-z0-9_-]", "__", full_key) + ".pt"
                     # Per-token units + explicit marker (audit M9): the
-                    # accumulator is token-summed; normalize by this
-                    # layer's token count so the blob matches the
-                    # sensitivity-probe writer's units.
-                    entry = acc_stats.get(full_key, {})
+                    # accumulator is token-summed; normalize by the
+                    # GLOBAL calib token count — the same denominator the
+                    # scalar h_trace gets in finalize_fisher_stats.
+                    # (Packed-3D rows count the full batch in
+                    # n_tokens_seen, so this is numerically identical to
+                    # the previous per-row count; global is used for
+                    # uniformity with the per-expert-Linear writers.)
                     torch.save(
-                        h_detail_blob(tensor,
-                                      int(entry.get("n_tokens_seen", 0)),
+                        h_detail_blob(tensor, global_tokens,
                                       full_key, kind="packed"),
                         detail_dir / fname)
                 packed_full_acc.clear()
@@ -2459,8 +4149,18 @@ def _run_body_streaming_shard(
             # Holding every target expert's sampled inputs until shard
             # finalization adds several GB of avoidable host pressure on
             # MiniMax's 256-expert layers.
-            flush_activation_snapshots(activation_snaps, activation_row_indices)
+            flush_activation_snapshots(
+                activation_snaps,
+                activation_row_indices,
+                activation_row_priorities,
+                activation_candidate_rows,
+            )
             flush_activation_snapshots(packed_act_snaps)
+            if activation_priority_plan is not None:
+                # q/k/v and gate/up have all observed the same cached plan by
+                # this point.  Release it with the layer's activation blobs so
+                # priority metadata cannot accumulate across the sweep.
+                activation_priority_plan.clear()
 
             phase_pressure_trim_bytes += int(ctx.unload(L) or 0)
             # The `del` drops all per-layer refs; CPython ref counting
@@ -2488,12 +4188,19 @@ def _run_body_streaming_shard(
             f"{k}:{load_by_src[k]:.1f}s/{count_by_src[k]}"
             for k in sorted(load_by_src)
         )
-        print(f"[incremental] phase-3 reverse sweep: {time.time()-t_phase:.1f}s  "
+        print(f"[incremental] phase-3 reverse sweep "
+              f"[{num_layers-1}->{stop_L}]: {time.time()-t_phase:.1f}s  "
               f"load={phase_load_s:.1f}s bwd={phase_bwd_s:.1f}s "
               f"pressure_trim={phase_pressure_trim_bytes/(1024**3):.1f}GB "
               f"load_by_src=[{load_parts}]  "
               f"{ctx.layer_cache.summary()}  {ctx.prefetch_summary()}",
               flush=True)
+        # Report the KV-cotangent path only when it did something, plus any
+        # cotangent no producer claimed (which would mean a residual
+        # under-count on that producer's k/v_proj — worth seeing, never
+        # silently swallowed).
+        if kv_cotangents.n_grafted or kv_cotangents.pending_keys():
+            print(f"[incremental] {kv_cotangents.summary()}", flush=True)
         _print_mem_snapshot("phase-3 done")
 
         # `activations_cpu` is a shared reference into the global
@@ -2503,9 +4210,8 @@ def _run_body_streaming_shard(
 
     # ---- Finalize ----
     # One shared denominator for every row — the global calib token count
-    # (see finalize_fisher_stats for why per-row n_tokens_seen is wrong
-    # for routed-expert Linears).
-    global_tokens = max(int(calib.size(0)) * int(seqlen), 1)
+    # (hoisted above; see finalize_fisher_stats for why per-row
+    # n_tokens_seen is wrong for routed-expert Linears).
     finalize_fisher_stats(merged_stats, global_tokens)
 
     detail_dir = Path(h_detail_dir) if h_detail_dir else None
@@ -2522,23 +4228,36 @@ def _run_body_streaming_shard(
             # used to save the raw token-summed accumulator under "H",
             # leaving HDetailIndex consumers ~n_tokens× hotter than
             # blobs from sensitivity_probe. h_detail_blob normalizes by
-            # the tokens this Linear actually saw and stamps
-            # units="per_token"; g2_per_token stays raw (it is already
-            # a per-token vector).
-            tokens = int(merged_stats.get(fqn, {}).get("n_tokens_seen", 0))
+            # the GLOBAL calib token count — the same denominator the
+            # scalar h_trace gets in finalize_fisher_stats above, so
+            # predicted_dloss fallback rows built from these blobs stay
+            # on the scalar's scale (per-expert nn.Linear rows only see
+            # their ROUTED tokens; dividing by that per-row count left
+            # the detail (global/routed)× hotter than the scalar).
+            # g2_per_token stays raw (it is already a per-token vector).
             torch.save(
-                h_detail_blob(h, tokens, fqn, kind="linear",
+                h_detail_blob(h, global_tokens, fqn, kind="linear",
                               g2_per_token=g2_per_token),
                 detail_dir / fname,
             )
 
     # Flush activation snapshots.
     if cache_dir is not None:
-        flush_activation_snapshots(activation_snaps, activation_row_indices)
+        flush_activation_snapshots(
+            activation_snaps,
+            activation_row_indices,
+            activation_row_priorities,
+            activation_candidate_rows,
+        )
         flush_activation_snapshots(packed_act_snaps)
-        cache_dtype = (torch.float32
-                       if os.environ.get("PRISMAQUANT_ACT_CACHE_FP32", "1") != "0"
-                       else torch.bfloat16)
+        if activation_priority_plan is not None:
+            activation_priority_plan.clear()
+        cache_dtype = (
+            torch.float32
+            if sample_parallel_contract is not None
+            or os.environ.get("PRISMAQUANT_ACT_CACHE_FP32", "1") != "0"
+            else torch.bfloat16
+        )
         for name, snaps in resident_act_snaps.items():
             if not snaps:
                 continue
@@ -2565,6 +4284,12 @@ def _run_body_streaming_shard(
     shard_routers_in_scope: set[str] = {
         rq for (rq, _eid) in shard_expert_info.values()
     }
+    # Packed Qwen3.5/3.6 experts have no per-expert nn.Linear leaves, so
+    # ``expert_info`` is empty even though Phase 1 records their sibling
+    # routers. Select those routers directly by this shard's layer regex.
+    shard_routers_in_scope.update(
+        rq for rq in precomputed.router_counts if inc.search(rq)
+    )
     shard_router_counts = {
         rq: per_expert_map
         for rq, per_expert_map in precomputed.router_counts.items()
@@ -2600,6 +4325,10 @@ def _run_body_streaming_shard(
                 "model": model_path,
                 "dataset": dataset_name,
                 "nsamples": int(calib.size(0)),
+                # R14: calibration identity, so held-out disjointness is
+                # verifiable from the artifact instead of resting on the
+                # driver passing the right --calib-skip-first.
+                "calib_hash": calibration_data_hash(calib),
                 "seqlen": seqlen,
                 "dtype": dtype_name,
                 "device_map": "streaming-layerwise",
@@ -2626,6 +4355,62 @@ def _run_body_streaming_shard(
 # no phase-3 reverse over body is needed since MTP gradients don't propagate
 # back into the body.
 # ---------------------------------------------------------------------------
+def _load_mtp_source_for_probe(
+    mtp_profile,
+    inner_mtp: nn.Module,
+    model_path: str,
+    *,
+    sample_parallel: bool,
+) -> tuple[dict[str, torch.Tensor], list[str], list[str]]:
+    """Load MTP weights, closing source/module coverage before any forward."""
+    raw = mtp_profile.read_mtp_source_state_dict(model_path)
+    if not raw:
+        if sample_parallel:
+            raise RuntimeError(
+                f"sample-parallel profile '{mtp_profile.name}' declares MTP "
+                "but the checkpoint has no source tensors under "
+                f"{mtp_profile.mtp_source_prefix()!r}"
+            )
+        return {}, [], []
+    missing, extra = mtp_profile.load_mtp_state_dict(inner_mtp, raw)
+    if sample_parallel and (missing or extra):
+        raise RuntimeError(
+            "sample-parallel MTP source/module coverage failure: "
+            f"unmatched_source={missing[:8]} "
+            f"module_params_unset={extra[:8]}"
+        )
+    return raw, list(missing), list(extra)
+
+
+def _build_mtp_fisher_accumulator(
+    mtp_wrapper: nn.Module,
+    tracked: list[str],
+    expert_info: dict[str, tuple[str, str]],
+    cache_dir: Path | None,
+    *,
+    input_rows_limit: int,
+    detail_dir: Path | None,
+    sample_parallel_contract: dict[str, object] | None,
+) -> FisherAccumulator:
+    """Construct the MTP collector with its execution-contract features.
+
+    Dense marginals are intentionally narrower than the global environment
+    default here: only sample-parallel MTP rows enter the all-qname closed
+    schema.  Ordinary MTP probing retains the accumulator's legacy payload.
+    """
+    return FisherAccumulator(
+        mtp_wrapper,
+        tracked,
+        expert_info,
+        cache_dir,
+        input_rows=input_rows_limit,
+        h_detail_dir=detail_dir,
+        emit_dense_marginals=(
+            sample_parallel_contract is not None and _marginals_enabled()
+        ),
+    )
+
+
 def _run_mtp_streaming_shard(
     ctx: StreamingContext,
     *,
@@ -2643,9 +4428,10 @@ def _run_mtp_streaming_shard(
     prefetch_lookahead: int = 3,
     activation_rows_limit: int = 256,
     precomputed: GlobalPrecompute | None = None,
+    sample_parallel_contract: dict[str, object] | None = None,
 ):
     # Lazy import to avoid depending on transformers subpath at module load.
-    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
+    from .model_profiles import profile_from_model as _profile_from_model
 
     if precomputed is None:
         raise ValueError(
@@ -2678,14 +4464,30 @@ def _run_mtp_streaming_shard(
         torch.cuda.empty_cache()
 
     # --- Synthesize MTP module, load its weights from safetensors ---
+    # Both the module layout and the checkpoint prefix come from the
+    # model profile (`build_mtp_module` / `mtp_source_prefix`); wrapping
+    # in a parent named `mtp` is what makes the qualified names equal
+    # the allocator's recipe names.
+    mtp_profile = _profile_from_model(model)
     text_config = model.config
-    inner_mtp = MtpModule(text_config)
+    inner_mtp = mtp_profile.build_mtp_module(text_config)
+    if inner_mtp is None:
+        raise RuntimeError(
+            f"profile '{mtp_profile.name}' declares has_mtp() but "
+            f"build_mtp_module() returned None — the MTP shard cannot be "
+            f"probed. Either implement build_mtp_module() or set "
+            f"has_mtp() -> False.")
     mtp_wrapper = nn.Module()
     mtp_wrapper.add_module("mtp", inner_mtp)
     mtp_wrapper.to(device=device, dtype=dtype)
     mtp_wrapper.eval()
 
-    raw = _load_mtp_state_dict(model_path)
+    raw, missing, extra = _load_mtp_source_for_probe(
+        mtp_profile,
+        inner_mtp,
+        model_path,
+        sample_parallel=sample_parallel_contract is not None,
+    )
     if not raw:
         # No MTP weights in source — write empty pickle to satisfy the
         # schedule and return. Mirrors the text-only visual fallback.
@@ -2700,6 +4502,10 @@ def _run_mtp_streaming_shard(
                     "model": model_path,
                     "dataset": dataset_name,
                     "nsamples": int(calib.size(0)),
+                    # R14: calibration identity, so held-out disjointness is
+                    # verifiable from the artifact instead of resting on the
+                    # driver passing the right --calib-skip-first.
+                    "calib_hash": calibration_data_hash(calib),
                     "seqlen": seqlen,
                     "dtype": dtype_name,
                     "execution_device": str(device),
@@ -2713,7 +4519,6 @@ def _run_mtp_streaming_shard(
         print(f"[incremental/mtp] no MTP weights; wrote empty shard "
               f"pickle to {output_path}", flush=True)
         return
-    missing, extra = _load_into_mtp(inner_mtp, raw)
     loaded = len(raw) - len(missing)
     print(f"[incremental/mtp] loaded {loaded}/{len(raw)} mtp weights "
           f"(missing={len(missing)}, module_params_unset={len(extra)})",
@@ -2731,24 +4536,32 @@ def _run_mtp_streaming_shard(
                if isinstance(m, nn.Linear) and not re.search(r"mlp\.gate$", n)]
     print(f"[incremental/mtp] tracking {len(tracked)} MTP Linears", flush=True)
 
-    from .model_profiles import profile_from_model as _profile_from_model
-    mtp_profile = _profile_from_model(model)
     expert_info_all = discover_moe_structure(mtp_wrapper, profile=mtp_profile)
+    if sample_parallel_contract is not None and expert_info_all:
+        raise RuntimeError(
+            "sample-parallel v1 rejects routed/packed MTP modules; MTP must "
+            "be the complete dense terminal-BF16 Linear census"
+        )
     expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
     top_k = read_top_k(mtp_wrapper, default=2)
 
-    cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
+    cache_dir = (
+        Path(activation_cache_dir)
+        if activation_cache_dir and sample_parallel_contract is None
+        else None
+    )
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
     detail_dir = Path(h_detail_dir) if h_detail_dir else None
     input_rows_limit = max(1, int(activation_rows_limit))
-    acc = FisherAccumulator(
+    acc = _build_mtp_fisher_accumulator(
         mtp_wrapper,
         tracked,
         expert_info,
         cache_dir,
-        input_rows=input_rows_limit,
-        h_detail_dir=detail_dir,
+        input_rows_limit=input_rows_limit,
+        detail_dir=detail_dir,
+        sample_parallel_contract=sample_parallel_contract,
     )
 
     # lm_head lives on the body model (resident).
@@ -2821,7 +4634,11 @@ def _run_mtp_streaming_shard(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    acc.finalize(tracker=None)
+    # Global calib token count, matching the meta nsamples×seqlen product
+    # below (the MTP shift trims 2 tokens/sample — a uniform constant, and
+    # keeping the meta product keeps the allocator renorm idempotent).
+    fisher_norm_tokens = max(int(calib.size(0)) * int(seqlen), 1)
+    acc.finalize(tracker=None, global_tokens=fisher_norm_tokens)
     acc.remove_hooks()
 
     renamed = dict(acc.stats)
@@ -2840,7 +4657,12 @@ def _run_mtp_streaming_shard(
                 "model": model_path,
                 "dataset": dataset_name,
                 "nsamples": int(calib.size(0)),
+                # R14: calibration identity, so held-out disjointness is
+                # verifiable from the artifact instead of resting on the
+                # driver passing the right --calib-skip-first.
+                "calib_hash": calibration_data_hash(calib),
                 "seqlen": seqlen,
+                "fisher_norm_tokens": fisher_norm_tokens,
                 "dtype": dtype_name,
                 "device_map": "streaming-layerwise",
                 "execution_device": str(device),
@@ -2867,6 +4689,18 @@ def _run_mtp_streaming_shard(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+#: Why the sample-parallel worker entry refuses. ONE spelling, raised from two
+#: places (parse time, and the deep branch it guards) so a restorer cannot
+#: delete one and leave the mode half-open with a different message.
+SAMPLE_PARALLEL_RETIRED = (
+    "sample-parallel probe is unavailable since 2026-09-02: its run contract "
+    "and per-worker source census were built on the strict-Ada FP8-CB "
+    "artifact census, archived with the Gridbook lane "
+    "(archive/gridbook_lane_2026-09-02/). Run without "
+    "--global-calibration-tensor/--sample-partition-index."
+)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -2885,6 +4719,59 @@ def main():
                          "give different sample subsets from the same dataset, "
                          "useful for multi-probe robust-Fisher experiments. "
                          "Default 42 reproduces historical behavior.")
+    ap.add_argument(
+        "--global-calibration-tensor", default=None,
+        help="Immutable tokenized calibration artifact produced by "
+             "`python -m prismaquant.sample_parallel_probe "
+             "prepare-calibration`. Every sample-parallel worker loads this "
+             "same global tensor once and selects its declared partition.",
+    )
+    ap.add_argument(
+        "--sample-partition-index", type=int, default=None,
+        help="Zero-based partition from --global-calibration-tensor. This "
+             "mode requires the complete body plus MTP/head qname scope; "
+             "only the calibration sample axis may differ between workers.",
+    )
+    ap.add_argument(
+        "--sample-run-contract", default=None,
+        help="Closed source-censused execution contract. Required with "
+             "sample parallelism; arbitrary shared metadata is not accepted. "
+             "NOTE (2026-09-02): the `prepare-run-contract` subcommand that "
+             "minted these retired with the Gridbook lane "
+             "(archive/gridbook_lane_2026-09-02/), so this flag currently "
+             "has no producer and the branch refuses.",
+    )
+    ap.add_argument(
+        "--sample-cover", default=None,
+        help="Digest-bound exact sample cover produced by "
+             "`sample_parallel_probe build-cover`. Required with sample "
+             "parallelism and checked against this worker's selected "
+             "calibration partition before any model/GPU setup.",
+    )
+    ap.add_argument(
+        "--producer-snapshot-root",
+        default=os.environ.get("PRISMAQUANT_PRODUCER_SNAPSHOT_ROOT"),
+        help="Mounted immutable PrismaQuant runtime snapshot root; required "
+             "and completely re-verified in sample-parallel mode.",
+    )
+    ap.add_argument(
+        "--container-image-digest",
+        default=os.environ.get("PRISMAQUANT_PRODUCER_IMAGE_DIGEST"),
+        help="Local pinned producer image digest (sha256:<64-hex>); required "
+             "and matched to the run contract in sample-parallel mode.",
+    )
+    ap.add_argument(
+        "--sample-importance-stats-output", default=None,
+        help="Stage 1 of exact importance weighting: write this partition's "
+             "raw CE sum/count receipt and exit before Fisher backward. The "
+             "v1 apply stage reruns phase 1 after the scalar barrier.",
+    )
+    ap.add_argument(
+        "--sample-global-importance-receipt", default=None,
+        help="Stage 2 of exact importance weighting: receipt emitted by "
+             "`sample_parallel_probe merge-importance`; its global CE mean "
+             "is used for every body token before backward.",
+    )
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--device-map", default=None)
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
@@ -2919,6 +4806,17 @@ def main():
                          "per-weight delta loss = 0.5 * <H, MSE_W> instead "
                          "of the scalar proxy. Omit to keep the legacy "
                          "scalar path.")
+    ap.add_argument("--emit-marginals",
+                    action=argparse.BooleanOptionalAction, default=None,
+                    help="Emit per-channel Fisher marginals alongside the "
+                         "scalars: fisher_row [out], fisher_col [in], "
+                         "g_sq_sum [out], act_sq_sum [in], act_absmax [in]. "
+                         "Unlike the full [out, in] Fisher these are cheap "
+                         "reductions of tensors the probe already forms; "
+                         "memory is sum over Linears of "
+                         "(2*out + 3*in) * 4 bytes. Default ON; overrides "
+                         "PRISMAQUANT_PROBE_MARGINALS. --no-emit-marginals "
+                         "restores byte-identical legacy output.")
     ap.add_argument("--unified-sweep", action="store_true", default=False,
                     help="Phase-3 in ONE reverse sweep through all 62 "
                          "layers, tracking ALL in-scope Linears at once "
@@ -2991,13 +4889,50 @@ def main():
     ap.add_argument("--mm-max-text-len", type=int, default=128,
                     help="Max text tokens per multimodal calibration sample.")
     args = ap.parse_args()
-
-    # MINOR-M33: on KV-sharing models the streaming Fisher probe under-counts
-    # the storing layer's k_proj/v_proj h_trace — the phase-3 K/V detach severs
-    # the Fisher cotangent from consumer layers that reuse its K/V. Fail loud
-    # rather than ship a silently-biased allocation (Principle 1: measurement
-    # gap, not a band-aid). No shipped model triggers this (Gemma4-31B-IT and
-    # the Gemma4TextConfig default are num_kv_shared_layers=0).
+    if args.global_calibration_tensor is not None:
+        # Fires HERE, before the pairing checks and before any model read, so
+        # the refusal needs no checkpoint on disk to reach. It used to sit ~50
+        # lines below `load_num_hidden_layers(args.model)`, which made a
+        # retired mode's refusal depend on having a live model -- and made it
+        # untestable without one. See SAMPLE_PARALLEL_RETIRED.
+        raise SystemExit(SAMPLE_PARALLEL_RETIRED)
+    if (args.global_calibration_tensor is None) != (
+        args.sample_partition_index is None
+    ):
+        ap.error(
+            "--global-calibration-tensor and --sample-partition-index must "
+            "be supplied together"
+        )
+    if (args.global_calibration_tensor is None) != (
+        args.sample_run_contract is None
+    ):
+        ap.error(
+            "--sample-run-contract is required exactly when sample-parallel "
+            "calibration flags are supplied"
+        )
+    if (args.global_calibration_tensor is None) != (args.sample_cover is None):
+        ap.error(
+            "--sample-cover is required exactly when sample-parallel "
+            "calibration flags are supplied"
+        )
+    args.sample_parallel_contract = None
+    args.sample_parallel_importance = None
+    args.sample_parallel_activation_scope = None
+    args.sample_parallel_execution_identity = None
+    args.sample_parallel_qname_census = None
+    args.sample_parallel_importance_execution_sha256 = None
+    # The marginal switch is read deep inside the hooks (and by shard
+    # subprocesses), so the CLI flag lands on the env var the same way
+    # allocator.py publishes --threads. Unset leaves the env default.
+    if args.emit_marginals is not None:
+        os.environ["PRISMAQUANT_PROBE_MARGINALS"] = (
+            "1" if args.emit_marginals else "0")
+    # MINOR-M33 (closed): KV-sharing models are probed normally now — the
+    # reverse sweep seeds each producing layer's backward with the cotangent its
+    # consumers accumulated on the borrowed K/V, so k_proj/v_proj h_trace is the
+    # same quantity an end-to-end backward measures. The measurement gap was
+    # closed rather than papered over (Principle 1). This guard only still
+    # fires when PRISMAQUANT_KV_COTANGENT=0 takes that path away.
     _kv_block = kv_shared_fisher_block_reason(args.model)
     if _kv_block:
         raise SystemExit(_kv_block)
@@ -3007,6 +4942,250 @@ def main():
     end = n_layers if args.end_layer is None else min(args.end_layer, n_layers)
     if start >= end:
         raise SystemExit(f"empty layer range: start={start} end={end}")
+
+    # Sample parallelism is deliberately orthogonal to the existing qname
+    # shards: every worker owns the complete model scope and differs only in
+    # the exact calibration samples it sees. Load the immutable global tensor
+    # once here, validate its semantic identity, then retain only the local
+    # contiguous slice for the GPU pass.
+    sample_parallel_calib: torch.Tensor | None = None
+    if args.global_calibration_tensor is not None:
+        # Retired 2026-09-02, fail-closed rather than degraded.
+        #
+        # The sample-parallel worker admitted a shared run contract only after
+        # revalidating THIS host's own source bytes against the contract's
+        # census (`validate_worker_local_source_census`) -- "a run contract
+        # produced on one host cannot authorize another host's bytes merely
+        # because the model path string agrees". Both that check and the
+        # `prepare-run-contract` minter were built on
+        # `prismaquant.rtx4090_artifact_census`, the strict-Ada FP8-CB
+        # campaign's closed Qwen3.8-27B layout, archived with the Gridbook
+        # lane (archive/gridbook_lane_2026-09-02/).
+        #
+        # Nothing can mint a contract now, and a contract left on disk from
+        # before the retirement would be admitted with one leg of its identity
+        # replay missing. That is the exact failure this branch existed to
+        # refuse, so it refuses. Re-enabling sample parallelism means giving
+        # the census a lane-independent source of truth, not deleting this
+        # gate. Recorded as debt D34.
+        #
+        # Unreachable from `main` since the same refusal moved to parse time
+        # above; kept as the second leg because everything below it is the
+        # SHAPE to restore, and a restorer must not be able to delete the
+        # parse-time guard and find this path silently live again.
+        raise SystemExit(SAMPLE_PARALLEL_RETIRED)
+        from prismaquant.sample_parallel_probe import (
+            _load_json_mapping,
+            activation_scope_receipt,
+            importance_execution_identity_sha256,
+            load_calibration_partition,
+            load_global_importance_receipt,
+            load_local_importance_stats,
+            validate_run_contract,
+            validate_local_producer_snapshot,
+        )
+        from prismaquant.sample_parallel_probe_merge import (
+            validate_worker_sample_cover,
+        )
+
+        try:
+            run_contract = validate_run_contract(
+                _load_json_mapping(args.sample_run_contract)
+            )
+        except Exception as exc:
+            raise SystemExit(
+                f"sample-parallel run contract is invalid: {exc}"
+            ) from exc
+        execution_identity = run_contract["execution_identity"]
+        qname_census = run_contract["qname_census"]
+        if not args.producer_snapshot_root:
+            raise SystemExit(
+                "sample-parallel worker requires --producer-snapshot-root"
+            )
+        try:
+            producer_snapshot = validate_local_producer_snapshot(
+                args.producer_snapshot_root,
+                expected_closure_sha256=execution_identity[
+                    "producer_snapshot_sha256"
+                ],
+                expected_commit=execution_identity[
+                    "producer_snapshot_commit"
+                ],
+                expected_tree=execution_identity["producer_snapshot_tree"],
+            )
+        except Exception as exc:
+            raise SystemExit(
+                f"sample-parallel producer snapshot preflight failed: {exc}"
+            ) from exc
+        if Path(args.output).exists():
+            raise SystemExit(
+                f"sample-parallel probe output already exists; refusing "
+                f"overwrite: {args.output}"
+            )
+        sample_parallel_calib, contract = load_calibration_partition(
+            args.global_calibration_tensor,
+            partition_index=int(args.sample_partition_index),
+        )
+        try:
+            validate_worker_sample_cover(
+                _load_json_mapping(args.sample_cover),
+                run_contract=run_contract,
+                partition_contract=contract,
+            )
+        except Exception as exc:
+            raise SystemExit(
+                f"sample-parallel worker cover preflight failed: {exc}"
+            ) from exc
+        if int(contract["seqlen"]) != int(args.seqlen):
+            raise SystemExit(
+                "sample-parallel calibration seqlen differs from --seqlen"
+            )
+        if str(contract.get("dataset", "")) != str(args.dataset):
+            raise SystemExit(
+                "sample-parallel calibration dataset differs from --dataset"
+            )
+        if str(contract.get("model", "")) != str(args.model):
+            raise SystemExit(
+                "sample-parallel calibration model differs from --model"
+            )
+        if int(contract.get("calib_seed", -1)) != int(args.calib_seed):
+            raise SystemExit(
+                "sample-parallel calibration seed differs from --calib-seed"
+            )
+        expected_execution = {
+            "model": args.model,
+            "dataset": args.dataset,
+            "calib_seed": int(args.calib_seed),
+            "dtype": args.dtype,
+            "calibration_modality": args.calibration_modality,
+            "importance_weighting": bool(args.importance_weighting),
+            "activation_rows_limit": int(args.activation_rows_limit),
+            "emit_marginals": bool(_marginals_enabled()),
+            "h_detail": False,
+            "probe_schedule": "unified_full_body_mtp_lm_head_text_only_v1",
+            "include_visual": False,
+            "producer_snapshot_sha256": producer_snapshot[
+                "closure_sha256"
+            ],
+            "producer_snapshot_commit": producer_snapshot["commit"],
+            "producer_snapshot_tree": producer_snapshot["tree"],
+            "container_image_digest": args.container_image_digest,
+        }
+        for key, expected in expected_execution.items():
+            if execution_identity.get(key) != expected:
+                raise SystemExit(
+                    f"sample-parallel execution identity {key!r} differs: "
+                    f"contract={execution_identity.get(key)!r}, cli={expected!r}"
+                )
+        importance_execution_sha = importance_execution_identity_sha256(
+            execution_identity, qname_census
+        )
+        if start != 0 or end != n_layers:
+            raise SystemExit(
+                "sample-parallel workers must process the complete body "
+                "qname scope (start-layer=0, end-layer=all)"
+            )
+        if not args.unified_sweep:
+            raise SystemExit(
+                "sample-parallel v1 requires --unified-sweep so every worker "
+                "uses the closed full-body execution schedule"
+            )
+        if args.include_visual:
+            raise SystemExit(
+                "sample-parallel v1 requires --no-include-visual; visual "
+                "Linears are excluded by the text-only source census"
+            )
+        if not args.include_mtp or not args.include_lm_head:
+            raise SystemExit(
+                "sample-parallel workers must include MTP and lm_head; "
+                "qname partitioning is not allowed on this lane"
+            )
+        if args.calibration_modality != "text-only":
+            raise SystemExit(
+                "sample-parallel incremental probe currently requires "
+                "text-only calibration; multimodal sampling has a separate "
+                "data contract"
+            )
+        if args.h_detail_dir is not None:
+            raise SystemExit(
+                "sample-parallel v1 is dense-only and requires --h-detail-dir "
+                "to be omitted; routed/per-qname g2 index merging is not "
+                "part of this exact lane"
+            )
+        collect_path = args.sample_importance_stats_output
+        apply_path = args.sample_global_importance_receipt
+        if args.importance_weighting and bool(collect_path) == bool(apply_path):
+            raise SystemExit(
+                "importance-weighted sample workers require exactly one of "
+                "--sample-importance-stats-output (stage 1) or "
+                "--sample-global-importance-receipt (stage 2)"
+            )
+        if not args.importance_weighting and (collect_path or apply_path):
+            raise SystemExit(
+                "sample importance receipts are invalid with "
+                "--no-importance-weighting"
+            )
+        if apply_path:
+            receipt = load_global_importance_receipt(
+                apply_path,
+                partition_contract=contract,
+                execution_identity_sha256=importance_execution_sha,
+            )
+            # Carry the complete, digest-validated global/local CE receipt.
+            # Projection here would erase artifact-SHA and duplicate-forward
+            # provenance before the strict cross-host merge can audit it.
+            args.sample_parallel_importance = dict(receipt)
+        elif collect_path and Path(collect_path).exists():
+            load_local_importance_stats(
+                collect_path,
+                partition_contract=contract,
+                execution_identity_sha256=importance_execution_sha,
+            )
+            print(
+                "[incremental/global] reusable local CE summary already "
+                f"exists at {collect_path}; no GPU work required",
+                flush=True,
+            )
+            return
+        args.nsamples = int(contract["local_samples"])
+        args.sample_parallel_contract = contract
+        args.sample_parallel_activation_scope = activation_scope_receipt()
+        args.sample_parallel_execution_identity = dict(execution_identity)
+        args.sample_parallel_qname_census = dict(qname_census)
+        args.sample_parallel_importance_execution_sha256 = (
+            importance_execution_sha
+        )
+        try:
+            _validate_sample_activation_directory_cover(
+                Path(args.activation_cache_dir),
+                set(str(name) for name in qname_census[
+                    "activation_qname_manifest"
+                ]["entries"]),
+                require_complete=False,
+            )
+        except Exception as exc:
+            raise SystemExit(
+                f"sample-parallel activation-cache preflight failed: {exc}"
+            ) from exc
+        print(
+            "[incremental] sample-parallel partition "
+            f"{contract['partition_index']}/{contract['partition_count']}: "
+            f"samples [{contract['sample_start']},{contract['sample_stop']}) "
+            f"local_hash={contract['local_calibration_hash']} "
+            f"global_hash={contract['global_calibration_hash']}",
+            flush=True,
+        )
+    elif (
+        args.sample_importance_stats_output
+        or args.sample_global_importance_receipt
+    ):
+        raise SystemExit(
+            "sample importance flags require --global-calibration-tensor "
+            "and --sample-partition-index"
+        )
+
+    from prismaquant.gpu_guard import require_cuda_hot_path
+    require_cuda_hot_path("incremental_probe", args.device)
 
     # Resolve --layers-per-shard: int literal or "auto" (hardware-adaptive).
     lps_arg = str(args.layers_per_shard).strip()
@@ -3096,7 +5275,7 @@ def main():
 
     ctx: StreamingContext | None = None
     tokenizer = None
-    calib: torch.Tensor | None = None
+    calib: torch.Tensor | None = sample_parallel_calib
     resolved_prefetch_lookahead: int | None = None
 
     # Module-level cache: when set, the StreamingContext + tokenizer are
@@ -3105,7 +5284,9 @@ def main():
     # This is what makes the in-process multi-chunk driver fast — the
     # 244 GB BF16 source streaming offload setup + LayerCache survive
     # across chunks, so chunk_01..N hit warm caches.
-    use_persistent = os.environ.get("PRISMAQUANT_PROBE_CTX_CACHE") == "1"
+    use_persistent = _persistent_probe_context_enabled(
+        args.sample_parallel_contract
+    )
 
     def _ensure_ready():
         nonlocal ctx, tokenizer, calib
@@ -3139,9 +5320,13 @@ def main():
                           flush=True)
                 _print_mem_snapshot("chunk start (post-reset)")
         if ctx is None:
-            from transformers import AutoTokenizer
             staged = stage_text_only(args.model)
-            tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
+            if sample_parallel_calib is None:
+                from transformers import AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    staged, trust_remote_code=True
+                )
             offload_folder = str(work_dir / "streaming_offload")
             ctx = _build_streaming_context(
                 args.model,
@@ -3199,10 +5384,7 @@ def main():
     # Fisher hooks. We install hooks on every resident linear that ANY
     # shard's include regex would match; each per-shard runner filters
     # the captured dicts down to its own scope.
-    linear_exclude = (
-        r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
-        r"block_sparse_moe\.gate$)"
-    )
+    linear_exclude = resolve_linear_exclude(args.model)
     resident_include_union = (
         "(?:" + "|".join(f"(?:{r})" for r in shard_regexes) + ")"
         if shard_regexes else r"(?!x)x"  # never-match fallback
@@ -3219,7 +5401,30 @@ def main():
         device=str(device),
         importance_weighting=args.importance_weighting,
         resident_include_union=resident_include_union,
+        # Resident marginals are written into the cached stats, so a
+        # cache built with the flag off must not be reused with it on.
+        emit_marginals=_marginals_enabled(),
     )
+    if args.sample_parallel_contract is not None:
+        precompute_meta["sample_parallel"] = dict(
+            args.sample_parallel_contract
+        )
+    if args.sample_parallel_importance is not None:
+        precompute_meta["sample_parallel_importance"] = dict(
+            args.sample_parallel_importance
+        )
+    if args.sample_parallel_activation_scope is not None:
+        precompute_meta["sample_parallel_activation_scope"] = dict(
+            args.sample_parallel_activation_scope
+        )
+    if args.sample_parallel_execution_identity is not None:
+        precompute_meta["sample_parallel_execution_identity"] = dict(
+            args.sample_parallel_execution_identity
+        )
+    if args.sample_parallel_qname_census is not None:
+        precompute_meta["sample_parallel_qname_census"] = dict(
+            args.sample_parallel_qname_census
+        )
 
     def _ensure_precompute() -> GlobalPrecompute:
         """Load Phase-1/Phase-2 artifacts from the on-disk cache if the
@@ -3227,45 +5432,30 @@ def main():
         nonlocal precomputed
         if precomputed is not None:
             return precomputed
-        cached = _load_precompute_cache(
-            precompute_cache_path, precompute_meta, device)
+        cached = (
+            None
+            if args.sample_importance_stats_output is not None
+            else _load_precompute_cache(
+                precompute_cache_path,
+                precompute_meta,
+                device,
+                sample_calibration=(
+                    calib if args.sample_parallel_contract is not None
+                    else None
+                ),
+            )
+        )
         if cached is not None:
             print(f"[incremental/global] reused precompute cache at "
                   f"{precompute_cache_path}", flush=True)
             precomputed = cached
             return precomputed
         _ensure_ready()
-        # Tied-embedding repair: when `tie_word_embeddings=True` (Qwen
-        # 3.5/3.6 small variants, Llama-3.2-1B/3B, etc.), the streaming
-        # pipeline materializes embed_tokens but leaves lm_head on meta
-        # because the source has no separate lm_head shard. Manually
-        # alias lm_head.weight to the materialized embedding before
-        # the precompute, otherwise model.lm_head(...) returns a meta
-        # tensor and `.item()` fails.
-        try:
-            _model = ctx.model
-            _cfg = getattr(_model, "config", None)
-            if _cfg is not None and getattr(_cfg, "tie_word_embeddings", False):
-                _embed = None
-                for _path in ("model.embed_tokens",
-                              "model.language_model.embed_tokens",
-                              "transformer.wte"):
-                    try:
-                        _m = _model.get_submodule(_path)
-                        if hasattr(_m, "weight") and not _m.weight.is_meta:
-                            _embed = _m
-                            break
-                    except (AttributeError, KeyError):
-                        continue
-                if _embed is not None and hasattr(_model, "lm_head"):
-                    if _model.lm_head.weight.is_meta:
-                        _model.lm_head.weight = _embed.weight
-                        print(f"[incremental] tied lm_head.weight ← "
-                              f"embed_tokens.weight (meta repair)", flush=True)
-        except Exception as _e:
-            print(f"[incremental] WARN tied-embedding repair: {_e}",
-                  flush=True)
-
+        # (Tied-embedding repair used to live here, with a hardcoded list
+        # of embedding paths and a swallowed exception. It now happens
+        # once, for every consumer of a streaming context, inside
+        # `_build_streaming_context` via
+        # `tied_embeddings.resolve_tied_output_embedding`.)
         precomputed = _compute_global_precompute(
             ctx,
             calib=calib,
@@ -3276,12 +5466,47 @@ def main():
             resident_include_union=resident_include_union,
             resident_exclude=linear_exclude,
             activation_cache_dir=args.activation_cache_dir,
+            sample_parallel_contract=args.sample_parallel_contract,
+            sample_importance_stats_output=(
+                args.sample_importance_stats_output
+                if args.sample_parallel_contract is not None else None
+            ),
+            sample_importance_execution_sha256=(
+                args.sample_parallel_importance_execution_sha256
+                if args.sample_parallel_contract is not None else None
+            ),
+            sample_publication_postflight=(
+                lambda: _validate_sample_parallel_publication_state(
+                    model=args.model,
+                    qname_census=args.sample_parallel_qname_census,
+                    producer_snapshot_root=args.producer_snapshot_root,
+                    execution_identity=(
+                        args.sample_parallel_execution_identity
+                    ),
+                )
+                if args.sample_parallel_contract is not None else None
+            ),
+            body_global_ce_mean=(
+                float(args.sample_parallel_importance["body_global_ce_mean"])
+                if args.sample_parallel_importance is not None else None
+            ),
         )
         _save_precompute_cache(
             precompute_cache_path, precomputed, precompute_meta)
         print(f"[incremental/global] wrote precompute cache to "
               f"{precompute_cache_path}", flush=True)
         return precomputed
+
+    if args.sample_importance_stats_output is not None:
+        # Stage 1 is a scalar-reduction barrier, not a probe-shard pass. Force
+        # it before any ordinary qname/LPS reuse checks; _compute exits after
+        # atomically writing the local CE summary.
+        try:
+            _ensure_precompute()
+        finally:
+            if ctx is not None and not use_persistent:
+                ctx.shutdown()
+        raise AssertionError("sample importance collection did not exit")
 
     # Linear-level reuse cache (LPS-invariant): union of per-Linear
     # Fisher stats from all existing shards that share the same
@@ -3301,13 +5526,28 @@ def main():
         "requested_device_map": str(args.device_map),
         "importance_weighting": args.importance_weighting,
         "activation_cache_dir": str(Path(args.activation_cache_dir)),
-        "linear_exclude": (
-            r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
-            r"block_sparse_moe\.gate$)"
-        ),
+        "linear_exclude": resolve_linear_exclude(args.model),
         "h_detail_dir": (str(Path(args.h_detail_dir))
                          if args.h_detail_dir else None),
         "activation_rows_limit": int(args.activation_rows_limit),
+        "router_coverage_version": _ROUTER_COVERAGE_VERSION,
+        "emit_marginals": _marginals_enabled(),
+        "sample_parallel": (
+            dict(args.sample_parallel_contract)
+            if args.sample_parallel_contract is not None else None
+        ),
+        "sample_parallel_importance": (
+            dict(args.sample_parallel_importance)
+            if args.sample_parallel_importance is not None else None
+        ),
+        "sample_parallel_activation_scope": (
+            dict(args.sample_parallel_activation_scope)
+            if args.sample_parallel_activation_scope is not None else None
+        ),
+        "sample_parallel_execution_identity": (
+            dict(args.sample_parallel_execution_identity)
+            if args.sample_parallel_execution_identity is not None else None
+        ),
     }
     linear_cache = scan_cached_linear_stats(shard_dir, content_meta_anchor)
     if linear_cache:
@@ -3371,6 +5611,8 @@ def main():
                     cache=linear_cache,
                     expected_meta=expected_meta,
                     output_path=shard_path,
+                    expected_layers=schedule[shard_idx].layer_indices,
+                    layer_prefix=schedule[shard_idx].layer_prefix,
                 ):
                     annotate_probe_shard(shard_path, expected_meta)
                     print(f"[incremental] synthesize shard {shard_idx} "
@@ -3405,6 +5647,14 @@ def main():
                     minimax_fast_moe_chunk_size=args.minimax_fast_moe_chunk_size,
                     activation_rows_limit=args.activation_rows_limit,
                     precomputed=pre,
+                    sample_parallel_contract=args.sample_parallel_contract,
+                    sample_parallel_execution_identity_sha256=(
+                        args.sample_parallel_execution_identity[
+                            "identity_sha256"
+                        ]
+                        if args.sample_parallel_execution_identity is not None
+                        else None
+                    ),
                 )
             elif kind == "mtp":
                 pre = _ensure_precompute()
@@ -3424,6 +5674,7 @@ def main():
                     prefetch_lookahead=_prefetch_lookahead(),
                     activation_rows_limit=args.activation_rows_limit,
                     precomputed=pre,
+                    sample_parallel_contract=args.sample_parallel_contract,
                 )
             elif kind == "lm_head":
                 # The lm_head Fisher is collected naturally during the
@@ -3448,6 +5699,7 @@ def main():
                     model_path=args.model,
                     prefetch_lookahead=_prefetch_lookahead(),
                     precomputed=pre,
+                    sample_parallel_contract=args.sample_parallel_contract,
                 )
             else:
                 # visual blocks are stripped by text-only staging, so the
@@ -3479,10 +5731,7 @@ def main():
                             "importance_weighting": args.importance_weighting,
                             "activation_cache_dir": args.activation_cache_dir,
                             "linear_include": linear_include,
-                            "linear_exclude": (
-                                r"(?:mlp\.gate$|mlp\..*gate$|"
-                                r"\.router(?:$|\.)|block_sparse_moe\.gate$)"
-                            ),
+                            "linear_exclude": resolve_linear_exclude(args.model),
                             "shard_kind": kind,
                         },
                     }, f)
@@ -3612,15 +5861,40 @@ def main():
     all_pickles = list(shard_paths)
     if visual_probe_path is not None and visual_probe_path.exists():
         all_pickles.append(visual_probe_path)
-    merge_probe_pickles(all_pickles, Path(args.output))
+    _merged = merge_probe_pickles(
+        all_pickles, Path(args.output), write_output=False
+    )
+    # Body-coverage gate: a merged probe missing whole layers poisons
+    # every downstream stage silently (cost skips them, the allocator
+    # allocates around them, the export passes them through). Fail
+    # fast here instead.
+    _cov = _merged
+    _body_prefix = schedule[0].layer_prefix if len(schedule) else None
+    if _body_prefix:
+        _expected_cov = set()
+        for _e in schedule:
+            if _e.kind == "body":
+                _expected_cov |= set(_e.layer_indices)
+        _covered = set()
+        _pat = re.compile(
+            re.escape(_body_prefix.rstrip(".") + ".") + r"(\d+)\.")
+        for _n in _cov.get("stats", {}):
+            _m = _pat.search(str(_n))
+            if _m:
+                _covered.add(int(_m.group(1)))
+        _missing_cov = sorted(_expected_cov - _covered)
+        if _missing_cov:
+            print(f"[incremental] FATAL: merged probe has NO stats for "
+                  f"body layers {_missing_cov} — refusing to write a "
+                  f"probe that would silently drop them downstream.",
+                  flush=True)
+            raise SystemExit(2)
     # Annotate the merged pickle with the calibration modality so
     # run-pipeline.sh's reuse guard (and any downstream tooling) can
     # reject a stale probe whose activations don't match the currently
     # requested modality. Written under the top-level `meta` dict so a
     # simple `pickle.load(...)['meta']['calibration_modality']` lookup
     # works.
-    with open(args.output, "rb") as _f:
-        _merged = pickle.load(_f)
     _meta = dict(_merged.get("meta", {}))
     _meta["calibration_modality"] = args.calibration_modality
     # Estimator provenance: packed-expert h_trace is the per-token
@@ -3628,9 +5902,136 @@ def main():
     # sum-then-square 5-50x inflated values and are refused by
     # prepare_cost_context unless explicitly allowed).
     _meta["packed_fisher_estimator"] = "per_token_v2"
+    _meta["emit_marginals"] = _marginals_enabled()
+    _meta["activation_rows_limit"] = int(args.activation_rows_limit)
+    if args.sample_parallel_contract is not None:
+        # Promote the partition contract to one canonical top-level location.
+        # The per-qname shards also carry it under incremental_shard for
+        # resume safety; the cross-worker merger reads this copy without
+        # depending on the internal layer-shard grouping.
+        if calibration_data_hash(calib) != args.sample_parallel_contract[
+            "local_calibration_hash"
+        ]:
+            raise SystemExit(
+                "sample-parallel local calibration hash changed during probe"
+            )
+        _meta["sample_parallel"] = dict(args.sample_parallel_contract)
+        if args.sample_parallel_importance is not None:
+            _meta["sample_parallel_importance"] = dict(
+                args.sample_parallel_importance
+            )
+        _meta["sample_parallel_activation_scope"] = dict(
+            args.sample_parallel_activation_scope
+        )
+        _meta["sample_parallel_execution_identity"] = dict(
+            args.sample_parallel_execution_identity
+        )
+        probe_entries = args.sample_parallel_qname_census[
+            "probe_qname_manifest"
+        ]["entries"]
+        observed_qnames = set(str(name) for name in _merged.get("stats", {}))
+        expected_qnames = set(str(name) for name in probe_entries)
+        if observed_qnames != expected_qnames:
+            raise SystemExit(
+                "sample-parallel worker probe differs from the authoritative "
+                f"source qname census: missing={sorted(expected_qnames-observed_qnames)[:8]} "
+                f"unexpected={sorted(observed_qnames-expected_qnames)[:8]}"
+            )
+        try:
+            from prismaquant.sample_parallel_probe import token_rows_per_sample
+            from prismaquant.sample_parallel_probe_merge import (
+                validate_sample_parallel_stat_row,
+            )
+
+            for name in sorted(expected_qnames):
+                entry = probe_entries[name]
+                validate_sample_parallel_stat_row(
+                    _merged["stats"][name],
+                    qname=name,
+                    expected_tokens=(
+                        int(args.sample_parallel_contract["local_samples"])
+                        * token_rows_per_sample(
+                            str(entry["token_rows_per_sample"]),
+                            int(args.sample_parallel_contract["seqlen"]),
+                        )
+                    ),
+                    expected_shape=tuple(
+                        int(value) for value in entry["shape"]
+                    ),
+                    require_marginals=bool(_marginals_enabled()),
+                )
+        except Exception as exc:
+            raise SystemExit(
+                f"sample-parallel worker stat postflight failed: {exc}"
+            ) from exc
+        for map_name in (
+            "router_counts", "router_totals", "router_active_counts",
+            "expert_route_stats", "expert_info",
+        ):
+            if _merged.get(map_name):
+                raise SystemExit(
+                    f"sample-parallel v1 rejects routed/packed map {map_name!r}"
+                )
+        expected_activation = set(
+            args.sample_parallel_qname_census[
+                "activation_qname_manifest"
+            ]["entries"]
+        )
+        try:
+            activation_entries = args.sample_parallel_qname_census[
+                "activation_qname_manifest"
+            ]["entries"]
+            activation_dir = Path(args.activation_cache_dir)
+            _validate_sample_activation_directory_cover(
+                activation_dir,
+                expected_activation,
+                require_complete=True,
+            )
+            for name in sorted(expected_activation):
+                _validate_sample_activation_blob(
+                    activation_dir / (
+                        re.sub(r"[^A-Za-z0-9_-]", "__", name) + ".pt"
+                    ),
+                    qname=name,
+                    expected_width=int(activation_entries[name]["shape"][1]),
+                    partition_contract=args.sample_parallel_contract,
+                    rows_limit=int(args.activation_rows_limit),
+                    execution_identity_sha256=str(
+                        args.sample_parallel_execution_identity[
+                            "identity_sha256"
+                        ]
+                    ),
+                )
+        except Exception as exc:
+            raise SystemExit(
+                f"sample-parallel worker activation postflight failed: {exc}"
+            ) from exc
+        # Close the source/runtime TOCTOU window immediately before the only
+        # durable worker publication.  The source identity-cache verifier
+        # replays mutation-sensitive shard fingerprints; the runtime verifier
+        # re-hashes the complete immutable source-snapshot ledger.
+        try:
+            _validate_sample_parallel_publication_state(
+                model=args.model,
+                qname_census=args.sample_parallel_qname_census,
+                producer_snapshot_root=args.producer_snapshot_root,
+                execution_identity=args.sample_parallel_execution_identity,
+            )
+        except Exception as exc:
+            raise SystemExit(
+                "sample-parallel source/runtime changed before publication: "
+                f"{exc}"
+            ) from exc
     _merged["meta"] = _meta
-    with open(args.output, "wb") as _f:
-        pickle.dump(_merged, _f)
+    output_payload = pickle.dumps(_merged, protocol=pickle.HIGHEST_PROTOCOL)
+    if args.sample_parallel_contract is not None:
+        from prismaquant.sample_parallel_probe import (
+            _atomic_write_bytes_no_clobber,
+        )
+        _atomic_write_bytes_no_clobber(Path(args.output), output_payload)
+    else:
+        from prismaquant.cost_stage_checkpoint import atomic_write_bytes
+        atomic_write_bytes(Path(args.output), output_payload)
     print(f"[incremental] wrote merged probe to {args.output} "
           f"(calibration_modality={args.calibration_modality})", flush=True)
 

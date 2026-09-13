@@ -88,15 +88,25 @@ import json
 import math
 import pickle
 import re
+import time as _time
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 
 from . import format_registry as fr
+from .tessera_menu import (
+    expand_menu_tokens_report,
+    menu_mode,
+    menu_width_report,
+    partition_attested,
+    surrogate_selection_caveat,
+)
 from .allocator_solver import (
     Candidate,
     _shape_from_stats,
     compute_achieved,
     compute_assignment_predicted_dloss,
+    legal_formats_from_candidates,
     promote_fused,
     promote_moe_pair,
     promote_serving_units,
@@ -113,22 +123,148 @@ from .allocator_candidates import (
     aggregate_fused_siblings,
     aggregate_packed_serving_groups,
     build_candidates,
+    calibrate_activation_fair_pricing,
+    check_stats_format_applicability,
     expand_fused_sibling_assignment,
     expand_packed_group_assignment,
     packed_role_split_profile,
+    selection_serving_lane_provenance,
+    serialized_candidate_payload,
     summarize_applicability_masks,
+    reduce_continuous_menu,
+)
+from .fixed_head import (
+    allow_pinned_lifts_lm_head,
+    is_lm_head_name,
+    parse_allow_pinned,
+)
+from .nvfp4_cb_footprint import (
+    CB_ASSIGNMENT_IDENTITIES_FIELD,
+    CB_TENSOR_IDENTITY_FIELD,
+    CBSerializationContext,
+    cb_assignment_payload_breakdown,
+    cb_assignment_serialization_stamps,
+    cb_serialization_context_from_env,
+    cb_serialization_context_stamp,
+    cb_tensor_payload_breakdown,
+    is_cb_format,
+    validate_cb_cost_provenance,
+    whole_artifact_budget_stamp,
+)
+from .production_weight_cache import (
+    project_cb_render_identity,
+    validate_cb_render_provenance,
+)
+from .footprint import (
+    NVFP4_WEIGHT_ONLY_STATS_KEY,
+    nvfp4_global_sidecar_bytes,
 )
 from .serving_profiles import (
     check_serving_format,
+    require_per_role_expert_scheme_support,
     resolve_target_profile,
+    serving_lane_catalog,
+    serving_lane_route,
     serving_profile_names,
 )
+from .cb_ladder_cross_family import (
+    cross_family_verdict_from_cost_payload,
+)
+from .serve_constraints import (
+    ServeConstraintContext,
+    ServeConstraintError,
+    ServeSLOs,
+    WorkloadMix,
+    evaluate_assignment as evaluate_serve_constraints,
+    evaluate_measured_assignment,
+    fastest_feasible_summary,
+    rejection_record,
+)
+from .serve_dispatch_table import DispatchTableError, load_dispatch_table
 from .decision_units import block_id_from_qname
+from .layer_config import LAYER_CONFIG_META_KEY
 from .schemas import validate_cost_payload, validate_probe_payload
+from .tessera_expert_projection import (
+    ExpertProjectionError,
+    allocation_expert_projection_block,
+)
 
 
 _KNEE_DIAGNOSTIC_MIN_LOG_SPAN_DECADES = 1.0
 _KNEE_DIAGNOSTIC_TAIL_MIDPOINT_FRACTION = 0.5
+
+
+def _serialized_format_rates(
+    specs: list[fr.FormatSpec],
+    stats: Mapping[str, Mapping],
+    cb_serialization_context: CBSerializationContext | None,
+) -> dict[str, float]:
+    """Artifact-faithful menu ordering, independent of input menu order.
+
+    CB FormatSpec rates are deliberately incomplete.  Rank each format by the
+    exact payload it would use across the available Linear shapes; for CB this
+    includes FP8 row scales and once-only codebook sidecars. Shapes a format
+    cannot serialize are omitted (the applicability gate will remove them
+    later). A name tie-break makes the result deterministic.
+    """
+    rates: dict[str, float] = {}
+    for spec in specs:
+        shapes: dict[str, tuple[int, ...]] = {}
+        total_params = 0
+        for name, entry in stats.items():
+            if not isinstance(entry, Mapping):
+                continue
+            shape = _shape_from_stats(dict(entry))
+            if len(shape) < 2 or any(int(dim) <= 0 for dim in shape):
+                continue
+            try:
+                if is_cb_format(spec.name):
+                    if cb_serialization_context is None:
+                        continue
+                    # The exact accountant owns the divisibility/shape gate.
+                    from .nvfp4_cb_footprint import cb_tensor_payload_breakdown
+
+                    cb_tensor_payload_breakdown(
+                        spec.name,
+                        shape,
+                        qname=str(name),
+                        context=cb_serialization_context,
+                    )
+                else:
+                    spec.memory_bytes_for_shape(shape)
+            except (ValueError, AssertionError):
+                continue
+            shapes[str(name)] = shape
+            total_params += int(math.prod(shape))
+        if total_params <= 0:
+            rates[spec.name] = float(spec.effective_bits)
+            continue
+        if is_cb_format(spec.name):
+            payload = cb_assignment_payload_breakdown(
+                {name: spec.name for name in shapes},
+                shapes,
+                context=cb_serialization_context,
+            )
+            total_bytes = int(payload["total_bytes"])
+        else:
+            total_bytes = sum(
+                int(spec.memory_bytes_for_shape(shape))
+                for shape in shapes.values()
+            )
+        rates[spec.name] = 8.0 * total_bytes / float(total_params)
+    return rates
+
+
+def _sort_specs_by_serialized_rate(
+    specs: list[fr.FormatSpec],
+    stats: Mapping[str, Mapping],
+    cb_serialization_context: CBSerializationContext | None,
+) -> tuple[list[fr.FormatSpec], dict[str, float]]:
+    rates = _serialized_format_rates(specs, stats, cb_serialization_context)
+    return (
+        sorted(specs, key=lambda spec: (rates[spec.name], spec.name)),
+        rates,
+    )
 _RD_LOG_LINEAR_R2_THRESHOLD = 0.99
 
 
@@ -465,13 +601,37 @@ def _allowed_format(target_profile: str, name: str, fmt: str) -> bool:
     return decision.legal
 
 
+def _allowed_candidate(
+    target_profile: str, name: str, candidate: Candidate,
+) -> bool:
+    """Legality of one candidate, whole-group options included.
+
+    A whole-group Tessera option is not a format name and the serving profile
+    has no row for it; asking about the name would be asking the wrong
+    question. What the profile can answer is whether each MEMBER's rung is
+    legal for that member, which is exactly the option's legality -- and it is
+    strictly stronger than the old per-NAME check, which asked once about a
+    single shared name.
+    """
+    member_formats = getattr(candidate, "member_formats", None)
+    if member_formats:
+        return all(
+            _allowed_format(target_profile, member, member_fmt)
+            for member, member_fmt in member_formats.items()
+        )
+    return _allowed_format(target_profile, name, candidate.fmt)
+
+
 def filter_candidates_for_profile(
     candidates: dict[str, list[Candidate]],
     target_profile: str,
 ) -> dict[str, list[Candidate]]:
     out = {}
     for name, cands in candidates.items():
-        kept = [c for c in cands if _allowed_format(target_profile, name, c.fmt)]
+        kept = [
+            c for c in cands
+            if _allowed_candidate(target_profile, name, c)
+        ]
         if kept:
             out[name] = kept
     return out
@@ -513,6 +673,35 @@ def _is_visual_linear(name: str) -> bool:
     allocator's stats dictionary landed on.
     """
     return bool(_VISUAL_PREFIX_RE.match(name))
+
+
+def _mark_weight_only_nvfp4_stats(
+    stats: Mapping[str, Mapping[str, object]],
+    profile,
+) -> dict[str, dict[str, object]]:
+    """Stamp targets that the mixed exporter emits as stock W4A16.
+
+    The exporter classifies a sidecar target by the same profile mapping:
+    ``checkpoint_to_live_name(..., multimodal=False) is None`` means text
+    calibration cannot cover that module, so stock NVFP4 drops
+    ``input_global_scale``. Persist that decision in the accounting stats
+    rather than re-deriving it from a visual/audio/MTP name heuristic.
+    """
+    mapper = getattr(profile, "checkpoint_to_live_name", None)
+    if not callable(mapper):
+        return {str(name): dict(entry) for name, entry in stats.items()}
+    marked: dict[str, dict[str, object]] = {}
+    for raw_name, raw_entry in stats.items():
+        name = str(raw_name)
+        entry = dict(raw_entry)
+        try:
+            live_name = mapper(name + ".weight", multimodal=False)
+        except TypeError:
+            live_name = mapper(name + ".weight")
+        if live_name is None:
+            entry[NVFP4_WEIGHT_ONLY_STATS_KEY] = True
+        marked[name] = entry
+    return marked
 
 
 def apply_visual_format_override(
@@ -562,15 +751,33 @@ def _is_mtp_linear(name: str) -> bool:
     return str(name).startswith("mtp.")
 
 
+def _canonical_candidate_format(fmt: str) -> str:
+    """Canonical registry name, or the name itself for a whole-group option.
+
+    A whole-group Tessera option (``TESSERA_<F>_K<n>_G<i>``) is deliberately
+    not resolvable to a ``FormatSpec``: it stands for a different rung on each
+    member of a serving unit, so there is no single rate a spec could carry.
+    Its own name IS its canonical identity, and it can only ever appear
+    against a super-item key -- an EXPANDED assignment holds real rungs. So
+    the identity comparisons below stay exact without asking the registry a
+    question it should refuse.
+    """
+    from .tessera_formats import is_tessera_group_option
+
+    if is_tessera_group_option(fmt):
+        return str(fmt)
+    return fr.get_format(fmt).name
+
+
 def _find_candidate_for_format(
     candidates: dict[str, list[Candidate]],
     name: str,
     fmt: str,
 ) -> Candidate | None:
     """Return the scored candidate for `name` at canonical format `fmt`."""
-    canonical = fr.get_format(fmt).name
+    canonical = _canonical_candidate_format(fmt)
     for cand in candidates.get(name, []):
-        if fr.get_format(cand.fmt).name == canonical:
+        if _canonical_candidate_format(cand.fmt) == canonical:
             return cand
     return None
 
@@ -583,17 +790,18 @@ def _validate_assignment_candidate_membership(
 ) -> None:
     """Fail if promotion assigned a format no candidate row allowed."""
     available = {
-        name: {fr.get_format(cand.fmt).name for cand in per_name}
+        name: {_canonical_candidate_format(cand.fmt) for cand in per_name}
         for name, per_name in candidates.items()
     }
     for name, cand in (fixed_chosen_candidates or {}).items():
-        available.setdefault(name, set()).add(fr.get_format(cand.fmt).name)
+        available.setdefault(name, set()).add(
+            _canonical_candidate_format(cand.fmt))
 
     violations = []
     for name, fmt in sorted(assignment.items()):
         if name not in available:
             continue
-        canonical = fr.get_format(fmt).name
+        canonical = _canonical_candidate_format(fmt)
         if canonical not in available[name]:
             violations.append((name, canonical, sorted(available[name])))
     if not violations:
@@ -663,6 +871,7 @@ def _build_bit_attribution(
     candidates: dict[str, list[Candidate]],
     stats_entry_for,
     format_specs: dict[str, "fr.FormatSpec"],
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """Build (buckets, per_linear_rows, body_totals) for the bit-attribution
     report over the FINAL resolved body assignment.
@@ -677,8 +886,10 @@ def _build_bit_attribution(
     """
     buckets: dict[tuple[str, str], dict] = {}
     per_linear: list[dict] = []
-    body_bits = 0.0
+    body_tensor_bits = 0.0
     body_params = 0
+    cb_assignment: dict[str, str] = {}
+    cb_shapes: dict[str, tuple[int, ...]] = {}
 
     for name, fmt in assignment_expanded.items():
         if _is_visual_linear(name) or _is_mtp_linear(name):
@@ -695,7 +906,29 @@ def _build_bit_attribution(
         cand = _find_candidate_for_format(candidates, name, fmt)
         bits = None
         pred_dloss = None
-        if cand is not None:
+        if is_cb_format(fmt):
+            if cb_serialization_context is None:
+                raise ValueError(
+                    f"bit attribution cannot price {name}={fmt} without "
+                    "CBSerializationContext"
+                )
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"bit attribution cannot price {name}={fmt} without shape stats"
+                )
+            shape = _shape_from_stats(entry)
+            item = cb_tensor_payload_breakdown(
+                fmt,
+                shape,
+                qname=name,
+                context=cb_serialization_context,
+            )
+            bits = 8.0 * int(item["tensor_payload_bytes"])
+            cb_assignment[name] = fmt
+            cb_shapes[name] = shape
+            if cand is not None:
+                pred_dloss = float(getattr(cand, "predicted_dloss", 0.0))
+        elif cand is not None:
             bits = 8.0 * cand.memory_bytes
             pred_dloss = float(getattr(cand, "predicted_dloss", 0.0))
         elif isinstance(entry, dict):
@@ -705,6 +938,15 @@ def _build_bit_attribution(
             elif fmt in format_specs and n_params:
                 shape = _shape_from_stats(entry)
                 bits = format_specs[fmt].effective_bits_for_shape(shape) * n_params
+
+        if bits is not None and fmt == "NVFP4" and isinstance(entry, dict):
+            bits += 8.0 * nvfp4_global_sidecar_bytes(
+                name,
+                _shape_from_stats(entry),
+                weight_only=bool(
+                    entry.get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)
+                ),
+            )
 
         bpp = (bits / n_params) if (bits is not None and n_params) else None
         block_id = block_id_from_qname(name)
@@ -737,7 +979,7 @@ def _build_bit_attribution(
         bucket["format_counts"][fmt] += 1
         if bits is not None:
             bucket["bits_total"] += bits
-            body_bits += bits
+            body_tensor_bits += bits
         if n_params:
             bucket["n_params_total"] += n_params
             body_params += n_params
@@ -767,8 +1009,22 @@ def _build_bit_attribution(
 
     bucket_list.sort(key=lambda r: (_bit_attr_block_sort_key(r["block_id"]), r["role"]))
     per_linear.sort(key=lambda r: (_bit_attr_block_sort_key(r["block_id"]), r["role"], r["qname"]))
+    cb_shared_sidecar_bits = 0.0
+    if cb_assignment:
+        cb_payload = cb_assignment_payload_breakdown(
+            cb_assignment,
+            cb_shapes,
+            context=cb_serialization_context,
+        )
+        cb_shared_sidecar_bits = 8.0 * int(
+            cb_payload["codebook_sidecar_bytes"]
+        )
+    body_bits = body_tensor_bits + cb_shared_sidecar_bits
     totals = {
         "body_bits": body_bits,
+        "body_tensor_payload_bits": body_tensor_bits,
+        "body_shared_cb_sidecar_bits": cb_shared_sidecar_bits,
+        "body_assignment_payload_bits": body_bits,
         "body_quantizable_params": body_params,
         "body_bits_per_param": (body_bits / body_params) if body_params else None,
         "n_body_linears": len(per_linear),
@@ -786,6 +1042,7 @@ def _write_bit_attribution_reports(
     candidates: dict[str, list[Candidate]],
     stats_entry_for,
     format_specs: dict[str, "fr.FormatSpec"],
+    cb_serialization_context: CBSerializationContext | None = None,
 ) -> None:
     """Write the bit-attribution JSON / CSV and print a compact per-role rollup.
 
@@ -793,14 +1050,43 @@ def _write_bit_attribution_reports(
     if not json_path and not csv_path:
         return
     buckets, per_linear, totals = _build_bit_attribution(
-        assignment_expanded, candidates, stats_entry_for, format_specs)
+        assignment_expanded,
+        candidates,
+        stats_entry_for,
+        format_specs,
+        cb_serialization_context,
+    )
+
+    if totals["body_quantizable_params"]:
+        reconciled = float(totals["body_bits_per_param"])
+        if not math.isclose(
+            reconciled,
+            float(achieved_bits),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise AssertionError(
+                "bit attribution does not reconcile with final exact body "
+                f"assignment bpp: report={reconciled}, final={achieved_bits}"
+            )
 
     if json_path:
         payload = {
-            "schema": "prismaquant.allocator.bit_attribution.v1",
+            "schema": "prismaquant.allocator.bit_attribution.v2",
             "target_bits": float(target_bits),
             "achieved_bits": float(achieved_bits),
             "body_bits_per_param": totals["body_bits_per_param"],
+            "body_assignment_payload_bits": totals[
+                "body_assignment_payload_bits"
+            ],
+            "body_tensor_payload_bits": totals["body_tensor_payload_bits"],
+            "body_shared_cb_sidecar_bits": totals[
+                "body_shared_cb_sidecar_bits"
+            ],
+            "reconciliation": (
+                "body_assignment_payload_bits = body_tensor_payload_bits + "
+                "body_shared_cb_sidecar_bits"
+            ),
             "body_quantizable_params": totals["body_quantizable_params"],
             "n_body_linears": totals["n_body_linears"],
             "buckets": buckets,
@@ -852,14 +1138,17 @@ def _write_bit_attribution_reports(
               flush=True)
 
 
-def discover_visual_linears_from_source(model_path: str) -> list[str]:
-    """Scan the source safetensors index for `model.visual.blocks.*.weight`
-    entries with rank-2 shapes — these are the Linear modules the visual
-    encoder exposes.
+def discover_visual_linear_stats_from_source(
+    model_path: str,
+    *,
+    strict: bool = False,
+) -> dict[str, dict[str, object]]:
+    """Scan source safetensors for visual-Linear names and exact shapes.
 
-    Returned names are the basename (`.weight` stripped) so they slot
-    directly into the allocator's assignment dictionary and the exporter's
-    quantize-by-recipe dispatch.
+    Returned keys are the basename (``.weight`` stripped); values carry the
+    same ``n_params``/``in_features``/``out_features`` fields as probe stats.
+    Keeping shapes is required for exact Pareto byte pricing when the text-only
+    probe did not instantiate the visual tower.
 
     The probe's text-only staging strips the visual tower, so visual
     Linears never appear in the probe or cost pickles. This helper lets
@@ -871,10 +1160,13 @@ def discover_visual_linears_from_source(model_path: str) -> list[str]:
     """
     src = Path(model_path)
     idx_path = src / "model.safetensors.index.json"
-    candidates: list[tuple[str, tuple[int, ...]]] = []
+    candidates: list[tuple[str, tuple[int, ...], str]] = []
+    source_tensor_names: set[str] = set()
+    scan_errors: list[str] = []
     if idx_path.exists():
         with open(idx_path) as f:
             wm = json.load(f).get("weight_map", {})
+        source_tensor_names.update(str(name) for name in wm)
         # Index file carries only names, not shapes. We need to open each
         # referenced shard once to read rank.
         from collections import defaultdict as _dd
@@ -887,43 +1179,71 @@ def discover_visual_linears_from_source(model_path: str) -> list[str]:
             by_shard[shard].append(key)
         try:
             from safetensors import safe_open
-        except ImportError:
-            return []
+        except ImportError as exc:
+            if strict:
+                raise RuntimeError(
+                    "exact visual source discovery requires safetensors"
+                ) from exc
+            return {}
         for shard, keys in by_shard.items():
             shard_path = src / shard
             if not shard_path.exists():
+                scan_errors.append(
+                    f"missing indexed shard {shard!r} for {keys[:4]}"
+                )
                 continue
             with safe_open(str(shard_path), framework="pt") as sf:
                 for k in keys:
                     try:
-                        shape = tuple(sf.get_slice(k).get_shape())
-                    except Exception:
+                        tensor_slice = sf.get_slice(k)
+                        shape = tuple(tensor_slice.get_shape())
+                        dtype = str(tensor_slice.get_dtype()).upper()
+                    except Exception as exc:
+                        scan_errors.append(f"{shard}:{k}: {exc}")
                         continue
-                    candidates.append((k, shape))
+                    candidates.append((k, shape, dtype))
     else:
         # No index file — scan every safetensors shard directly. Used for
         # small, single-file checkpoints.
         try:
             from safetensors import safe_open
-        except ImportError:
-            return []
+        except ImportError as exc:
+            if strict:
+                raise RuntimeError(
+                    "exact visual source discovery requires safetensors"
+                ) from exc
+            return {}
         import os as _os
         if not src.exists():
-            return []
+            if strict:
+                raise FileNotFoundError(
+                    f"visual source checkpoint does not exist: {src}"
+                )
+            return {}
         for f in sorted(_os.listdir(src)):
             if not f.endswith(".safetensors"):
                 continue
             with safe_open(str(src / f), framework="pt") as sf:
+                source_tensor_names.update(str(key) for key in sf.keys())
                 for k in sf.keys():
                     if not k.endswith(".weight"):
                         continue
                     if not _VISUAL_PREFIX_RE.match(k):
                         continue
                     try:
-                        shape = tuple(sf.get_slice(k).get_shape())
-                    except Exception:
+                        tensor_slice = sf.get_slice(k)
+                        shape = tuple(tensor_slice.get_shape())
+                        dtype = str(tensor_slice.get_dtype()).upper()
+                    except Exception as exc:
+                        scan_errors.append(f"{f}:{k}: {exc}")
                         continue
-                    candidates.append((k, shape))
+                    candidates.append((k, shape, dtype))
+
+    if strict and scan_errors:
+        raise RuntimeError(
+            "exact visual source discovery was incomplete: "
+            + "; ".join(scan_errors[:8])
+        )
 
     # Only rank-2 weights are Linear-like; conv1d / norms / biases are
     # kept at BF16 passthrough regardless of --visual-format.
@@ -942,14 +1262,85 @@ def discover_visual_linears_from_source(model_path: str) -> list[str]:
         r"|rotary_emb"          # rotary pos embed cache
         r")(?:\.|$)"
     )
-    out: list[str] = []
-    for name, shape in candidates:
+    out: dict[str, dict[str, object]] = {}
+    for name, shape, dtype in candidates:
         if len(shape) != 2:
             continue
         if _NON_LINEAR_RE.search(name):
             continue
-        out.append(name[:-len(".weight")] if name.endswith(".weight") else name)
-    return sorted(set(out))
+        qname = name[:-len(".weight")] if name.endswith(".weight") else name
+        out_features, in_features = (int(shape[0]), int(shape[1]))
+        entry = {
+            "n_params": out_features * in_features,
+            "out_features": out_features,
+            "in_features": in_features,
+            NVFP4_WEIGHT_ONLY_STATS_KEY: True,
+            "source_dtype": (
+                "bf16" if dtype == "BF16"
+                else "fp8" if dtype.startswith("F8_")
+                else "fp16" if dtype == "F16"
+                else "fp32" if dtype == "F32"
+                else dtype.lower()
+            ),
+            "has_fp8_scale": any(
+                f"{qname}.{suffix}" in source_tensor_names
+                for suffix in ("weight_scale_inv", "weight_scale")
+            ),
+        }
+        previous = out.setdefault(qname, entry)
+        if previous != entry:
+            raise RuntimeError(
+                f"visual Linear {qname!r} appears with conflicting source "
+                f"shapes: {previous} versus {entry}"
+            )
+    return dict(sorted(out.items()))
+
+
+def discover_visual_linears_from_source(model_path: str) -> list[str]:
+    """Backwards-compatible name-only view of source visual Linears."""
+    return list(discover_visual_linear_stats_from_source(model_path))
+
+
+def validate_source_visual_passthrough_contract(
+    source_visual_stats: Mapping[str, Mapping[str, object]],
+    visual_format: str,
+) -> None:
+    """Reject a source-only visual passthrough whose dtype does not match."""
+    canonical = fr.get_format(visual_format).name
+    if canonical not in PASSTHROUGH_SOURCE_REQUIREMENTS:
+        return
+    mismatched = sorted(
+        name
+        for name, entry in source_visual_stats.items()
+        if (
+            not _passthrough_source_ok(
+                canonical,
+                str(entry.get("source_dtype", "unknown")),
+            )
+            or (
+                canonical == "FP8_SOURCE"
+                and not bool(entry.get("has_fp8_scale", False))
+            )
+        )
+    )
+    if not mismatched:
+        return
+    sample = [
+        (
+            name,
+            source_visual_stats[name].get("source_dtype", "unknown"),
+            bool(source_visual_stats[name].get("has_fp8_scale", False)),
+        )
+        for name in mismatched[:8]
+    ]
+    raise ValueError(
+        f"--visual-format={canonical} is a passthrough contract, but "
+        "source-only visual Linears have incompatible source dtype/scale "
+        "contracts "
+        f"(sample={sample}). The exporter copies these tensors verbatim, so "
+        "pricing them as a re-encode would make the assignment budget false. "
+        "Choose an explicit re-encoding format or use a matching source."
+    )
 
 
 
@@ -1005,6 +1396,41 @@ def incomplete_fused_group_dp_exclusions(
     return sorted(incomplete_members - set(allocation_excluded))
 
 
+def tied_lm_head_dp_exclusions(
+    stats: dict,
+    costs: dict,
+    model_profile,
+    model_path: str | None,
+    allocation_excluded=(),
+) -> list[str]:
+    """Linears to exclude from DP because they are a tied LM head.
+
+    When the checkpoint declares `tie_word_embeddings` and ships no head
+    tensor, `lm_head.weight` IS the input embedding — one storage, one set
+    of source bytes. Quantizing it would quantize every token embedding
+    (which the pipeline prices in the non-quantizable floor and no probe /
+    cost measurement observes), and there is no `lm_head.weight` in the
+    source manifest to move out of that floor. So the tie makes the head
+    structurally passthrough-only, independent of the serving profile's
+    pins: this exclusion deliberately ignores `--allow-pinned lm_head`,
+    which exists to trade an *independent* head's bytes for quality.
+
+    Post-fix probes emit no tied-head row at all (the shard schedule skips
+    it); this also covers probes built before that fix.
+    """
+    if not model_path:
+        return []
+    from .tied_embeddings import lm_head_is_tied_alias
+
+    if not lm_head_is_tied_alias(model_path, profile=model_profile):
+        return []
+    excluded = {
+        name for name in (set(stats) | set(costs))
+        if is_lm_head_name(name, model_profile)
+    }
+    return sorted(excluded - set(allocation_excluded))
+
+
 def validate_final_serving_promotion_noop(
     before: dict[str, str],
     after: dict[str, str],
@@ -1025,10 +1451,250 @@ def validate_final_serving_promotion_noop(
     )
 
 
+def renormalize_probe_fisher(stats: dict, meta: dict, *,
+                             allow_legacy: bool = False) -> int | None:
+    """Recompute h_trace/h_w2_sum/h_trace_per_expert from the stored RAW
+    accumulators with the one correct shared denominator: the global calib
+    token count.
+
+    Older incremental probes finalized `h_trace = h_trace_raw /
+    n_tokens_seen` PER ROW, where per-expert Linears only count their
+    ROUTED tokens — inflating a rarely-routed expert's Fisher by
+    (global/routed), i.e. inverted importance weighting. The typical
+    inflation is ~n_experts/top_k (≈32x on a 256-expert top-8 model);
+    the degenerate 1-routed-token case reaches ~33,000x at a 32k-token
+    calibration. Dense rows saw exactly the global count, so their values
+    are unchanged; probes written by the fixed finalize renormalize to
+    identical values — the recompute is idempotent (see PER-ROW STAMPS).
+
+    PER-ROW STAMPS WIN. A row that already carries ``h_trace_norm_tokens``
+    was written by a fixed finalize (the field was introduced with it) and
+    is already divided by the global count of the pass that PRODUCED it —
+    which is not always this probe's meta count. `incremental_probe` merges
+    the multimodal visual pass (finalized at ``n_samples x max_text_len``,
+    e.g. 8x128) into the body probe, and `merge_probe_pickles` keeps the
+    FIRST shard's meta (the body's, e.g. 32x1024), so recomputing every row
+    from the meta count would rescale the visual rows by ~32x away from
+    what their writer computed — and would not be idempotent. Honouring the
+    row stamp keeps each row on its own writer's denominator and makes the
+    recompute a true no-op for any probe written by the fixed finalize.
+
+    Returns the probe-wide token count (the meta fallback used for
+    unstamped rows), or None when nothing could be renormalized. A row
+    with raw accumulators, no stamp, and no usable meta count is a HARD
+    ERROR (SystemExit) — silently allocating on routed-token-normalized
+    Fisher mis-spends the bit budget; `allow_legacy=True`
+    (--allow-legacy-fisher-norm) downgrades it to a warning and keeps the
+    probe's stored h_trace values.
+    """
+    meta = meta or {}
+    meta_tokens = int(meta.get("fisher_norm_tokens", 0) or 0)
+    if meta_tokens <= 0:
+        meta_tokens = (int(meta.get("nsamples", 0) or 0)
+                       * int(meta.get("seqlen", 0) or 0))
+
+    renormed = 0
+    unresolvable = 0
+    denominators: dict[int, int] = {}
+    for entry in stats.values():
+        if not isinstance(entry, dict) or "h_trace_raw" not in entry:
+            continue
+        # The row's own writer-stamped denominator, else the probe-wide one.
+        row_tokens = int(entry.get("h_trace_norm_tokens", 0) or 0)
+        if row_tokens <= 0:
+            row_tokens = meta_tokens
+        if row_tokens <= 0:
+            unresolvable += 1
+            continue
+        entry["h_trace"] = float(entry["h_trace_raw"]) / row_tokens
+        if "h_w2_sum_raw" in entry:
+            entry["h_w2_sum"] = (
+                float(entry["h_w2_sum_raw"]) / row_tokens)
+        per_raw = entry.get("h_trace_per_expert_raw")
+        if per_raw is not None:
+            entry["h_trace_per_expert"] = [
+                float(v) / row_tokens for v in per_raw]
+        # Keep the probe-side stamp truthful on legacy pickles.
+        entry["h_trace_norm_tokens"] = row_tokens
+        denominators[row_tokens] = denominators.get(row_tokens, 0) + 1
+        renormed += 1
+
+    if unresolvable:
+        msg = (
+            "probe rows carry raw Fisher accumulators but no usable token "
+            "count: neither a per-row h_trace_norm_tokens stamp nor "
+            f"meta.fisher_norm_tokens / nsamples+seqlen ({unresolvable} of "
+            f"{len(stats)} rows). h_trace cannot be renormalized by the "
+            "global calib token count; legacy per-row normalization inflates "
+            "routed-expert rows by (global/routed) — typically "
+            "~n_experts/top_k — and the allocator would mis-spend the bit "
+            "budget on rarely-routed experts. Re-run the probe with current "
+            "code (it stamps meta.fisher_norm_tokens), or pass "
+            "--allow-legacy-fisher-norm to proceed with the stored legacy "
+            "values anyway.")
+        if not allow_legacy:
+            raise SystemExit(f"[alloc] ERROR: {msg}")
+        print(f"[alloc] WARNING (--allow-legacy-fisher-norm): {msg}",
+              flush=True)
+
+    if renormed:
+        mix = ", ".join(f"{n}x{cnt} rows"
+                        for n, cnt in sorted(denominators.items()))
+        print(f"[alloc] Fisher renormalized: {renormed}/{len(stats)} rows "
+              f"→ h_trace_raw / global calib tokens [{mix}] "
+              "(per-expert routed-count normalization corrected)", flush=True)
+        if meta_tokens > 0:
+            return meta_tokens
+        # Meta-less probe carried entirely by row stamps: report the
+        # denominator the most rows share (the body pass').
+        return max(denominators.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    return None
+
+
+_FISHER_CAP_ROLE_RE = re.compile(r"layers\.(\d+)\.[a-z_]+\.([a-z_]+)$")
+
+
+def _fisher_cap_role(qname: str) -> str | None:
+    """Role bucket for the robust-Fisher clip, or ``None`` to skip the row.
+
+    Deliberately the REFERENCE TOOL's grouping
+    (``/home/rob/dq-runs/robust_fisher_clip.py``), not the wider
+    ``_parse_role_from_qname`` used for bit attribution: it requires exactly
+    one container segment between ``layers.<N>.`` and the leaf, so dense
+    attention/MLP projections bucket by their leaf role
+    (``q_proj``/``k_proj``/``v_proj``/``o_proj``/``gate_proj``/``up_proj``/
+    ``down_proj``) and everything else — packed and unpacked MoE experts,
+    shared experts, MTP/visual sidecars, non-``layers`` names — is skipped.
+    That is the grouping the 4B research result was measured under; widening
+    it would change the medians and is a separate, unmeasured lever.
+    """
+    m = _FISHER_CAP_ROLE_RE.search(qname)
+    return m.group(2) if m else None
+
+
+def clip_probe_fisher_outliers(stats: dict, meta: dict | None = None, *,
+                               cap_multiplier: float | None = None
+                               ) -> dict | None:
+    """OPT-IN robust-Fisher clip: cap each row's ``h_trace`` at
+    ``K x median(h_trace)`` over its role bucket.
+
+    Off unless ``PRISMAQUANT_FISHER_CAP_MULTIPLIER`` is set (or
+    ``cap_multiplier`` is passed explicitly); when off this is a byte-identical
+    no-op and returns ``None``. Research lever — a per-role h_trace clip at
+    K=3 measured ~5% better WikiText PPL at 6.0 bpp on Qwen3-4B (2026-05-19),
+    never promoted to a default because it has no served A/B.
+
+    Rationale: ``predicted_dloss = 1/2 h_trace MSE`` is linear in ``h_trace``,
+    so a handful of heavy-tailed Fisher rows can capture the DP's whole bit
+    budget. Clipping the tail bounds that leverage without touching the rest
+    of the distribution (values below the cap are unchanged).
+
+    ``h_w2_sum`` is rescaled by the same ratio so the derived cost math stays
+    consistent with the clipped scalar, exactly as the reference tool does.
+    The raw accumulators (``h_trace_raw`` / ``h_w2_sum_raw``) are NOT touched
+    — they remain the source of truth for renormalization, so this must run
+    AFTER :func:`renormalize_probe_fisher`, never before.
+
+    Returns a summary dict (``cap_multiplier``, ``role_median``, ``role_cap``,
+    ``n_clipped``, ``n_considered``) when active, else ``None``.
+    """
+    import os
+    import statistics
+
+    if cap_multiplier is None:
+        raw = os.environ.get("PRISMAQUANT_FISHER_CAP_MULTIPLIER")
+        if raw is None or not str(raw).strip():
+            return None
+        try:
+            cap_multiplier = float(raw)
+        except (TypeError, ValueError):
+            raise SystemExit(
+                "[alloc] ERROR: PRISMAQUANT_FISHER_CAP_MULTIPLIER must be a "
+                f"float multiple of the per-role median, got {raw!r}.")
+    K = float(cap_multiplier)
+    if not (K > 0.0) or not math.isfinite(K):
+        raise SystemExit(
+            "[alloc] ERROR: PRISMAQUANT_FISHER_CAP_MULTIPLIER must be a "
+            f"finite value > 0 (it is a multiple of the role median), got {K}.")
+
+    by_role: dict[str, list[float]] = defaultdict(list)
+    for qname, entry in stats.items():
+        if not isinstance(entry, dict):
+            continue
+        role = _fisher_cap_role(qname)
+        if role is None:
+            continue
+        by_role[role].append(float(entry.get("h_trace", 0.0) or 0.0))
+
+    role_median = {r: statistics.median(v) for r, v in by_role.items() if v}
+    role_cap = {r: K * m for r, m in role_median.items()}
+
+    n_clipped = 0
+    n_considered = 0
+    for qname, entry in stats.items():
+        if not isinstance(entry, dict):
+            continue
+        role = _fisher_cap_role(qname)
+        if role is None:
+            continue
+        cap = role_cap.get(role)
+        if cap is None:
+            continue
+        n_considered += 1
+        old = float(entry.get("h_trace", 0.0) or 0.0)
+        if old <= cap:
+            continue
+        entry["h_trace"] = cap
+        old_w2 = entry.get("h_w2_sum")
+        if old_w2 is not None and old > 0:
+            entry["h_w2_sum"] = float(old_w2) * (cap / old)
+        n_clipped += 1
+
+    summary = {
+        "schema": "prismaquant.robust_fisher_clip.v1",
+        "cap_multiplier": K,
+        "role_median": role_median,
+        "role_cap": role_cap,
+        "n_clipped": n_clipped,
+        "n_considered": n_considered,
+    }
+    if isinstance(meta, dict):
+        meta.setdefault("clip_history", []).append(summary)
+    print(f"[alloc] robust Fisher clip ACTIVE (research lever, "
+          f"PRISMAQUANT_FISHER_CAP_MULTIPLIER={K:g}): clipped {n_clipped} of "
+          f"{n_considered} role-bucketed rows at K x per-role median "
+          f"({len(role_median)} roles)", flush=True)
+    return summary
+
+
 def main():
+    from .tessera_serving_scope import (
+        add_serving_scope_arguments, serving_target_from_args,
+        context_by_unit_from_stats, scope_provenance,
+    )
     ap = argparse.ArgumentParser()
+    add_serving_scope_arguments(ap)
     ap.add_argument("--probe", required=True, help="sensitivity_probe pickle")
     ap.add_argument("--costs", required=True, help="measure_quant_cost pickle")
+    ap.add_argument(
+        "--accept-research-cost-table",
+        action="store_true",
+        help="Explicitly accept a table stamped as the sanctioned study-grade "
+             "assembled-segments lane. This never weakens production CB "
+             "provenance checks for unstamped tables.",
+    )
+    ap.add_argument(
+        "--research-cost-base",
+        default=None,
+        help="With --accept-research-cost-table, production v2 base pickle "
+             "to assemble into --costs before allocation.",
+    )
+    ap.add_argument(
+        "--research-cost-segments-dir",
+        default=None,
+        help="With --accept-research-cost-table, complete layer_*.pkl store "
+             "to assemble over --research-cost-base before allocation.",
+    )
     ap.add_argument("--model-override", default=None,
                     help="Override the model path stored in probe.pkl's meta. "
                          "Useful when re-running allocator against a probe "
@@ -1049,19 +1715,181 @@ def main():
                          "silently-corrupt artifact. Off by default: "
                          "the allocator hard-errors instead and asks for "
                          "--model-override.")
+    ap.add_argument("--allow-legacy-fisher-norm", action="store_true",
+                    help="Permit allocation from a probe whose rows carry "
+                         "neither a per-row h_trace_norm_tokens stamp nor "
+                         "meta fisher_norm_tokens / nsamples+seqlen, i.e. whose "
+                         "h_trace cannot be renormalized by the global calib "
+                         "token count. Such probes carry the legacy per-row "
+                         "normalization that inflates routed-expert Fisher "
+                         "by (global/routed) — typically ~n_experts/top_k. "
+                         "Off by default: the allocator hard-errors and asks "
+                         "for a re-probe. Use only to reproduce historical "
+                         "allocations.")
     ap.add_argument("--target-bits", type=float, default=4.75)
     ap.add_argument("--target-disk-gb", type=float, default=None,
                     help="Fit-the-card ship selection: instead of --target-bits, "
-                         "pick the highest-bpp allocation whose EXACT exported "
-                         "on-disk footprint (prismaquant.footprint, validated "
-                         "0.00%% vs real index.json total_size) fits this many "
-                         "decimal GB. Bisects the sub-second DP between Pareto "
-                         "grid rungs for an exact fit, overrides --target-bits "
-                         "for the emitted layer_config, and writes selection.json "
-                         "beside --pareto-csv. Needs the source model path (probe "
+                         "the card sets the CONSTRAINT and predicted Δloss the "
+                         "OBJECTIVE — among allocations whose exact tensor-data "
+                         "payload plus --artifact-overhead-reserve-bytes fits "
+                         "this many decimal GB, ship the one with the LOWEST "
+                         "predicted "
+                         "Δloss (ties -> larger footprint; more bits is not "
+                         "monotonically better, so filling the card is a proxy, "
+                         "not the objective). Bisects the sub-second DP between "
+                         "Pareto grid rungs to search denser fitting "
+                         "allocations. The exporter then measures all regular "
+                         "files recursively and fails closed against this same "
+                         "budget. Overrides --target-bits for the emitted "
+                         "layer_config, and writes selection.json (objective, "
+                         "search ceiling, full ratchet trace) beside "
+                         "--pareto-csv. Needs the source model path (probe "
                          "meta.model / --model-override) to size the "
-                         "non-quantizable floor (lm_head/embed/norms). Unpin "
-                         "lm_head (--allow-pinned lm_head) to lower the floor.")
+                         "non-quantizable floor (lm_head/embed/norms). A "
+                         "measured fixed head (--lm-head-format FP8_E4M3) "
+                         "lowers the floor without putting head parameters "
+                         "into reported body bpp; --allow-pinned lm_head is "
+                         "the separate research/DP path.")
+    ap.add_argument(
+        "--artifact-overhead-reserve-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Required with --target-disk-gb. Conservative upper bound for "
+            "all bytes outside safetensors tensor-data spans (container "
+            "headers, JSON/config, tokenizer/processor assets and other "
+            "regular files). Selection gates tensor payload + this reserve; "
+            "the exporter then stats every regular file recursively and "
+            "fails closed against the original whole-artifact budget."
+        ),
+    )
+    ap.add_argument(
+        "--exclude-source-prefix",
+        action="append",
+        default=None,
+        metavar="PREFIX",
+        help=(
+            "Repeatable. Declare that this artifact does NOT ship the source "
+            "tensors under PREFIX, because they ship as a separate artifact. "
+            "Byte accounting otherwise counts every unassigned source tensor "
+            "at source precision (correct for a verbatim tensor, wrong for "
+            "one that is not here at all), which UNDER-fills a byte budget by "
+            "the excluded mass and is invisible downstream because the "
+            "artifact still comes in under budget. Live case: DSv4-Flash "
+            "ships its draft head as its own directory, so the target "
+            "artifact passes --exclude-source-prefix mtp. and the 10.863 GB "
+            "of MTP spans leave the floor. Exact (resolved against the "
+            "per-tensor source manifest, each span charged at most once); a "
+            "prefix matching nothing is a hard error."
+        ),
+    )
+    ap.add_argument(
+        "--cb-scale-coding",
+        choices=("v1", "two_tier"),
+        default=None,
+        help=(
+            "Exact CB producer scale layout used for candidate and artifact "
+            "bytes. Required when the body/auxiliary formats contain a CB "
+            "rung; production "
+            "passes two_tier. v1 is explicit legacy-write reproduction only."
+        ),
+    )
+    ap.add_argument(
+        "--cb-codebook-source",
+        choices=("lattice", "learned"),
+        default=None,
+        help=(
+            "Exact CB sidecar sharing policy. Required when any body/auxiliary "
+            "format is CB so codebook identity/bytes cannot be guessed. The "
+            "production CLI currently accepts lattice only; learned is "
+            "rejected until every stage consumes one immutable value-bearing "
+            "bundle."
+        ),
+    )
+    ap.add_argument(
+        "--cb-codebook-source-scope",
+        choices=("none", "fp8", "all"),
+        default=None,
+        help=(
+            "Family-scoped source contract. none is the byte-identical "
+            "all-lattice default; fp8 keeps NVFP4 lattice and binds FP8_CB "
+            "to immutable learned cells; all is research-only/NO-GO on NVFP4."
+        ),
+    )
+    ap.add_argument(
+        "--cb-codebook-bundle",
+        default=None,
+        help=(
+            "Immutable value-bearing .pqcb used by every learned render "
+            "stage. Required when the effective source scope is not none."
+        ),
+    )
+    ap.add_argument(
+        "--cb-codebook-digests",
+        default=None,
+        help=(
+            "Reserved learned-CB digest manifest. The production CLI rejects "
+            "this digest-only contract because it does not supply codebook "
+            "values; direct research accounting APIs still accept digests."
+        ),
+    )
+    ap.add_argument(
+        "--cb-scale-sweep",
+        choices=("0", "1"),
+        default=None,
+        help="Exact CB scale-search contract; required with CB formats.",
+    )
+    ap.add_argument(
+        "--cb-scale-sweep-scope",
+        choices=("none", "nvfp4", "fp8", "all"),
+        default=None,
+        help=(
+            "Optional per-family scale-search scope. Unset preserves the "
+            "legacy --cb-scale-sweep bool and its byte-identical stamp."
+        ),
+    )
+    ap.add_argument(
+        "--cb-ldlq",
+        choices=("0", "1"),
+        default=None,
+        help="Exact CB feedback-assignment contract; required with CB formats.",
+    )
+    ap.add_argument(
+        "--cb-ldlq-scope",
+        choices=("none", "nvfp4", "all"),
+        default=None,
+        help=(
+            "Which CB family the exporter will LDLQ. Authoritative over "
+            "--cb-ldlq when given. The stamp must match what the export "
+            "actually renders, or the per-tensor identity preflight fails: "
+            "'nvfp4' means NVFP4_CB is LDLQ and FP8_CB stays raw. LDLQ is "
+            "byte-neutral, so this changes the recorded contract, not bytes."
+        ),
+    )
+    ap.add_argument(
+        "--cb-minchain",
+        choices=("0", "1"),
+        default="0",
+        help=(
+            "Exact CB monotone min-chain encoder contract (default: 0). "
+            "The production pipeline passes this explicitly."
+        ),
+    )
+    ap.add_argument(
+        "--cb-encode-tier",
+        choices=("fast", "balanced", "max"),
+        default=None,
+        help="Resolved CB encoder tier; required with CB formats.",
+    )
+    ap.add_argument(
+        "--cb-col-weights",
+        default=None,
+        help=(
+            "Exact imatrix pickle used by CB cost/cache/export. Required "
+            "when any allocated or fixed auxiliary format is CB; allocator "
+            "validates its value-bearing render identity before solving."
+        ),
+    )
     ap.add_argument("--formats", default="",
                     help="Comma-separated format names to consider; empty=all")
     ap.add_argument("--allow-pinned", default="",
@@ -1073,13 +1901,24 @@ def main():
                          "n_params. Empty = current behavior (backwards-compat). "
                          "Shipping a quantized pinned name also needs cache "
                          "render + export packing + vLLM serving support "
-                         "(lm_head: yes; embed_tokens: serving unverified).")
+                         "(lm_head: yes, native lane; embed_tokens: NO "
+                         "sanctioned lane since 2026-09-02 -- the only route "
+                         "was the Gridbook lane's quantized_embedding "
+                         "declaration and it retired with that lane, "
+                         "archive/gridbook_lane_2026-09-02/. The native "
+                         "compressed-tensors embedding path accepts "
+                         "weight-only INT and RAISES for FP8/NVFP4, so a "
+                         "stock config_groups entry does not mis-serve, it "
+                         "refuses to load).")
     ap.add_argument("--pareto-targets",
                     default="4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25",
                     help="Comma-separated budgets to sweep for Pareto curve")
     ap.add_argument("--layer-config", required=True,
                     help="Output AutoRound layer_config JSON")
     ap.add_argument("--pareto-csv", required=True, help="Output Pareto CSV")
+    ap.add_argument("--tessera-materialization-plan", default=None,
+                    help="Write a non-exportable selected-wire request here instead of layer-config; "
+                         "finalize through prismaquant.tessera_materialization after selected wires exist")
     ap.add_argument("--knee-refine-tol", type=float, default=0.03,
                     help="Golden-section knee refinement tolerance in bpp "
                          "(default 0.03). The coarse Pareto grid only lands the "
@@ -1135,11 +1974,14 @@ def main():
                     help="Split each packed-MoE expert serving group into "
                          "TWO DP units per layer: gate+up projections and "
                          "down projections (default: one per-layer-uniform "
-                         "unit). Legal when the serving lane supports "
-                         "per-role expert schemes (e.g. GGUF stacks expert "
-                         "tensors per projection). The split threads "
-                         "through the profile view, so serving promotion "
-                         "stays consistent with the DP units.")
+                         "unit). Hard-errors unless the resolved serving "
+                         "profile declares supports_per_role_expert_schemes "
+                         "(e.g. gguf: GGUF stacks expert tensors per "
+                         "projection, so each role can carry its own type; "
+                         "vLLM packed-MoE loads one scheme per FusedMoE "
+                         "layer). The split threads through the profile "
+                         "view, so serving promotion stays consistent with "
+                         "the DP units.")
     ap.add_argument("--enforce-family-coherence", action="store_true",
                     help="Error (instead of warn) if the format set contains "
                          "multiple candidates for the same bit tier (e.g. "
@@ -1159,34 +2001,18 @@ def main():
                          "prismaquant/serving_profile_specs. Defaults to "
                          "the detected model profile's configured serving "
                          "profile, or research when none is declared.")
+    ap.add_argument("--target-profile-default",
+                    default="research",
+                    help="Fallback serving profile when neither "
+                         "--target-profile nor the architecture's "
+                         "spec.default_serving_profile names one. The "
+                         "production orchestrator passes vllm_packed_moe; "
+                         "the bare-CLI default stays `research` (re-vet R11).")
     ap.add_argument("--calibration", default=None,
                     help="Optional path to a JSON containing "
                          "'calibrated_gains[fmt] = α_fmt'. When present, "
                          "the per-(layer, format) predicted Δloss "
                          "is multiplied by α_fmt before the DP runs.")
-    ap.add_argument("--propagated-sensitivity-report", default=None,
-                    help="Optional sensitivity_propagated_group_report JSON. "
-                         "When provided, propagated KL is folded into the "
-                         "allocator costs before candidate construction.")
-    ap.add_argument("--propagated-sensitivity-scale", type=float, default=1.0,
-                    help="Multiplier for --propagated-sensitivity-report "
-                         "penalties. The report's current-format unit KL "
-                         "is preserved at scale=1 and distributed once over "
-                         "fused siblings by added-bit share.")
-    ap.add_argument("--propagated-sensitivity-score-field",
-                    default="propagated_kl",
-                    help="Numeric report row field to fold into allocator "
-                         "costs when --propagated-sensitivity-report is set.")
-    ap.add_argument("--propagated-sensitivity-format-extrapolation",
-                    choices=("local_mse_ratio", "current_only", "bits_interp"),
-                    default="local_mse_ratio",
-                    help="How to extrapolate measured current-format "
-                         "propagated sensitivity across alternative "
-                         "candidate formats.")
-    ap.add_argument("--propagated-sensitivity-target-format", default=None,
-                    help="Override target format for propagated-sensitivity "
-                         "bit-share accounting. Defaults to the report's "
-                         "target_format.")
     ap.add_argument("--overshoot-tolerance", type=float, default=0.01,
                     help="Maximum allowed overshoot (bits/param) of the "
                          "achieved budget over the requested target after "
@@ -1220,6 +2046,21 @@ def main():
                     help="Uniform format for MTP Linears. BF16 is the "
                          "production default until MTP speculative-decode "
                          "acceptance is validated for quantized MTP weights.")
+    ap.add_argument(
+        "--lm-head-format",
+        choices=_format_cli_choices(),
+        default="BF16",
+        help=(
+            "Fixed auxiliary format for the language-model output head. "
+            "BF16 preserves the historical profile pin. A non-BF16 value "
+            "removes only lm_head from the DP, records its exact serialized "
+            "payload inside whole-artifact accounting, and excludes its "
+            "parameters from reported body bpp. Use --allow-pinned lm_head "
+            "instead for the independent research path where the DP chooses "
+            "the head format; a non-BF16 fixed value and that research "
+            "override are mutually exclusive."
+        ),
+    )
     ap.add_argument("--bit-attribution-json", default=None,
                     help="Optional path: write a read-only 'where did the "
                          "budget go' report bucketing the final body "
@@ -1229,7 +2070,189 @@ def main():
                     help="Optional path: write the flat per-Linear bit "
                          "attribution table (qname, block, role, format, "
                          "bits, bpp, n_params, h_trace, predicted_dloss).")
+    # ---- Hard serving constraints: the second selection axis (P5c) ----
+    # format-speed-policy.md §1's constrained problem. Latency is NEVER
+    # blended into the objective (no lambda, no phase-weighted serve_ms):
+    # these are hard constraints, an assignment that misses one is INFEASIBLE,
+    # and the objective stays minimum predicted Delta-loss among the feasible.
+    # Supply NONE of them and every code path is byte-identical to the
+    # pre-P5c allocator apart from a stamp recording that constraints were
+    # absent. See prismaquant/serve_constraints.py for the aggregation model
+    # and its named assumptions.
+    ap.add_argument("--serve-dispatch-table", default=None,
+                    help="Path to a measured serve dispatch table "
+                         "(prismaquant.serve_dispatch_table.v1): per "
+                         "(format-family, phase, M-regime, lane) relative "
+                         "serving costs, every row citing its source. The "
+                         "tree ships NO example table since 2026-09-02 "
+                         "(serve_dispatch_table.example_table_path() returns "
+                         "None): the only one it ever had was PROPOSAL DATA "
+                         "built from the retired Gridbook codebook lane's "
+                         "published measurements, and it went to "
+                         "archive/gridbook_lane_2026-09-02/ with that lane. "
+                         "Point this at a table measured on your own "
+                         "hardware.")
+    ap.add_argument("--measured-runtime-table", default=None,
+                    help="Research-only measured whole-operator runtime table. "
+                         "Uses exact discrete bytes/quality/prefill/decode/residency "
+                         "search. Requires --measured-runtime-context and a prefill "
+                         "budget. Operator sums do not certify p95 or end-to-end SLOs.")
+    ap.add_argument("--measured-runtime-context", default=None,
+                    help="Independent expected runtime/workload identity JSON, "
+                         "including exact operator routes for each unit and format.")
+    ap.add_argument("--serve-workload-mix", default=None,
+                    help="Workload M-regime mix, e.g. "
+                         "'prefill:dense_prefill_1400=1.0,"
+                         "decode:decode_batch1=1.0'. Per-phase weights must "
+                         "sum to 1.0. There is deliberately no default: "
+                         "policy §1 forbids a default workload mix hidden in "
+                         "the allocator.")
+    ap.add_argument("--slo-prefill-p95-ttft-ms", type=float, default=None,
+                    help="Hard constraint: predicted p95 TTFT (ms) must be "
+                         "<= this. Prefill and decode are separate "
+                         "constraints and are never blended.")
+    ap.add_argument("--slo-decode-p95-itl-ms", type=float, default=None,
+                    help="Hard constraint: predicted p95 inter-token latency "
+                         "(ms) must be <= this.")
+    ap.add_argument("--slo-decode-p05-tps", type=float, default=None,
+                    help="Hard constraint: predicted p05 decode throughput "
+                         "(tok/s) must be >= this.")
+    ap.add_argument("--serve-device-budget-bytes", type=int, default=None,
+                    help="Hard constraint: resident weight bytes + "
+                         "--serve-kv-bytes + --serve-peak-scratch-bytes must "
+                         "be <= this.")
+    ap.add_argument("--serve-kv-bytes", type=int, default=0,
+                    help="Operator-supplied KV-cache bytes for the device "
+                         "memory constraint (not modelled by the allocator).")
+    ap.add_argument("--serve-peak-scratch-bytes", type=int, default=0,
+                    help="Operator-supplied peak scratch bytes for the "
+                         "device memory constraint (not modelled by the "
+                         "allocator).")
     args = ap.parse_args()
+
+    if args.measured_runtime_context and not args.measured_runtime_table:
+        ap.error("--measured-runtime-context requires --measured-runtime-table")
+    if args.measured_runtime_table:
+        if args.serve_dispatch_table or args.serve_workload_mix:
+            ap.error("--measured-runtime-table is mutually exclusive with "
+                     "--serve-dispatch-table and --serve-workload-mix")
+        if not args.measured_runtime_context:
+            ap.error("--measured-runtime-table requires --measured-runtime-context")
+        if args.slo_prefill_p95_ttft_ms is None:
+            ap.error("--measured-runtime-table requires --slo-prefill-p95-ttft-ms "
+                     "as an operator-sum proposal budget")
+        if args.slo_decode_p05_tps is not None:
+            ap.error("measured operator sums cannot certify --slo-decode-p05-tps; "
+                     "use --slo-decode-p95-itl-ms as a proposal budget")
+        for flag, value in (("--slo-prefill-p95-ttft-ms", args.slo_prefill_p95_ttft_ms),
+                            ("--slo-decode-p95-itl-ms", args.slo_decode_p95_itl_ms),
+                            ("--serve-device-budget-bytes", args.serve_device_budget_bytes)):
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                ap.error(f"{flag} must be positive and finite")
+        if args.serve_kv_bytes < 0 or args.serve_peak_scratch_bytes < 0:
+            ap.error("measured runtime KV and scratch reserves must be nonnegative")
+
+    effective_cb_source_scope = args.cb_codebook_source_scope
+    if effective_cb_source_scope is None:
+        effective_cb_source_scope = (
+            "all" if args.cb_codebook_source == "learned" else "none"
+        )
+    if effective_cb_source_scope != "none" and not args.cb_codebook_bundle:
+        raise SystemExit(
+            "[alloc] ERROR: learned CB requires an immutable value-bearing "
+            "codebook bundle before reading probe/cost inputs; pass "
+            "--cb-codebook-bundle. Digest-only identity cannot render values."
+        )
+
+    if args.target_disk_gb is not None:
+        if not math.isfinite(args.target_disk_gb) or args.target_disk_gb <= 0:
+            raise SystemExit(
+                "[alloc] ERROR: --target-disk-gb must be a positive finite "
+                "decimal-GB budget"
+            )
+        if (
+            args.artifact_overhead_reserve_bytes is None
+            or args.artifact_overhead_reserve_bytes <= 0
+        ):
+            raise SystemExit(
+                "[alloc] ERROR: --target-disk-gb is a whole-artifact hard "
+                "budget and requires a positive "
+                "--artifact-overhead-reserve-bytes. The selector can price "
+                "tensor data deterministically, but safetensors headers, "
+                "JSON and copied tokenizer/processor files require an "
+                "operator-supplied conservative reserve; final export is "
+                "measured recursively and fails closed."
+            )
+    elif args.artifact_overhead_reserve_bytes is not None:
+        raise SystemExit(
+            "[alloc] ERROR: --artifact-overhead-reserve-bytes is meaningful "
+            "only with --target-disk-gb"
+        )
+
+    # ---- Hard serving constraints, resolved once (ultraplan P5c) ----
+    # Built before any expensive work so a malformed table, an unbalanced
+    # workload mix, or an SLO with nothing to price it fails on the command
+    # line rather than after a multi-minute solve. An INACTIVE context (no
+    # table / no SLOs) makes every downstream call a no-op that only stamps
+    # "constraints were absent" — the pre-P5c behaviour, byte for byte.
+    measured_runtime_table = None
+    serve_slos = ServeSLOs(
+        p95_ttft_ms=args.slo_prefill_p95_ttft_ms,
+        p95_itl_ms=args.slo_decode_p95_itl_ms,
+        p05_tps=args.slo_decode_p05_tps,
+        device_budget_bytes=args.serve_device_budget_bytes,
+        kv_bytes=int(args.serve_kv_bytes or 0),
+        peak_scratch_bytes=int(args.serve_peak_scratch_bytes or 0),
+    )
+    if args.measured_runtime_table:
+        from .measured_runtime_prices import load_runtime_context, load_measured_runtime_table
+        try:
+            expected_runtime = load_runtime_context(args.measured_runtime_context)
+            with open(args.costs, "rb") as cost_file:
+                expected_cost_sha256 = hashlib.file_digest(cost_file, "sha256").hexdigest()
+            measured_runtime_table = load_measured_runtime_table(
+                args.measured_runtime_table, expected_context=expected_runtime,
+                expected_cost_sha256=expected_cost_sha256)
+        except (ValueError, OSError) as exc:
+            raise SystemExit(f"[alloc] ERROR: measured runtime: {exc}") from None
+    try:
+        serve_dispatch = (
+            load_dispatch_table(args.serve_dispatch_table)
+            if args.serve_dispatch_table else None
+        )
+        serve_context = ServeConstraintContext(
+            table=serve_dispatch,
+            mix=WorkloadMix.parse(args.serve_workload_mix),
+            slos=ServeSLOs() if measured_runtime_table is not None else serve_slos,
+        )
+        serve_context.validate()
+    except (DispatchTableError, ServeConstraintError) as exc:
+        raise SystemExit(f"[alloc] ERROR: {exc}") from None
+    serving_constraints_active = measured_runtime_table is not None or serve_context.active
+    if measured_runtime_table is not None:
+        print("[alloc] measured runtime search ACTIVE (research): exact discrete "
+              "bytes/quality/prefill/decode/residency frontier. Whole-operator sums "
+              "cannot certify p95 or end-to-end SLOs; fixed-teacher held-out KL "
+              "and end-to-end serving validation remain required.", flush=True)
+    elif serve_context.active:
+        print(
+            "[alloc] serving constraints ACTIVE (ultraplan P5c): table="
+            f"{serve_dispatch.table_id!r} status={serve_dispatch.status!r}, "
+            f"mix={args.serve_workload_mix!r}, "
+            f"SLOs={serve_context.slos.as_dict()}. These are HARD "
+            "constraints: an assignment that misses one is infeasible, never "
+            "scored worse. The objective is unchanged (min predicted Δloss); "
+            "no λ blending exists. Table-driven latency is PROPOSAL DATA — "
+            "the served NATIVE-PARITY protocol is the release gate.",
+            flush=True,
+        )
+    elif serve_dispatch is not None or args.serve_workload_mix:
+        print(
+            "[alloc] serving constraints INACTIVE: a dispatch table and/or "
+            "workload mix was supplied but no SLO, so no serving constraint "
+            "is evaluated and selection is the pre-P5c byte-budget objective.",
+            flush=True,
+        )
 
     if args.threads > 0:
         import os
@@ -1274,76 +2297,216 @@ def main():
             "specific fused-sibling groups will NOT be enforced. Pass "
             "--model-override <model> (or rebuild the probe with meta['model'] "
             "set) so detect_profile resolves the real profile.", flush=True)
-    target_profile = resolve_target_profile(model_profile, args.target_profile)
+    target_profile = resolve_target_profile(
+        model_profile, args.target_profile,
+        default=str(args.target_profile_default or "research"),
+    )
     if target_profile not in serving_profile_names():
         raise SystemExit(f"[alloc] ERROR: unknown target profile {target_profile!r}")
     print(f"[alloc] target profile: {target_profile}", flush=True)
+    from .serving_profiles import load_serving_profile
+    tessera_serving_target = serving_target_from_args(
+        args, target_platform=load_serving_profile(target_profile).target_platform)
+
+    if bool(args.research_cost_base) != bool(args.research_cost_segments_dir):
+        raise SystemExit(
+            "[alloc] ERROR: --research-cost-base and "
+            "--research-cost-segments-dir must be supplied together"
+        )
+    if args.research_cost_base:
+        if not args.accept_research_cost_table:
+            raise SystemExit(
+                "[alloc] ERROR: assembling segmented research costs requires "
+                "--accept-research-cost-table"
+            )
+        from .research_cost_acceptance import assemble_research_cost_table
+        try:
+            _assembled, _manifest = assemble_research_cost_table(
+                args.research_cost_base,
+                args.research_cost_segments_dir,
+                output_path=args.costs,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"[alloc] ERROR: research cost assembly: {exc}") from None
+        print(
+            "[alloc] RESEARCH COST ACCEPTED: assembled "
+            f"{_manifest['assembled_row_count']} rows x "
+            f"{len(_manifest['formats'])} formats from "
+            f"{_manifest['layer_count']} x {_manifest['rows_per_layer']} "
+            f"layer rows -> {args.costs}",
+            flush=True,
+        )
 
     with open(args.probe, "rb") as f:
         probe = pickle.load(f)
     with open(args.costs, "rb") as f:
-        cost_data = pickle.load(f)
+        if measured_runtime_table is not None:
+            # Authenticate the exact owned bytes parsed below. A later hash
+            # read of the mutable file could authenticate a different payload.
+            cost_bytes = f.read()
+            if hashlib.sha256(cost_bytes).hexdigest() != expected_cost_sha256:
+                raise SystemExit("[alloc] ERROR: cost payload changed after measured runtime admission")
+            cost_data = pickle.loads(cost_bytes)
+            del cost_bytes
+        else:
+            cost_data = pickle.load(f)
     validate_probe_payload(probe, args.probe)
     validate_cost_payload(cost_data, args.costs)
+    from .joint_aura import prepare_joint_aura_identities
+    prepare_joint_aura_identities(cost_data)
+    # One DP prices in one currency: a cost table carrying Tessera-currency
+    # rows (output_mse under the route's activation contract) is admissible
+    # only on the objective those rows measure (render-score). Read from the
+    # table's attested provenance['cost_mode'], never the environment
+    # (RobTand/prismaquant#127).
+    from .cost_currency import CostCurrencyError, require_run_currency
+    try:
+        cost_currency_report = require_run_currency(cost_data)
+    except CostCurrencyError as exc:
+        raise SystemExit(f"[alloc] ERROR: cost currency: {exc}") from None
+    if cost_currency_report["tessera_rows"]:
+        print(
+            f"[alloc] cost currency: {cost_currency_report['tessera_rows']} "
+            f"Tessera rows in {cost_currency_report['expected_currency']!r} "
+            f"(COST_MODE={cost_currency_report['cost_mode']!r})",
+            flush=True,
+        )
+    from .research_cost_acceptance import (
+        accepted_cost_provenance,
+        propagated_cost_provenance,
+    )
+    try:
+        research_cost_provenance = accepted_cost_provenance(cost_data)
+    except ValueError as exc:
+        raise SystemExit(f"[alloc] ERROR: {exc}") from None
+    if research_cost_provenance is not None and not args.accept_research_cost_table:
+        raise SystemExit(
+            "[alloc] ERROR: cost table is research-stamped; pass "
+            "--accept-research-cost-table to acknowledge its study-grade "
+            "assembled provenance"
+        )
+    if args.accept_research_cost_table and research_cost_provenance is None:
+        raise SystemExit(
+            "[alloc] ERROR: --accept-research-cost-table cannot bless an "
+            "unstamped table; assemble it through the sanctioned path first"
+        )
+    if research_cost_provenance is not None:
+        print(
+            "[alloc] RESEARCH COST ACCEPTANCE ACTIVE: production CB reuse, "
+            "serialized-payload, lattice-coverage, and render-scope guards "
+            "remain unchanged outside this exact stamped table",
+            flush=True,
+        )
     stats = probe["stats"]
     costs = cost_data["costs"]
     print(f"[alloc] stats: {len(stats)} Linears, costs: {len(costs)} Linears")
 
-    # ---- Fisher renormalization ----
-    # Older incremental probes finalized `h_trace = h_trace_raw /
-    # n_tokens_seen` PER ROW, where per-expert Linears only count their
-    # ROUTED tokens — inflating a rarely-routed expert's Fisher by
-    # (global/routed), up to ~33,000x, i.e. inverted importance weighting.
-    # The raw accumulators are stored, so recompute every derived field here
-    # with the one correct shared denominator: the global calib token count
-    # (probe meta nsamples x seqlen). Dense rows saw exactly that many
-    # tokens, so their values are unchanged; probes written by the fixed
-    # finalize (meta.fisher_norm_tokens) renormalize to identical values —
-    # the recompute is idempotent.
-    _meta = probe.get("meta", {}) or {}
-    _norm_tokens = int(_meta.get("fisher_norm_tokens", 0) or 0)
-    if _norm_tokens <= 0:
-        _norm_tokens = (int(_meta.get("nsamples", 0) or 0)
-                        * int(_meta.get("seqlen", 0) or 0))
-    if _norm_tokens > 0:
-        _renormed = 0
-        for _entry in stats.values():
-            if not isinstance(_entry, dict) or "h_trace_raw" not in _entry:
-                continue
-            _entry["h_trace"] = float(_entry["h_trace_raw"]) / _norm_tokens
-            if "h_w2_sum_raw" in _entry:
-                _entry["h_w2_sum"] = (
-                    float(_entry["h_w2_sum_raw"]) / _norm_tokens)
-            _per_raw = _entry.get("h_trace_per_expert_raw")
-            if _per_raw is not None:
-                _entry["h_trace_per_expert"] = [
-                    float(v) / _norm_tokens for v in _per_raw]
-            _renormed += 1
-        print(f"[alloc] Fisher renormalized: {_renormed}/{len(stats)} rows "
-              f"→ h_trace_raw / {_norm_tokens} global calib tokens "
-              "(per-expert routed-count normalization corrected)", flush=True)
-    else:
-        _needs_fix = sum(
-            1 for _e in stats.values()
-            if isinstance(_e, dict) and "h_trace_raw" in _e
-            and int(_e.get("n_tokens_seen", 0) or 0) > 0)
-        if _needs_fix:
-            print("[alloc] WARNING: probe meta lacks nsamples/seqlen; cannot "
-                  "renormalize h_trace by the global calib token count. "
-                  "Per-expert Fisher may be inflated by routed-token "
-                  "normalization.", flush=True)
+    # One Hessian identity per cost table, or refuse. The Tessera encoder's
+    # shipping default consumes a per-unit XtX, so rows priced with and
+    # without one describe different bytes at the same format name, and the
+    # DP would trade them against each other. Raises on a mix; reports what
+    # it found otherwise, so "no claim" stays distinguishable from "a
+    # matching claim" (principle 14).
+    from .tessera_menu import assert_uniform_hessian_identity, priced_static_scales
+    tessera_hessian_identity = assert_uniform_hessian_identity(costs)
+    if tessera_hessian_identity.get("stamped_rows") or \
+            tessera_hessian_identity.get("unstamped_rows"):
+        print(f"[alloc] tessera hessian identity: "
+              f"supplied={tessera_hessian_identity['supplied']} "
+              f"tokens={tessera_hessian_identity['token_count']} "
+              f"sha={str(tessera_hessian_identity['text_sha'])[:12]} "
+              f"({tessera_hessian_identity['stamped_rows']} stamped, "
+              f"{tessera_hessian_identity['unstamped_rows']} unstamped rows)")
 
-    allow_pinned = [s.strip() for s in (args.allow_pinned or "").split(",") if s.strip()]
+    # Which runtime contract answered this run's Tessera route queries, if any.
+    # The block names the exact Tessera commit and consumed contract digest;
+    # its presence does not by itself identify a development override or prove
+    # that every candidate route was attested for the requested context.
+    # Read through tessera_menu's ONE read, not through load_tessera_contract
+    # directly: the menu's every attestation goes through that function, and
+    # a provenance block that read the pin a second time could name a table
+    # the menu never consulted (or, as it did, name none while the menu had
+    # one). "Which table answered" is one fact per run, so it is read once.
+    from .tessera_menu import tessera_runtime_contract
+    _tessera_contract = tessera_runtime_contract()
+    tessera_dev_pin = {} if _tessera_contract is None else _tessera_contract.identity()
+    if tessera_dev_pin:
+        from .tessera_runtime_contract import describe_dev_pin
+        print(f"[alloc] tessera dev pin: {describe_dev_pin(tessera_dev_pin)}")
+
+    # ---- Fisher renormalization ----
+    # One shared denominator (the global calib token count) recomputed
+    # from the stored raw accumulators; hard error on probes that cannot
+    # be renormalized unless --allow-legacy-fisher-norm. See
+    # renormalize_probe_fisher for the full story.
+    renormalize_probe_fisher(stats, probe.get("meta", {}),
+                             allow_legacy=args.allow_legacy_fisher_norm)
+
+    # ---- Robust Fisher clip (opt-in research lever) ----
+    # PRISMAQUANT_FISHER_CAP_MULTIPLIER=K caps each dense row's h_trace at
+    # K x its role's median. Unset => byte-identical no-op. Must run AFTER
+    # the renormalization above (it clips the finalized scalar, not the raw
+    # accumulator). See clip_probe_fisher_outliers.
+    clip_probe_fisher_outliers(stats, probe.get("meta", {}))
+
+    allow_pinned = list(parse_allow_pinned(args.allow_pinned))
+    lm_head_format_canonical = fr.get_format(args.lm_head_format).name
+    lm_head_dp_unpinned = allow_pinned_lifts_lm_head(
+        model_profile, allow_pinned
+    )
+    if lm_head_dp_unpinned and lm_head_format_canonical != "BF16":
+        raise SystemExit(
+            "[alloc] ERROR: --lm-head-format fixes lm_head outside the body "
+            "DP, while --allow-pinned lm_head asks the DP to choose it. "
+            "These modes are mutually exclusive. Drop --allow-pinned for "
+            f"the fixed {lm_head_format_canonical} production recipe, or "
+            "leave --lm-head-format=BF16 for the research/DP path."
+        )
+    fixed_lm_head_quantized = (
+        not lm_head_dp_unpinned and lm_head_format_canonical != "BF16"
+    )
     allocation_excluded = []
     for name in sorted(set(stats) | set(costs)):
         if model_profile.is_pinned_name(name):
+            if fixed_lm_head_quantized and is_lm_head_name(
+                name, model_profile
+            ):
+                # Retain the row until the fixed-auxiliary pass below. It is
+                # removed before the body DP and priced exactly there.
+                continue
             if any(tok in name for tok in allow_pinned):
                 continue  # opt-in: let the allocator choose this name's format
             allocation_excluded.append(name)
+    tied_head_added = tied_lm_head_dp_exclusions(
+        stats, costs, model_profile, probe_model_path, allocation_excluded)
+    allocation_excluded.extend(tied_head_added)
+    fixed_tied_heads = [
+        name for name in tied_head_added
+        if fixed_lm_head_quantized and is_lm_head_name(name, model_profile)
+    ]
+    if fixed_tied_heads:
+        raise SystemExit(
+            "[alloc] ERROR: a fixed quantized lm_head cannot share storage "
+            "with the non-quantizable input embedding; quantizing it would "
+            f"also quantize the embedding ({fixed_tied_heads}). Keep "
+            "--lm-head-format=BF16 for tied embeddings."
+        )
+    if tied_head_added:
+        print(
+            "[alloc] tied LM head (shares storage with the non-quantizable "
+            f"input embedding) excluded from DP budget: {tied_head_added} "
+            "— not overridable by --allow-pinned", flush=True)
     if allow_pinned:
         print(f"[alloc] --allow-pinned active for {allow_pinned}: these "
               "profile-pinned names enter the DP budget (allocator chooses "
               "their format by cost-per-byte)", flush=True)
+    if fixed_lm_head_quantized:
+        print(
+            f"[alloc] --lm-head-format={lm_head_format_canonical}: lm_head "
+            "is a fixed auxiliary assignment (outside body bpp/DP, inside "
+            "exact artifact bytes)",
+            flush=True,
+        )
     # vLLM fused-load invariant: a fused-sibling group missing a member (e.g.
     # Gemma4 k_eq_v full-attention layers synthesize v=k and ship no v_proj /
     # v_scale) cannot be partially quantized — the present members must ship
@@ -1369,41 +2532,205 @@ def main():
             f"(sample: {allocation_excluded[:8]})",
             flush=True,
         )
+    stats = _mark_weight_only_nvfp4_stats(stats, model_profile)
     accounting_stats = dict(stats)
-
-    propagated_sensitivity_summary: dict | None = None
-    if args.propagated_sensitivity_report:
-        from .propagated_sensitivity_costs import (
-            apply_propagated_sensitivity_penalty,
-        )
-
-        with open(args.propagated_sensitivity_report) as f:
-            propagated_report = json.load(f)
-        costs, propagated_sensitivity_summary = apply_propagated_sensitivity_penalty(
-            costs,
-            stats=stats,
-            report=propagated_report,
-            scale=float(args.propagated_sensitivity_scale),
-            target_format=args.propagated_sensitivity_target_format,
-            score_field=args.propagated_sensitivity_score_field,
-            format_extrapolation=args.propagated_sensitivity_format_extrapolation,
-        )
-        print(
-            "[alloc] propagated sensitivity costs: "
-            f"report={args.propagated_sensitivity_report} "
-            f"scale={propagated_sensitivity_summary['scale']:.6g} "
-            f"adjusted={propagated_sensitivity_summary['adjusted_entries']} "
-            f"skipped={propagated_sensitivity_summary['skipped']} "
-            f"penalty={propagated_sensitivity_summary['total_scaled_member_penalty']:.6g}",
-            flush=True,
-        )
+    tessera_context_by_unit = context_by_unit_from_stats(
+        tessera_serving_target, accounting_stats, model_profile)
 
     if args.formats:
         fmt_names = [s.strip() for s in args.formats.split(",") if s.strip()]
     else:
         fmt_names = cost_data["formats"]
-    specs = [fr.get_format(n) for n in fmt_names]
-    specs_sorted = sorted(specs, key=lambda s: s.effective_bits)
+    # ``TESSERA`` is a menu TOKEN, not a format. It cannot expand to a fixed
+    # list the way ``NVFP4`` names one rung: a Tessera family addresses a
+    # continuous rate axis, the realisable set depends on the unit's column
+    # count, and one 0.6B Linear carries thousands of legal rungs across the
+    # four families. So the token expands to exactly the rungs THIS RUN PRICED --
+    # the cost table's own Tessera columns -- which is both the widest menu
+    # the DP could honestly consider and a set that needs no second copy of
+    # the campaign's legality decisions. A rung the campaign did not price
+    # would be dropped by ``build_candidates`` anyway (no cost row); naming it
+    # here would only have ``require_producer_formats`` refuse the whole run.
+    # The expansion is intersected with what the pinned runtime attests, so a
+    # research-priced table read back on the default path allocates over the
+    # backed axis instead of refusing wholesale. The narrowing is printed, not
+    # inferred: an allocation over 2 rungs and one over 3060 must not look the
+    # same in a log (P9, P12).
+    priced_tessera = [
+        n for n in cost_data.get("formats", ())
+        if isinstance(n, str) and n.startswith("TESSERA_")
+    ]
+    fmt_names, unattested = expand_menu_tokens_report(
+        fmt_names, cost_data.get("formats", ()),
+        **({"context_by_unit": tessera_context_by_unit}
+           if tessera_context_by_unit is not None else {}))
+    tessera_menu_widths: dict = {}
+    if priced_tessera:
+        kept = [n for n in fmt_names if n.startswith("TESSERA_")]
+        # The count is the admission predicate's, not the caller's: an
+        # explicitly named rung stays on the menu so the eligibility gate can
+        # refuse it out loud, and it is not "attested" until then (#278).
+        admitted, explicit_unattested = partition_attested(
+            kept, **({"context_by_unit": tessera_context_by_unit}
+                     if tessera_context_by_unit is not None else {}))
+        widths, line = menu_width_report(
+            priced_tessera, admitted, unattested, explicit_unattested, menu_mode())
+        if kept:
+            tessera_menu_widths = widths
+        print(line, flush=True)
+        # The measured status of the ranking this DP is about to do. Printed
+        # here rather than at the end because it governs how the whole run's
+        # output is to be read, and stamped into provenance below because a
+        # terminal line is not a property of the artifact (P12).
+        if kept:
+            print(
+                "[alloc] WARNING: Tessera rungs are on this menu and the DP "
+                "ranks them on a surrogate MEASURED to mis-rank them at "
+                "matched bytes -- served KL 2.00x worse than a byte-matched "
+                "uniform arm at 4.0 bpp (2.33x at 3.0, 2.88x at 5.0), and "
+                "1.93x on the priced units alone. See "
+                "tessera_menu.surrogate_selection_caveat() and "
+                "docs/measurements/tessera-allocated-served-2026-09-02.md. "
+                "This assignment is a CANDIDATE, not a selection: promote it "
+                "only through SELECTION_MODE=validated-surrogate with a "
+                "byte-matched uniform arm served beside it.",
+                flush=True,
+            )
+        if unattested and not kept:
+            raise SystemExit(
+                "[alloc] ERROR: the cost table prices "
+                f"{len(priced_tessera)} Tessera rungs and the pinned runtime "
+                "attests none of them, so the TESSERA menu token expands to "
+                "nothing. Either widen the runtime's attested rungs "
+                "(attested_rungs_q256 in the packaged runtime_contract.json) "
+                "or price a table under the attested menu; "
+                "PRISMAQUANT_TESSERA_MENU=readable allocates over the rungs "
+                "the pinned decoder accepts and "
+                "PRISMAQUANT_TESSERA_MENU=research over the whole realisable "
+                "axis -- both for research runs that do not export."
+            )
+    try:
+        specs = fr.require_producer_formats(
+            fmt_names, where="new allocator assignment menu",
+            **({"context_by_unit": tessera_context_by_unit}
+               if tessera_context_by_unit is not None else {}),
+        )
+    except ValueError as exc:
+        raise SystemExit(
+            f"[alloc] ERROR: {exc}"
+        ) from None
+    cb_serialization_context = None
+    cb_col_weights = None
+    cb_cost_render_identity = None
+    cb_requested_names = [spec.name for spec in specs]
+    cb_requested_names.extend((
+        lm_head_format_canonical,
+        fr.get_format(args.mtp_format).name,
+        fr.get_format(args.visual_format).name,
+    ))
+    if any(is_cb_format(name) for name in cb_requested_names):
+        if (
+            args.cb_scale_coding is None
+            or args.cb_codebook_source is None
+            or args.cb_scale_sweep is None
+            or args.cb_ldlq is None
+            or args.cb_encode_tier is None
+        ):
+            raise SystemExit(
+                "[alloc] ERROR: a CB format is present in the body or fixed "
+                "auxiliary assignment but exact serialized "
+                "and renderer context is missing. Pass --cb-scale-coding, "
+                "--cb-codebook-source, --cb-scale-sweep, --cb-ldlq, "
+                "--cb-minchain, and "
+                "--cb-encode-tier; refusing implicit render defaults."
+            )
+        if args.cb_codebook_digests is not None:
+            raise SystemExit(
+                "[alloc] ERROR: --cb-codebook-digests is a digest-only legacy "
+                "contract and cannot supply learned values. Pass "
+                "--cb-codebook-bundle instead."
+            )
+        if args.cb_col_weights is None:
+            raise SystemExit(
+                "[alloc] ERROR: CB allocation requires --cb-col-weights so "
+                "the cost table can be checked against the exact imatrix "
+                "that cache/KL/export consume"
+            )
+        try:
+            with open(args.cb_col_weights, "rb") as fh:
+                cb_col_weights = pickle.load(fh)
+        except Exception as exc:
+            raise SystemExit(
+                f"[alloc] ERROR: cannot load CB col-weights "
+                f"{args.cb_col_weights}: {exc}"
+            ) from None
+        if not isinstance(cb_col_weights, Mapping):
+            raise SystemExit(
+                "[alloc] ERROR: --cb-col-weights must contain a qname -> "
+                "tensor mapping"
+            )
+        try:
+            cb_env = {
+                "CB_SCALE_CODING": args.cb_scale_coding,
+                "CB_CODEBOOK_SOURCE": args.cb_codebook_source,
+                "CB_SCALE_SWEEP": args.cb_scale_sweep,
+                "PRISMAQUANT_CB_LDLQ": args.cb_ldlq,
+                "PRISMAQUANT_CB_MINCHAIN": args.cb_minchain,
+                "PRISMAQUANT_CB_ENCODE_TIER": args.cb_encode_tier,
+            }
+            if args.cb_codebook_source_scope is not None:
+                cb_env["CB_CODEBOOK_SOURCE_SCOPE"] = (
+                    args.cb_codebook_source_scope
+                )
+            if args.cb_scale_sweep_scope is not None:
+                cb_env["CB_SCALE_SWEEP_SCOPE"] = args.cb_scale_sweep_scope
+            if args.cb_ldlq_scope is not None:
+                cb_env["PRISMAQUANT_CB_LDLQ_SCOPE"] = args.cb_ldlq_scope
+            if args.cb_codebook_bundle is not None:
+                cb_env["CB_CODEBOOK_BUNDLE"] = args.cb_codebook_bundle
+            cb_serialization_context = cb_serialization_context_from_env(
+                cb_env,
+                require_explicit=True,
+                where="allocator CB producer context",
+            )
+        except ValueError as exc:
+            raise SystemExit(f"[alloc] ERROR: {exc}") from None
+        print(
+            "[alloc] CB serialized payload: "
+            f"scale_coding={cb_serialization_context.scale_coding} "
+            f"layout_version={cb_serialization_context.layout_version} "
+            f"codebook_source={cb_serialization_context.codebook_source} "
+            f"codebook_source_scope={cb_serialization_context.codebook_source_scope} "
+            f"scale_sweep={cb_serialization_context.scale_sweep} "
+            f"scale_sweep_scope={cb_serialization_context.scale_sweep_scope} "
+            f"ldlq={cb_serialization_context.ldlq} "
+            f"encode_tier={cb_serialization_context.encode_tier} "
+            f"renderer_abi={cb_serialization_context.renderer_abi}",
+            flush=True,
+        )
+        if research_cost_provenance is None:
+            try:
+                validate_cb_cost_provenance(
+                    cost_data,
+                    cb_requested_names,
+                    context=cb_serialization_context,
+                    where=f"allocator cost cache {args.costs}",
+                )
+                _stored_context, cb_cost_render_identity = (
+                    validate_cb_render_provenance(
+                        cost_data,
+                        expected_context=cb_serialization_context,
+                        col_weights=cb_col_weights,
+                        where=f"allocator cost cache {args.costs}",
+                    )
+                )
+            except ValueError as exc:
+                raise SystemExit(f"[alloc] ERROR: {exc}") from None
+    specs_sorted, serialized_rates = _sort_specs_by_serialized_rate(
+        specs,
+        accounting_stats,
+        cb_serialization_context,
+    )
 
     # Fused-coherence guard: a multi-format menu under DefaultProfile cannot
     # enforce architecture-specific fused-sibling coherence (e.g. Qwen3.x
@@ -1424,6 +2751,13 @@ def main():
     )
 
     if args.packed_role_split:
+        # A role split emits different expert formats for gate_up vs down
+        # projections of the SAME MoE layer — only loadable when the
+        # serving lane keys expert schemes per projection. Hard-error
+        # unless the resolved serving profile declares the capability
+        # (SystemExit inside on unsupported/unknown profiles).
+        require_per_role_expert_scheme_support(
+            target_profile, flag="--packed-role-split")
         # Split packed expert groups into gate_up / down serving units by
         # wrapping the profile view: DP aggregation AND serving promotion
         # both key groups through packed_expert_format_group, so wrapping
@@ -1432,21 +2766,23 @@ def main():
         # DefaultProfile gate above.
         model_profile = packed_role_split_profile(model_profile)
         print("[alloc] --packed-role-split: packed expert groups keyed as "
-              "(layer, {gate_up|down}) serving units", flush=True)
+              "(layer, {gate_up|down}) serving units "
+              f"(profile {target_profile!r} declares per-role expert "
+              "schemes)", flush=True)
 
     # --- Format-family coherence check -----------------------------------
     # A sensible format ladder has at most ONE format per bit tier. Having
-    # both NVFP4 and MXFP4 (or MXFP6_E3M2 and MXFP6_E2M3) means the allocator
+    # both NVFP4 and MXFP4 means the allocator
     # picks between them based on tiny measurement noise per-layer, which
     # produces a serving mess: two separate kernel paths for the same tier.
     #
-    # We bucket formats by effective_bits rounded to 0.25 and warn when a
+    # We bucket formats by exact serialized rate rounded to 0.25 and warn when a
     # bucket has more than one member. If --enforce-family-coherence is
     # set we error instead.
     from collections import Counter as _Counter
     buckets: dict[float, list[str]] = {}
     for s in specs_sorted:
-        key = round(s.effective_bits * 4) / 4
+        key = round(serialized_rates[s.name] * 4) / 4
         buckets.setdefault(key, []).append(s.name)
     collisions = {k: v for k, v in buckets.items() if len(v) > 1}
     if collisions:
@@ -1457,8 +2793,8 @@ def main():
                + "\nRecommended bundles (vLLM serving, today):\n"
                "  Production     : NVFP4,FP8_DYNAMIC,BF16\n"
                "  MX research    : MXFP4,MXFP8_E4M3,BF16\n"
-               "  Experimental   : NVFP4,MXFP6_E3M2,FP8_DYNAMIC,BF16   "
-               "(MXFP6 hardware-supported on Blackwell, vLLM kernels not yet landed)")
+               "  Experimental   : NVFP4,MXFP4,FP8_DYNAMIC,BF16   "
+               "(MXFP4 serves W4A16 -- no A4 kernel on this lane)")
         if args.enforce_family_coherence:
             raise SystemExit(f"[alloc] ERROR: {msg}")
         else:
@@ -1466,13 +2802,21 @@ def main():
     mtp_format_canonical = fr.get_format(args.mtp_format).name
     visual_format_canonical = fr.get_format(args.visual_format).name
     rank_specs = {s.name: s for s in specs_sorted}
+    rank_specs.setdefault(
+        lm_head_format_canonical,
+        fr.get_format(lm_head_format_canonical),
+    )
     rank_specs.setdefault(mtp_format_canonical, fr.get_format(mtp_format_canonical))
     rank_specs.setdefault(visual_format_canonical, fr.get_format(visual_format_canonical))
-    rank_specs_sorted = sorted(rank_specs.values(), key=lambda s: s.effective_bits)
+    rank_specs_sorted, _rank_serialized_rates = _sort_specs_by_serialized_rate(
+        list(rank_specs.values()),
+        accounting_stats,
+        cb_serialization_context,
+    )
     format_rank = {s.name: i for i, s in enumerate(rank_specs_sorted)}
     format_specs = {s.name: s for s in rank_specs_sorted}
     print(f"[alloc] formats (low→high bits): "
-          f"{[f'{s.name}({s.effective_bits:.2f}b)' for s in specs_sorted]}")
+          f"{[f'{s.name}({serialized_rates[s.name]:.4f}b)' for s in specs_sorted]}")
 
     # Optional empirical calibration: per-format scalar gain α_f. When
     # absent, all gains default to 1.0.
@@ -1494,9 +2838,10 @@ def main():
             print(f"[alloc] WARNING: {args.calibration} has no usable "
                   f"calibrated_gains; running uncalibrated", flush=True)
 
-    # Source-dtype manifest drives passthrough-integrity filtering in
-    # build_candidates. None when model path is unknown — candidates
-    # fall back to cost-pickle-only gating (pre-passthrough behavior).
+    # Source-dtype manifest drives passthrough-integrity filtering and the
+    # exact candidate-payload <= source-payload gate in build_candidates.
+    # None when model path is unknown — legacy/offline allocations cannot
+    # evaluate either source-dependent rule.
     source_manifest: dict[str, str] | None = None
     if probe_model_path:
         source_manifest = _scan_source_dtype_manifest(
@@ -1512,24 +2857,277 @@ def main():
                   "allowed WITHOUT source verification", flush=True)
             source_manifest = None
         if source_manifest:
-            n_fp8 = sum(1 for v in source_manifest.values() if v == "fp8")
-            n_bf16 = sum(1 for v in source_manifest.values() if v == "bf16")
-            print(f"[alloc] source-dtype manifest: {n_fp8} fp8, "
-                  f"{n_bf16} bf16 (gates FP8_SOURCE/BF16 per source)",
+            # Report EVERY kind the scan found, not a hardcoded fp8/bf16 pair.
+            # A checkpoint whose units are mxfp4 and fp8_ue8m0 printed "0 fp8,
+            # 238 bf16" under the old line — which reads as "nothing was
+            # classified" precisely when the classification is the interesting
+            # part, and hides a newly censused native format entirely.
+            kinds = Counter(source_manifest.values())
+            summary = ", ".join(
+                f"{count} {kind}" for kind, count in sorted(kinds.items())
+            )
+            gated = ", ".join(sorted(PASSTHROUGH_SOURCE_REQUIREMENTS))
+            print(f"[alloc] source-dtype manifest: {summary} "
+                  f"(gates {gated} per source)",
                   flush=True)
 
+    # A requested production CB rung needs a measured row everywhere it is
+    # otherwise legal. `build_candidates` historically skipped absent/error
+    # rows, which could silently prune the entire CB menu after an imatrix or
+    # learned-codebook render failure and let the run select stock/BF16.
+    body_cb_specs = [spec for spec in specs_sorted if is_cb_format(spec.name)]
+    mtp_cb_spec = (
+        fr.get_format(mtp_format_canonical)
+        if is_cb_format(mtp_format_canonical)
+        else None
+    )
+    visual_cb_spec = (
+        fr.get_format(visual_format_canonical)
+        if is_cb_format(visual_format_canonical)
+        else None
+    )
+    incomplete_cb_costs: list[tuple[str, str, str]] = []
+    for name, stats_entry in stats.items():
+        if _is_mtp_linear(name):
+            required_specs = [mtp_cb_spec] if mtp_cb_spec is not None else []
+        elif _is_visual_linear(name):
+            required_specs = (
+                [visual_cb_spec] if visual_cb_spec is not None else []
+            )
+        else:
+            required_specs = body_cb_specs
+        source_kind = (
+            source_manifest.get(name, "unknown")
+            if source_manifest is not None
+            else None
+        )
+        per_name_costs = costs.get(name)
+        for spec in required_specs:
+            verdict = check_stats_format_applicability(
+                stats_entry,
+                spec,
+                qname=name,
+                source_kind=source_kind,
+                target_profile=target_profile,
+                cb_serialization_context=cb_serialization_context,
+            )
+            if not verdict.legal:
+                continue
+            row = None
+            if isinstance(per_name_costs, Mapping):
+                for candidate_name in dict.fromkeys(
+                    (spec.name, *fr.aliases_for(spec.name))
+                ):
+                    if candidate_name in per_name_costs:
+                        row = per_name_costs[candidate_name]
+                        break
+            reason = None
+            if not isinstance(row, Mapping):
+                reason = "missing"
+            elif "error" in row:
+                reason = f"error={row.get('error')!r}"
+            if reason is not None:
+                incomplete_cb_costs.append((str(name), spec.name, reason))
+    if incomplete_cb_costs:
+        sample = "; ".join(
+            f"{name}={fmt} ({reason})"
+            for name, fmt, reason in incomplete_cb_costs[:8]
+        )
+        raise SystemExit(
+            "[alloc] ERROR: production CB cost coverage is incomplete for "
+            f"{len(incomplete_cb_costs)} legal (tensor, format) pair(s): "
+            f"{sample}. CB export is imatrix-weighted, so missing/error rows "
+            "cannot be silently pruned from the menu. Rebuild the cost/cache "
+            "with complete production col_weights or remove the CB rung."
+        )
+
+    # ---- Activation-fair pricing (ultraplan P5a) ----
+    # ONE per-family calibration for the whole run, fit before any candidate
+    # is built so the body, MTP and visual menus cannot end up on three
+    # different scales. See activation_fair_pricing for the functional form,
+    # the fail-closed policy, and the PRISMAQUANT_ACTIVATION_FAIR_PRICING
+    # kill switch (this call raises AssertionError on a mixed scale).
+    activation_pricing_stats = (
+        {
+            name: entry for name, entry in stats.items()
+            if not is_lm_head_name(name, model_profile)
+        }
+        if fixed_lm_head_quantized else stats
+    )
+    activation_pricing_costs = (
+        {
+            name: entry for name, entry in costs.items()
+            if not is_lm_head_name(name, model_profile)
+        }
+        if fixed_lm_head_quantized else costs
+    )
+    activation_pricing = calibrate_activation_fair_pricing(
+        activation_pricing_stats,
+        activation_pricing_costs,
+        specs_sorted,
+    )
+    if activation_pricing.enabled:
+        print(
+            "[alloc] activation-fair pricing: "
+            + ", ".join(
+                f"{family} x{fit.penalty:.4g} (n={fit.n_rows}, "
+                f"log2 sd={fit.log2_stdev:.3f}, rung-dep "
+                f"{fit.rung_dependence_log2_range:.3f})"
+                for family, fit in sorted(activation_pricing.families.items())
+            ),
+            flush=True,
+        )
+    else:
+        print(
+            "[alloc] activation-fair pricing DISABLED "
+            f"({activation_pricing.reason}): weight-only-priced rows keep "
+            "their pre-P5a prices, so any W4A4-vs-W8A8 comparison drawn "
+            "from this run is NOT activation-fair "
+            f"(weight_only rows by family: "
+            f"{dict(sorted(activation_pricing.weight_only_rows_by_family.items()))})",
+            flush=True,
+        )
+
+    # ---- Cross-family CB-ladder symmetry verdict (ultraplan P5a item 2) ----
+    # Computed by the cost stage on its own held-out units; the allocator
+    # republishes it so a consumer reading only the allocation artifacts can
+    # see whether this run's ladder fits support a cross-family (NVFP4-CB vs
+    # FP8-CB) claim at all. A failure is surfaced, never fatal: the
+    # allocation is still solvable, only the cross-family verdict is not
+    # publishable.
+    cross_family_verdict = cross_family_verdict_from_cost_payload(cost_data)
+    if cross_family_verdict is not None:
+        line = (
+            "[alloc] CB ladder cross-family symmetry: "
+            f"{str(cross_family_verdict.get('verdict', '?')).upper()} — "
+            f"{cross_family_verdict.get('detail', '')}"
+        )
+        if not cross_family_verdict.get(
+                "cross_family_comparison_publishable", False):
+            print(f"[alloc] WARNING: {line[8:]}", flush=True)
+        else:
+            print(line, flush=True)
+
     candidate_mask_records: list[dict] = []
+    tessera_menu_report: dict = {}
     candidates = build_candidates(
         stats, costs, specs_sorted, calibrated_gains,
         source_manifest=source_manifest,
         target_profile=target_profile,
         mask_records=candidate_mask_records,
+        cb_serialization_context=cb_serialization_context,
+        activation_pricing=activation_pricing,
+        # The DP's own bin width, so a continuous Tessera menu is reduced to
+        # what THIS solver can distinguish rather than to a taste constant.
+        bit_precision=float(args.bit_precision),
+        tessera_menu_report=tessera_menu_report,
+        context_by_unit=tessera_context_by_unit,
+        **({"preserve_runtime_frontier": True} if measured_runtime_table is not None else {}),
     )
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 
     fixed_format_assignment: dict[str, str] = {}
     fixed_stats: dict[str, dict] = {}
     fixed_chosen_candidates: dict[str, Candidate] = {}
+    fixed_lm_head_names: set[str] = set()
+    fixed_lm_head_cost_pricing = (
+        "direct_terminal_measurement_no_body_activation_transfer"
+        if fixed_lm_head_quantized else None
+    )
+
+    if fixed_lm_head_quantized:
+        head_probe_names = sorted(
+            name for name in stats
+            if is_lm_head_name(name, model_profile)
+        )
+        if not head_probe_names:
+            raise SystemExit(
+                f"[alloc] --lm-head-format={lm_head_format_canonical} was "
+                "requested, but the probe has no lm_head row. Re-run the "
+                "probe with --include-lm-head."
+            )
+        head_names_without_costs = [
+            name for name in head_probe_names if name not in costs
+        ]
+        if head_names_without_costs:
+            raise SystemExit(
+                f"[alloc] --lm-head-format={lm_head_format_canonical} was "
+                f"requested, but the cost pickle lacks {len(head_names_without_costs)} "
+                f"lm_head row(s): {head_names_without_costs[:8]}. Re-run "
+                "cost measurement with --include-lm-head."
+            )
+        head_stats = {name: stats[name] for name in head_probe_names}
+        head_costs = {name: costs[name] for name in head_probe_names}
+        head_candidates = build_candidates(
+            head_stats,
+            head_costs,
+            [fr.get_format(lm_head_format_canonical)],
+            calibrated_gains,
+            source_manifest=source_manifest,
+            target_profile=target_profile,
+            mask_records=candidate_mask_records,
+            cb_serialization_context=cb_serialization_context,
+            # The fixed head is selected from direct terminal-head evidence.
+            # The body family transfer fits a measured/output-space scale for
+            # ordinary internal Linears and must not multiply that terminal
+            # measurement a second time.  Passing None preserves the row's
+            # own predicted_dloss/cost_source precedence while making the
+            # absence of body activation transfer explicit.
+            activation_pricing=None,
+            context_by_unit=tessera_context_by_unit,
+        )
+        missing_head_candidates = [
+            name for name in head_probe_names
+            if _find_candidate_for_format(
+                head_candidates,
+                name,
+                lm_head_format_canonical,
+            ) is None
+        ]
+        if missing_head_candidates:
+            raise SystemExit(
+                f"[alloc] --lm-head-format={lm_head_format_canonical} "
+                "requires a measured, serveable candidate for every head, "
+                f"but {len(missing_head_candidates)} are missing: "
+                f"{missing_head_candidates[:8]}. Rebuild the head cost for "
+                "this format and verify the target serving profile supports "
+                "quantized lm_head."
+            )
+        fixed_lm_head_names = set(head_probe_names)
+        fixed_format_assignment.update({
+            name: lm_head_format_canonical for name in head_probe_names
+        })
+        fixed_stats.update(head_stats)
+        fixed_chosen_candidates.update({
+            name: candidate
+            for name in head_probe_names
+            if (
+                candidate := _find_candidate_for_format(
+                    head_candidates,
+                    name,
+                    lm_head_format_canonical,
+                )
+            ) is not None
+        })
+        stats = {
+            name: value for name, value in stats.items()
+            if name not in fixed_lm_head_names
+        }
+        costs = {
+            name: value for name, value in costs.items()
+            if name not in fixed_lm_head_names
+        }
+        candidates = {
+            name: value for name, value in candidates.items()
+            if name not in fixed_lm_head_names
+        }
+        print(
+            f"[alloc] --lm-head-format={lm_head_format_canonical}: fixed "
+            f"{len(fixed_lm_head_names)} lm_head Linear(s) before DP as "
+            "auxiliary to body bpp/\u0394loss accounting",
+            flush=True,
+        )
+
     mtp_names_without_costs = sorted(
         n for n in stats if _is_mtp_linear(n) and n not in costs
     )
@@ -1561,6 +3159,9 @@ def main():
             source_manifest=source_manifest,
             target_profile=target_profile,
             mask_records=candidate_mask_records,
+            cb_serialization_context=cb_serialization_context,
+            activation_pricing=activation_pricing,
+            context_by_unit=tessera_context_by_unit,
         )
         missing_mtp_candidates = [
             name for name in mtp_names
@@ -1579,11 +3180,11 @@ def main():
                 f"that candidate. Sample: {sample}. Re-run cost measurement "
                 "with --include-mtp for the requested MTP format."
             )
-        fixed_format_assignment = {
+        fixed_format_assignment.update({
             name: mtp_format_canonical for name in mtp_names
-        }
-        fixed_stats = {name: stats[name] for name in mtp_names}
-        fixed_chosen_candidates = {
+        })
+        fixed_stats.update({name: stats[name] for name in mtp_names})
+        mtp_chosen_candidates = {
             name: _find_candidate_for_format(
                 mtp_candidates,
                 name,
@@ -1591,12 +3192,12 @@ def main():
             )
             for name in mtp_names
         }
-        fixed_chosen_candidates = {
-            name: cand for name, cand in fixed_chosen_candidates.items()
+        fixed_chosen_candidates.update({
+            name: cand for name, cand in mtp_chosen_candidates.items()
             if cand is not None
-        }
-        if fixed_format_assignment:
-            fixed_names = set(fixed_format_assignment)
+        })
+        if mtp_names:
+            fixed_names = set(mtp_names)
             stats = {
                 name: value for name, value in stats.items()
                 if name not in fixed_names
@@ -1611,7 +3212,7 @@ def main():
             }
             print(
                 f"[alloc] --mtp-format={mtp_format_canonical}: fixed "
-                f"{len(fixed_format_assignment)} MTP Linears before DP "
+                f"{len(mtp_names)} MTP Linears before DP "
                 "as auxiliary to body bpp/Δloss accounting",
                 flush=True,
             )
@@ -1631,6 +3232,9 @@ def main():
                 source_manifest=source_manifest,
                 target_profile=target_profile,
                 mask_records=candidate_mask_records,
+                cb_serialization_context=cb_serialization_context,
+                activation_pricing=activation_pricing,
+                context_by_unit=tessera_context_by_unit,
             )
             visual_aux_candidates = {
                 name: cand for name in visual_cost_names
@@ -1671,6 +3275,59 @@ def main():
             flush=True,
         )
 
+    # Text-only probes can omit the complete visual tower. Discover those
+    # source-only Linears *before* Pareto records are built so every candidate
+    # JSON, CB identity, payload price, and budget stamp covers the exact full
+    # assignment later emitted by the selector/exporter. The historical late
+    # insertion made Pareto files deltas over the final layer_config and could
+    # stamp a different (occasionally smaller) artifact than the one shipped.
+    source_visual_stats = (
+        discover_visual_linear_stats_from_source(
+            probe_model_path,
+            strict=bool(
+                args.target_disk_gb is not None
+                or visual_format_canonical != "BF16"
+            ),
+        )
+        if probe_model_path
+        else {}
+    )
+    source_visual_stats = _mark_weight_only_nvfp4_stats(
+        source_visual_stats,
+        model_profile,
+    )
+    source_only_visual_stats = {
+        name: entry
+        for name, entry in source_visual_stats.items()
+        if name not in fixed_format_assignment
+    }
+    if source_only_visual_stats and is_cb_format(visual_format_canonical):
+        sample = sorted(source_only_visual_stats)[:8]
+        raise SystemExit(
+            "[alloc] ERROR: source-only visual Linears cannot be assigned a "
+            f"CB format without measured imatrix/cost rows (sample={sample}). "
+            "Run multimodal probing so these Linears have production "
+            "col_weights, or choose a non-CB --visual-format."
+        )
+    try:
+        validate_source_visual_passthrough_contract(
+            source_visual_stats,
+            visual_format_canonical,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[alloc] ERROR: {exc}") from None
+    if source_only_visual_stats:
+        fixed_format_assignment.update({
+            name: visual_format_canonical for name in source_only_visual_stats
+        })
+        fixed_stats.update(source_only_visual_stats)
+        print(
+            f"[alloc] --visual-format={visual_format_canonical}: added "
+            f"{len(source_only_visual_stats)} source-only visual Linears "
+            "to every full Pareto assignment before byte pricing",
+            flush=True,
+        )
+
     pre_aggregation_availability = {
         spec.name: sum(
             1 for per_name in candidates.values()
@@ -1683,15 +3340,54 @@ def main():
         int(entry.get("n_params", 0) or 0) for entry in fixed_stats.values()
     )
 
-    def _bits_for_stats_entry(entry: dict, fmt: str) -> float:
+    def _bits_for_stats_entry(entry: dict, fmt: str, qname: str) -> float:
         shape = _shape_from_stats(entry)
-        return 8.0 * fr.get_format(fmt).memory_bytes_for_shape(shape)
+        payload_bytes, _identity, _sidecar_identity = serialized_candidate_payload(
+            fr.get_format(fmt),
+            shape,
+            qname=qname,
+            cb_serialization_context=cb_serialization_context,
+        )
+        global_bytes = (
+            nvfp4_global_sidecar_bytes(
+                qname,
+                shape,
+                weight_only=bool(
+                    entry.get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)
+                ),
+            )
+            if fmt == "NVFP4"
+            else 0
+        )
+        return 8.0 * (payload_bytes + global_bytes)
 
     fixed_total_bits = sum(
-        _bits_for_stats_entry(fixed_stats[name], fmt)
+        _bits_for_stats_entry(fixed_stats[name], fmt, name)
         for name, fmt in fixed_format_assignment.items()
         if name in fixed_stats
     )
+    fixed_cb_assignment = {
+        name: fmt
+        for name, fmt in fixed_format_assignment.items()
+        if name in fixed_stats and is_cb_format(fmt)
+    }
+    if fixed_cb_assignment:
+        if cb_serialization_context is None:
+            raise AssertionError(
+                "fixed CB assignment reached payload reporting without a "
+                "CBSerializationContext"
+            )
+        fixed_cb_payload = cb_assignment_payload_breakdown(
+            fixed_cb_assignment,
+            {
+                name: _shape_from_stats(fixed_stats[name])
+                for name in fixed_cb_assignment
+            },
+            context=cb_serialization_context,
+        )
+        fixed_total_bits += 8.0 * int(
+            fixed_cb_payload["codebook_sidecar_bytes"]
+        )
     fixed_total_dloss = sum(
         float(cand.predicted_dloss)
         for cand in fixed_chosen_candidates.values()
@@ -1704,6 +3400,16 @@ def main():
     )
     applicability_report_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Per-Linear legal-format sets for serving-unit promotion, snapshotted
+    # BEFORE aggregation: both promotion call sites below run on the EXPANDED
+    # per-Linear assignment, where an aggregated super-item's candidate list no
+    # longer describes its individual members. Auxiliary MTP/visual names were
+    # already removed from `candidates` and stay absent here on purpose — they
+    # are format-PINNED, not legality-restricted (their candidates were built
+    # from a one-format menu), and promotion treats an absent name as
+    # unconstrained.
+    per_linear_legal_formats = legal_formats_from_candidates(candidates)
+
     # Pre-aggregate packed-MoE serving groups (e.g. DeepSeek-V4's 768
     # per-expert Linears per layer) into single multi-choice DP units.
     # The serving runtime loads each group under ONE format, so the DP
@@ -1715,7 +3421,10 @@ def main():
     # is a validated no-op.
     if not args.no_packed_aggregation:
         stats, costs, candidates = aggregate_packed_serving_groups(
-            stats, costs, specs_sorted, candidates, profile=model_profile)
+            stats, costs, specs_sorted, candidates, profile=model_profile,
+            calibrated_gains=calibrated_gains,
+            activation_pricing=activation_pricing,
+            **({"preserve_runtime_frontier": True} if measured_runtime_table is not None else {}))
         packed_groups = sum(
             1 for n in candidates if _PACKED_GROUP_MARKER in n)
         packed_member_rows = sum(
@@ -1726,22 +3435,75 @@ def main():
               f"groups ({packed_member_rows} member Linears priced as "
               "whole-group DP units)")
 
-    # Pre-aggregate fused siblings (qkv_proj, gate_up_proj, ...) into
-    # single DP items. The DP can't pick mixed-sibling solutions because
-    # there's only one item per group — so promote_fused becomes a no-op
-    # on aggregated items and the overshoot-tightening loop collapses to
-    # a single pass on well-behaved models. Must run AFTER the MoE
-    # aggregation (it skips `.__fused__.` and packed-group entries
-    # explicitly).
+    # Pre-aggregate fused siblings (qkv_proj, gate_up_proj, ...) into single
+    # DP items, so promote_fused is a no-op on them and the overshoot-
+    # tightening loop collapses to a single pass. Must run AFTER the MoE
+    # aggregation (it skips `.__fused__.` and packed-group entries explicitly).
+    #
+    # A super item carries one candidate per stock format NAME *and*, for each
+    # (family, shared-signature) cell its members share, the group's own exact
+    # multi-choice knapsack over their rungs (tessera_group_composites). So
+    # the DP CAN return a mixed-rung group -- one decoder, a rate per member --
+    # WHERE the pinned Tessera contract's fused_module block licenses it
+    # (fields.q256 = per_member since contract v6); this comment used to say
+    # the opposite, and the one-rung reading cost 1.12-1.29x in Δloss on the
+    # Qwen3-0.6B continuous menu. It then asserted the licence instead of
+    # reading it, which is the defect prismaquant #132 closed: with no
+    # contract pinned there are no composites at all, and the __licence__
+    # stamp below says so.
+    tessera_group_menu_report: dict = {}
     if not args.no_fused_aggregation:
         stats, costs, candidates = aggregate_fused_siblings(
             stats, costs, specs_sorted, candidates, profile=model_profile,
-            calibrated_gains=calibrated_gains)
+            calibrated_gains=calibrated_gains,
+            activation_pricing=activation_pricing,
+            **({"preserve_runtime_frontier": True} if measured_runtime_table is not None else {}))
         sib_groups = sum(1 for n in candidates if _FUSED_SIBLING_MARKER in n)
         print(f"[alloc] fused-sibling aggregation: {sib_groups} groups "
               f"(qkv_proj / gate_up_proj / ...)")
+        # The group knapsack: one decoder per group, a rung per member where
+        # the contract licenses it. Report what the fold cost and what it
+        # produced, per (group, cell) --
+        # "how big is the option set the DP now chooses from" is the number
+        # that says whether the exact constraint is affordable.
+        tessera_group_menu_report = {
+            name: dict(stats[name].get("_tessera_group_menu") or {})
+            for name in candidates
+            if stats.get(name, {}).get("_tessera_group_menu")
+        }
+        for name, per_class in sorted(tessera_group_menu_report.items()):
+            for label, row in sorted(per_class.items()):
+                if label.startswith("__"):
+                    # A stamp, not a fold: ``__licence__`` (what the pinned
+                    # contract freed) and ``__ablation__`` (the fold switched
+                    # off). Printed as itself so a run that produced no
+                    # composite says why, instead of KeyError-ing on a
+                    # ``member_menu`` it never had.
+                    print(f"[alloc] tessera group knapsack {name} {label}: "
+                          f"{row}", flush=True)
+                    continue
+                print(f"[alloc] tessera group knapsack {name} {label}: "
+                      f"member menus {row['member_menu']} -> fold "
+                      f"{row['fold_frontier']} -> {row['options']} options",
+                      flush=True)
 
     candidates = filter_candidates_for_profile(candidates, target_profile)
+
+    # The aggregated super items were built one candidate per format NAME,
+    # straight from `specs_sorted` -- they never passed through the reduction
+    # `build_candidates` applies to per-Linear menus. On a continuous Tessera
+    # menu that is the difference between a group carrying five rungs and one
+    # carrying several thousand, so the reduction is re-applied here, on the
+    # post-aggregation dict, with the same two exact steps (dominance, then
+    # this DP's own charged bins). Non-Tessera items are partitioned out and
+    # returned untouched, so a stock run is byte-identical.
+    tessera_menu_report_agg: dict = {}
+    candidates = reduce_continuous_menu(
+        candidates, stats,
+        bit_precision=float(args.bit_precision),
+        report=tessera_menu_report_agg,
+        **({"preserve_runtime_frontier": True} if measured_runtime_table is not None else {}),
+    )
 
     post_aggregation_availability = {
         spec.name: sum(
@@ -1769,25 +3531,48 @@ def main():
         "formats": [spec.name for spec in specs_sorted],
         "probe": str(args.probe),
         "costs": str(args.costs),
-        "propagated_sensitivity_costs": propagated_sensitivity_summary,
         "pre_aggregation_candidate_availability": pre_aggregation_availability,
         "post_aggregation_candidate_availability": post_aggregation_availability,
         "fixed_format_assignment": {
+            "lm_head_format": lm_head_format_canonical,
+            "lm_head_mode": (
+                "dp" if lm_head_dp_unpinned
+                else "fixed" if fixed_lm_head_quantized
+                else "profile_pinned_bf16"
+            ),
+            "lm_head_cost_pricing": fixed_lm_head_cost_pricing,
             "mtp_format": mtp_format_canonical,
             "visual_format": visual_format_canonical,
             "linears": len(fixed_format_assignment),
             "linears_by_kind": dict(Counter(
-                "mtp" if _is_mtp_linear(name)
+                "lm_head" if name in fixed_lm_head_names
+                else "mtp" if _is_mtp_linear(name)
                 else "visual" if _is_visual_linear(name)
                 else "other"
                 for name in fixed_format_assignment
             )),
             "params": fixed_total_params,
-            "bits_total": fixed_total_bits,
+            "assignment_payload_bits_total": fixed_total_bits,
+            "assignment_payload_bits_scope": (
+                "fixed_assignment_tensor_payload_including_deduplicated_"
+                "cb_sidecars"
+            ),
             "predicted_dloss": fixed_total_dloss,
             "budget_scope": "auxiliary_excluded_from_body_budget",
         },
-        **summarize_applicability_masks(candidate_mask_records),
+        # Ultraplan P5a/P5b: how every candidate's activation contract was
+        # priced, whether this run's per-family ladder fits are
+        # cross-comparable, and the concrete serving route each format rides.
+        "activation_fair_pricing": activation_pricing.as_dict(),
+        "cb_ladder_cross_family_verdict": cross_family_verdict,
+        "serving_lanes": serving_lane_catalog(target_profile),
+        **summarize_applicability_masks(
+            candidate_mask_records,
+            source_census_present=source_manifest is not None,
+            source_census_units=(
+                len(source_manifest) if source_manifest is not None else None
+            ),
+        ),
     }
     applicability_report_path.write_text(
         json.dumps(applicability_payload, indent=2, sort_keys=True) + "\n"
@@ -1805,44 +3590,6 @@ def main():
         if isinstance(original_entry, dict):
             return original_entry
         return None
-
-    _solve_cache: dict[float, tuple] = {}
-
-    def _solve_for_target(target_bits: float):
-        """Solve the body-budget DP at one target bit budget.
-
-        Memoized: the solve is a pure function of the target given fixed
-        stats/candidates, and the byte-budget grid + ratchet bisection
-        re-visit targets the Pareto sweep already solved.
-        """
-        cache_key = round(float(target_bits), 9)
-        cached = _solve_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        result = _solve_for_target_uncached(target_bits)
-        _solve_cache[cache_key] = result
-        return result
-
-    def _solve_for_target_uncached(target_bits: float):
-        mutable_target_bits = float(target_bits)
-        if mutable_total_params <= 0:
-            if fixed_total_params > 0 and mutable_target_bits >= 0.0:
-                return {}, 0.0, 0.0, 0.0
-            return None, float("nan"), float("inf"), float("inf")
-        if mutable_target_bits < 0.0:
-            return None, float("nan"), float("inf"), float("inf")
-        assign, achieved_r = solve_with_promotion(
-            stats, candidates, mutable_target_bits, format_specs, format_rank,
-            args.bit_precision,
-            no_fused_promote=args.no_fused_promote,
-            overshoot_tolerance=args.overshoot_tolerance,
-            profile=model_profile,
-        )
-        if assign is None:
-            return None, float("nan"), float("inf"), float("inf")
-        mutable_total = compute_assignment_predicted_dloss(assign, candidates)
-        total = mutable_total
-        return assign, achieved_r, total, mutable_total
 
     def _expand_assignment_for_seed_json(
         assignment: dict[str, str],
@@ -1864,17 +3611,461 @@ def main():
             expanded = expand_fused_sibling_assignment(expanded, stats)
         if include_auxiliary:
             expanded.update(fixed_format_assignment)
-        return promote_serving_units(expanded, format_rank, profile=model_profile)
+        return promote_serving_units(
+            expanded,
+            format_rank,
+            profile=model_profile,
+            legal_formats=per_linear_legal_formats,
+        )
 
-    def _assignment_bits_total(assignment: dict[str, str]) -> float:
+    measured_runtime_resources = {}
+    measured_option_assignments = {}
+    if measured_runtime_table is not None:
+        from dataclasses import replace
+        from .measured_runtime_prices import RuntimeBinding, build_runtime_resources
+        from .joint_aura import validate_joint_aura_entry
+        try:
+            if dict(measured_runtime_table.fixed_assignment) != fixed_format_assignment:
+                raise ValueError("measured table fixed auxiliary assignment differs "
+                                 "from allocator fixed formats/source visual overrides")
+            expected_bindings = {}
+            for unit, options in sorted(candidates.items()):
+                for option in options:
+                    if option.serialized_sidecar_identity is not None:
+                        raise ValueError("measured runtime search requires additive serialized "
+                                         "candidate bytes; shared candidate sidecars are unsupported")
+                    members = expand_fused_sibling_assignment(
+                        expand_packed_group_assignment({unit: option.fmt}, stats), stats)
+                    measured_option_assignments[(unit, option.fmt)] = members
+                    identities = {}
+                    shapes = {}
+                    for name, fmt in members.items():
+                        row = cost_data["costs"].get(name, {}).get(fmt, {})
+                        digest = row.get("joint_operator_identity_sha256")
+                        if not validate_joint_aura_entry(row) or not digest:
+                            raise ValueError(f"{name}:{fmt}: measured runtime requires "
+                                             "an identity-bound joint AURA cost row")
+                        probe_identity = row["probe_identity"]
+                        if (probe_identity["calibration_sha256"] != measured_runtime_table.context.calibration_sha256
+                                or probe_identity["source_model"]["content_sha256"] != measured_runtime_table.context.source_sha256):
+                            raise ValueError(f"{name}:{fmt}: measured runtime source/calibration "
+                                             "differs from the joint AURA evidence")
+                        identities[name] = digest
+                        entry = _stats_entry_for_assignment_name(name)
+                        if entry is None:
+                            raise ValueError(f"{name}: measured runtime has no independent shape")
+                        shapes[name] = _shape_from_stats(entry)
+                        if tuple(row["joint_operator_identity"]["source_weight"]["shape"]) != shapes[name]:
+                            raise ValueError(f"{name}:{fmt}: joint AURA shape differs from probe stats")
+                    expected_bindings[(unit, option.fmt)] = RuntimeBinding(
+                        member_formats=members,
+                        member_operator_identity_sha256=identities,
+                        member_shapes=shapes,
+                        operator_route=measured_runtime_table.context.operator_route(unit, option.fmt),
+                    )
+            measured_runtime_resources = build_runtime_resources(
+                measured_runtime_table,
+                {unit: [replace(option, member_formats=measured_option_assignments[(unit, option.fmt)])
+                        for option in options] for unit, options in candidates.items()},
+                expected_bindings=expected_bindings)
+        except (ValueError, KeyError) as exc:
+            raise SystemExit(f"[alloc] ERROR: measured runtime: {exc}") from None
+
+    _serve_lane_cache: dict[tuple, object] = {}
+
+    def _serve_lane_for(name: str, fmt: str):
+        """The concrete serving-lane route one assigned unit would ride (P5b).
+
+        Same resolution order as ``selection_serving_lane_provenance``: prefer
+        the ``Candidate`` the DP actually saw, and re-resolve from the target
+        profile for expanded members of aggregated super items, which have no
+        candidate of their own. The constraint axis prices the route actually
+        resolved for that serving context, including a declared fallback when
+        the requested fused route is unavailable.
+        """
+        for cand in candidates.get(name, ()):
+            if cand.fmt == fmt:
+                return cand.serving_lane
+        context = None if tessera_context_by_unit is None else tessera_context_by_unit.get(name)
+        key = (fmt, None if context is None else context.key())
+        if key not in _serve_lane_cache:
+            _serve_lane_cache[key] = serving_lane_route(
+                target_profile, fmt,
+                **({"serving_context": context} if context is not None else {}))
+        return _serve_lane_cache[key]
+
+    def _serve_feasibility(
+        expanded_assignment: Mapping[str, str],
+        *,
+        resident_bytes: int | None = None,
+    ):
+        """Policy §1's hard serving constraints for one expanded assignment.
+
+        Inactive context -> a stamp and ``feasible=True``; nothing downstream
+        changes. The stats view is the same three-map precedence the footprint
+        accounting uses, so a super-item-expanded name resolves to real
+        parameter counts (the aggregation is parameter-share weighted).
+        """
+        if measured_runtime_table is not None:
+            try:
+                return evaluate_measured_assignment(
+                    expanded_assignment,
+                    option_assignments=measured_option_assignments,
+                    resources=measured_runtime_resources,
+                    fixed_assignment=fixed_format_assignment,
+                    fixed_resources=measured_runtime_table.fixed_resources,
+                    slos=serve_slos,
+                    table_identity=measured_runtime_table.identity(),
+                )
+            except ServeConstraintError as exc:
+                raise SystemExit(f"[alloc] ERROR: measured runtime: {exc}") from None
+        return evaluate_serve_constraints(
+            expanded_assignment,
+            {**accounting_stats, **fixed_stats, **stats},
+            serve_context,
+            lane_for=_serve_lane_for,
+            resident_bytes=resident_bytes,
+        )
+
+    def _assignment_payload_totals(
+        assignment: Mapping[str, str],
+        *,
+        require_all_stats: bool,
+    ) -> dict[str, float | int | list[str]]:
+        """Exact assignment-scope tensor payload, including shared CB tables.
+
+        Candidate memory remains the additive DP proposal cost.  This function
+        is the non-additive exact filter/reporting path: CB tables are charged
+        once per physical identity and NVFP4 global scale tensors are included.
+        """
         total = 0.0
+        params = 0
+        cb_assignment: dict[str, str] = {}
+        cb_shapes: dict[str, tuple[int, ...]] = {}
+        missing: list[str] = []
         for name, fmt in assignment.items():
             entry = _stats_entry_for_assignment_name(name)
             if not isinstance(entry, dict):
+                missing.append(name)
+                continue
+            params += int(entry.get("n_params", 0) or 0)
+            if is_cb_format(fmt):
+                cb_assignment[name] = fmt
+                cb_shapes[name] = _shape_from_stats(entry)
+                continue
+            # Super-items (packed groups, fused siblings) carry exact
+            # per-format byte sums; their stats entries have no single
+            # (out, in) shape, so the shape fallback is only for plain rows.
+            memory_map = entry.get("_memory_bytes_by_format")
+            if isinstance(memory_map, dict) and fmt in memory_map:
+                total += 8.0 * memory_map[fmt]
+                if fmt == "NVFP4":
+                    total += 8.0 * nvfp4_global_sidecar_bytes(
+                        name,
+                        _shape_from_stats(entry),
+                        weight_only=bool(
+                            entry.get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)
+                        ),
+                    )
                 continue
             shape = _shape_from_stats(entry)
-            total += 8.0 * fr.get_format(fmt).memory_bytes_for_shape(shape)
-        return float(total)
+            payload_bytes, _identity, _sidecar_identity = serialized_candidate_payload(
+                fr.get_format(fmt),
+                shape,
+                qname=name,
+                cb_serialization_context=cb_serialization_context,
+            )
+            total += 8.0 * payload_bytes
+            if fmt == "NVFP4":
+                total += 8.0 * nvfp4_global_sidecar_bytes(
+                    name,
+                    shape,
+                    weight_only=bool(
+                        entry.get(NVFP4_WEIGHT_ONLY_STATS_KEY, False)
+                    ),
+                )
+        if missing and require_all_stats:
+            raise AssertionError(
+                "exact assignment payload has no shape/stats for "
+                f"{len(missing)} tensor(s): {sorted(missing)[:12]}"
+            )
+        cb_tensor_bits = 0.0
+        cb_sidecar_bits = 0.0
+        if cb_assignment:
+            if cb_serialization_context is None:
+                raise AssertionError(
+                    "CB assignment reached exact bit reporting without a "
+                    "CBSerializationContext"
+                )
+            payload = cb_assignment_payload_breakdown(
+                cb_assignment,
+                cb_shapes,
+                context=cb_serialization_context,
+            )
+            cb_tensor_bits = 8.0 * int(payload["tensor_payload_bytes"])
+            cb_sidecar_bits = 8.0 * int(payload["codebook_sidecar_bytes"])
+            total += cb_tensor_bits + cb_sidecar_bits
+        return {
+            "bits_total": float(total),
+            "quantizable_params": int(params),
+            "bits_per_param": float(total) / max(params, 1),
+            "cb_tensor_bits": float(cb_tensor_bits),
+            "cb_shared_sidecar_bits": float(cb_sidecar_bits),
+            "missing_stats_names": sorted(missing),
+        }
+
+    def _assignment_bits_total(assignment: dict[str, str]) -> float:
+        return float(_assignment_payload_totals(
+            assignment,
+            require_all_stats=True,
+        )["bits_total"])
+
+    _solve_cache: dict[float, tuple] = {}
+    # Solver diagnostics per target, kept beside the memo so a cache hit never
+    # loses them: an INFEASIBLE rung's only explanation lives here.
+    _solve_diagnostics: dict[float, dict] = {}
+
+    def _solve_for_target(target_bits: float):
+        """Solve additively, then exact-filter non-additive shared payloads.
+
+        Shared CB sidecars are assignment activation costs rather than legal
+        per-candidate additive costs.  The DP therefore proposes assignments;
+        every proposal is expanded and exact-priced, and an over-target result
+        tightens/re-solves.  This enforces feasibility but is deliberately not
+        advertised as a globally optimal mixed-sidecar solve.
+        """
+        cache_key = round(float(target_bits), 9)
+        cached = _solve_cache.get(cache_key)
+        if cached is None:
+            cached = _solve_for_target_uncached(target_bits)
+            _solve_cache[cache_key] = cached
+        assign, achieved_r, total, mutable_total = cached
+        if assign is not None:
+            assign = dict(assign)
+        return assign, achieved_r, total, mutable_total
+
+    def _solve_for_target_uncached(target_bits: float):
+        requested_target = float(target_bits)
+        mutable_target_bits = requested_target
+        if measured_runtime_table is not None:
+            from .allocator_solver import solve_runtime_frontier
+            fixed = measured_runtime_table.fixed_resources
+            fixed_device = (fixed.resident_bytes + fixed.activation_bytes
+                            + fixed.peak_scratch_bytes + fixed.kv_bytes
+                            + serve_slos.kv_bytes + serve_slos.peak_scratch_bytes)
+            max_prefill = serve_slos.p95_ttft_ms - fixed.prefill_ms
+            max_decode = None
+            if serve_slos.p95_itl_ms is not None:
+                if fixed.decode_ms is None:
+                    raise SystemExit("[alloc] ERROR: fixed runtime decode work is unpriced")
+                max_decode = serve_slos.p95_itl_ms - fixed.decode_ms
+            diag = {"solver_contract": "exact_discrete_runtime_frontier_then_expanded_assignment_check",
+                    "global_optimality_claimed": False, "solver_calls": 1,
+                    "exact_filter_trace": []}
+            _solve_diagnostics[round(requested_target, 9)] = diag
+            if (requested_target < 0 or max_prefill < 0
+                    or (max_decode is not None and max_decode < 0)):
+                diag["reason"] = "fixed_runtime_resources_exceed_budget"
+                return None, float("nan"), float("inf"), float("inf")
+            start = _time.perf_counter()
+            try:
+                frontier = solve_runtime_frontier(
+                    candidates, measured_runtime_resources,
+                    max_memory_bytes=math.floor(requested_target * mutable_total_params / 8),
+                    max_prefill_ms=max_prefill, max_decode_ms=max_decode,
+                    max_device_bytes=serve_slos.device_budget_bytes,
+                    fixed_device_bytes=fixed_device, diagnostics=diag)
+            except (ValueError, RuntimeError) as exc:
+                raise SystemExit(f"[alloc] ERROR: measured runtime search: {exc}") from None
+            diag["solver_seconds"] = _time.perf_counter() - start
+            for proposal in frontier:
+                raw_expanded = {}
+                for unit, fmt in proposal.assignment.items():
+                    raw_expanded.update(measured_option_assignments[(unit, fmt)])
+                raw_expanded.update(fixed_format_assignment)
+                expanded = _expand_assignment_for_seed_json(proposal.assignment)
+                if expanded != raw_expanded:
+                    raise SystemExit("[alloc] ERROR: serving promotion changed a measured "
+                                     "runtime proposal; aggregate coupled units and measure "
+                                     "their exact whole-operator options before selection")
+                exact = _assignment_payload_totals(
+                    {name: fmt for name, fmt in expanded.items()
+                     if name not in fixed_format_assignment}, require_all_stats=True)
+                achieved = float(exact["bits_per_param"])
+                verdict = _serve_feasibility(expanded)
+                feasible = achieved <= requested_target and verdict.feasible
+                diag["exact_filter_trace"].append({
+                    "exact_assignment_payload_bpp": achieved,
+                    "feasible": feasible, "serve_constraints": verdict.as_dict()})
+                if feasible:
+                    diag["achieved_bits"] = achieved
+                    return (dict(proposal.assignment), achieved,
+                            proposal.predicted_dloss, proposal.predicted_dloss)
+            diag["reason"] = "no_runtime_frontier_assignment_passed_exact_checks"
+            return None, float("nan"), float("inf"), float("inf")
+        if mutable_total_params <= 0:
+            if fixed_total_params > 0 and mutable_target_bits >= 0.0:
+                return {}, 0.0, 0.0, 0.0
+            return None, float("nan"), float("inf"), float("inf")
+        if mutable_target_bits < 0.0:
+            return None, float("nan"), float("inf"), float("inf")
+        outer_diag: dict = {
+            "solver_contract": (
+                "additive_candidate_proposal_then_exact_assignment_filter"
+            ),
+            "global_optimality_claimed": False,
+            "exact_filter_trace": [],
+        }
+        _solve_diagnostics[round(requested_target, 9)] = outer_diag
+        solver_seconds_total = 0.0
+        solver_calls = 0
+        for attempt in range(16):
+            proposal_diag: dict = {}
+            _solve_t0 = _time.perf_counter()
+            assign, solver_achieved = solve_with_promotion(
+                stats,
+                candidates,
+                mutable_target_bits,
+                format_specs,
+                format_rank,
+                args.bit_precision,
+                no_fused_promote=args.no_fused_promote,
+                overshoot_tolerance=args.overshoot_tolerance,
+                profile=model_profile,
+                diagnostics=proposal_diag,
+            )
+            # DP wall time, summed over the tightening retries this target
+            # needed. Stamped into the seed JSON so a continuous-menu run can
+            # be compared against a stock one without re-timing by hand.
+            solver_seconds_total += _time.perf_counter() - _solve_t0
+            solver_calls += 1
+            outer_diag["solver_seconds"] = solver_seconds_total
+            outer_diag["solver_calls"] = solver_calls
+            outer_diag.update({
+                key: value
+                for key, value in proposal_diag.items()
+                if key not in {"achieved_bits"}
+            })
+            if assign is None:
+                return None, float("nan"), float("inf"), float("inf")
+            expanded = _expand_assignment_for_seed_json(
+                assign,
+                include_auxiliary=False,
+            )
+            exact = _assignment_payload_totals(
+                expanded,
+                require_all_stats=True,
+            )
+            exact_achieved = float(exact["bits_per_param"])
+            outer_diag["exact_filter_trace"].append({
+                "attempt": attempt,
+                "proposal_target_bits": float(mutable_target_bits),
+                "solver_additive_candidate_bpp": float(solver_achieved),
+                "exact_assignment_payload_bpp": exact_achieved,
+                "cb_shared_sidecar_bits": float(
+                    exact["cb_shared_sidecar_bits"]
+                ),
+                "feasible": bool(
+                    exact_achieved
+                    <= requested_target + args.overshoot_tolerance
+                ),
+            })
+            if exact_achieved <= requested_target + args.overshoot_tolerance:
+                outer_diag["achieved_bits"] = exact_achieved
+                outer_diag["solver_additive_candidate_bpp"] = float(
+                    solver_achieved
+                )
+                outer_diag["exact_assignment_payload_bpp"] = exact_achieved
+                mutable_total = compute_assignment_predicted_dloss(
+                    assign, candidates
+                )
+                return assign, exact_achieved, mutable_total, mutable_total
+            overage = exact_achieved - requested_target
+            next_target = (
+                mutable_target_bits
+                - overage
+                - max(float(args.bit_precision), 1e-9)
+            )
+            if next_target >= mutable_target_bits or next_target < 0.0:
+                break
+            mutable_target_bits = next_target
+        outer_diag["feasible"] = False
+        outer_diag["reason"] = "exact_assignment_payload_filter_exhausted"
+        return None, float("nan"), float("inf"), float("inf")
+
+    def _cb_stamps_for_assignment(
+        assignment: Mapping[str, str],
+    ) -> dict[str, str]:
+        cb_names = {
+            name: fmt for name, fmt in assignment.items()
+            if is_cb_format(fmt)
+        }
+        if not cb_names:
+            return {}
+        if cb_serialization_context is None:
+            raise AssertionError(
+                "CB assignment reached stamp emission without a "
+                "CBSerializationContext"
+            )
+        shapes: dict[str, tuple[int, ...]] = {}
+        for name in cb_names:
+            entry = _stats_entry_for_assignment_name(name)
+            if not isinstance(entry, dict):
+                raise AssertionError(
+                    f"{name}: cannot stamp CB serialization identity without "
+                    "probe stats"
+                )
+            shapes[name] = _shape_from_stats(entry)
+        stamps = cb_assignment_serialization_stamps(
+            cb_names,
+            shapes,
+            context=cb_serialization_context,
+        )
+        # Candidate construction persisted the identity it priced. Assert the
+        # expanded assignment still agrees before a Pareto/KL/export consumer
+        # can mistake a promotion or stale aggregation record for exact bytes.
+        for name, fmt in cb_names.items():
+            entry = _stats_entry_for_assignment_name(name)
+            identities = (
+                entry.get("_serialized_identity_by_format")
+                if isinstance(entry, dict)
+                else None
+            )
+            if isinstance(identities, Mapping) and fmt in identities:
+                if str(identities[fmt]) != stamps[name]:
+                    raise AssertionError(
+                        f"{name}: selected {fmt} serialization identity "
+                        "differs from the candidate priced by the allocator"
+                    )
+        return stamps
+
+    def _cb_render_identity_for_assignment(
+        expanded_assignment: Mapping[str, str],
+    ) -> dict | None:
+        selected_scope = {
+            str(name): (str(fmt),)
+            for name, fmt in expanded_assignment.items()
+            if is_cb_format(fmt)
+        }
+        if not selected_scope:
+            return None
+        if cb_cost_render_identity is None or cb_col_weights is None:
+            if research_cost_provenance is not None:
+                # This absence is the exact production guard the explicit
+                # research-cost acceptance acknowledges. Do not fabricate a
+                # render identity; carry the research manifest instead so the
+                # exporter can demand its own independent acknowledgement.
+                return None
+            raise RuntimeError(
+                "CB assignment has no validated value-bearing cost render "
+                "identity"
+            )
+        return project_cb_render_identity(
+            cb_cost_render_identity,
+            selected_scope,
+            col_weights=cb_col_weights,
+            where="allocator selected CB assignment",
+        )
 
     pareto_seed_records: list[dict] = []
 
@@ -1903,7 +4094,7 @@ def main():
             "aux_fixed_predicted_dloss": fixed_total_dloss,
             "fixed_predicted_dloss": fixed_total_dloss,
             "total_predicted_dloss_with_aux": total_with_aux,
-            "aux_fixed_bits_total": fixed_total_bits,
+            "aux_fixed_assignment_payload_bits_total": fixed_total_bits,
             "aux_fixed_params": fixed_total_params,
             **{f"layers_{k}": v for k, v in format_counts.items()},
             **{f"params_{k}": v for k, v in format_params.items()},
@@ -1917,6 +4108,9 @@ def main():
             expanded_counts = defaultdict(int)
             for fmt in expanded.values():
                 expanded_counts[fmt] += 1
+            pareto_cb_render_identity = _cb_render_identity_for_assignment(
+                expanded
+            )
             pareto_seed_records.append({
                 "target_bits": float(t),
                 "achieved_bits": float(achieved),
@@ -1929,6 +4123,12 @@ def main():
                 "format_counts": dict(sorted(expanded_counts.items())),
                 "bits_total": _assignment_bits_total(budget_expanded),
                 "bits_total_with_aux": _assignment_bits_total(expanded),
+                CB_ASSIGNMENT_IDENTITIES_FIELD: _cb_stamps_for_assignment(
+                    expanded
+                ),
+                **({
+                    "cb_render_identity": pareto_cb_render_identity,
+                } if pareto_cb_render_identity is not None else {}),
             })
 
     # Coarse Kneedle, then golden-section refinement inside the knee bracket so
@@ -1962,6 +4162,9 @@ def main():
                     r_counts = defaultdict(int)
                     for fmt in r_exp.values():
                         r_counts[fmt] += 1
+                    refined_cb_render_identity = (
+                        _cb_render_identity_for_assignment(r_exp)
+                    )
                     pareto_seed_records.append({
                         "target_bits": float(refined["target_bits"]),
                         "achieved_bits": float(r_ach),
@@ -1974,6 +4177,12 @@ def main():
                         "format_counts": dict(sorted(r_counts.items())),
                         "bits_total": _assignment_bits_total(r_bud),
                         "bits_total_with_aux": _assignment_bits_total(r_exp),
+                        CB_ASSIGNMENT_IDENTITIES_FIELD: _cb_stamps_for_assignment(
+                            r_exp
+                        ),
+                        **({
+                            "cb_render_identity": refined_cb_render_identity,
+                        } if refined_cb_render_identity is not None else {}),
                         "knee_refined": True,
                     })
 
@@ -1995,6 +4204,171 @@ def main():
               f"(target={_r['target_bits']:.3f}, {_r['evals']} DP evals, "
               f"±{_r['tol_bits']}b)")
 
+    # --- deterministic tensor payload + conservative artifact bound --------
+    # The byte budget is the CONSTRAINT and measured KL is the OBJECTIVE, but
+    # `select_validated_frontier` cannot see the card: it reads only the
+    # per-point KL rows. Pricing each candidate here — through the SAME
+    # footprint.assignment_artifact_bytes the allocator's own byte-budget
+    # selector uses.  That function prices safetensors tensor-data spans, not
+    # a directory.  Under a whole-artifact budget we add the explicit operator
+    # reserve; the exporter later measures every regular file and hard-fails.
+    _footprint_ctx: dict[str, object] = {}
+
+    def _partition_source_total(_fp, src_total, src_manifest, *, where,
+                                assigned_names=()):
+        """Apply --exclude-source-prefix, or pass the total through.
+
+        Raises SystemExit (not ValueError) on a bad prefix ON PURPOSE: both
+        callers of the pricing scalars sit behind `except Exception` clauses
+        that degrade to "pricing unavailable", and a prefix that silently
+        excluded nothing is the exact failure this flag exists to prevent —
+        it under-fills the budget by the excluded mass and every downstream
+        number stays self-consistent. SystemExit is a BaseException, so it
+        passes through those clauses to the operator.
+        """
+        if not getattr(args, "exclude_source_prefix", None):
+            return int(src_total), None
+        try:
+            part = _fp.partitioned_source_total_bytes(
+                src_manifest, int(src_total), args.exclude_source_prefix,
+                context=where, assigned_names=assigned_names)
+        except ValueError as exc:
+            raise SystemExit(f"[alloc] ERROR: {exc}") from None
+        print(
+            f"[alloc] source partition ({where}): excluding "
+            f"{', '.join(part['excluded_prefixes'])} removes "
+            f"{part['n_excluded']} source tensors / "
+            f"{part['excluded_source_bytes'] / 1e9:.3f} GB; this artifact is "
+            f"priced against {part['source_total_bytes'] / 1e9:.3f} GB of "
+            f"{int(src_total) / 1e9:.3f} GB",
+            flush=True)
+        return int(part["source_total_bytes"]), part
+
+    def _footprint_scalars():
+        if _footprint_ctx or not probe_model_path:
+            return _footprint_ctx or None
+        from . import footprint as _fp
+        try:
+            src_total, src_by_dtype = _fp.source_checkpoint_bytes(probe_model_path)
+            src_manifest = _fp.source_tensor_bytes_manifest(
+                probe_model_path,
+                name_map=getattr(model_profile, "checkpoint_to_live_name", None),
+                expert_parent_for_projection=getattr(
+                    model_profile, "packed_expert_parent_for_projection", None),
+            )
+            priced_total, _part = _partition_source_total(
+                _fp, src_total, src_manifest,
+                where="pareto candidate footprint",
+                assigned_names={**accounting_stats, **fixed_stats, **stats})
+            _footprint_ctx.update({
+                "fp": _fp,
+                "source_total_bytes": priced_total,
+                "regime": _fp.source_regime(src_by_dtype),
+                "source_manifest": src_manifest,
+                "stats": {**accounting_stats, **fixed_stats, **stats},
+            })
+        except Exception as exc:  # pricing is additive; never break allocation
+            print(f"[alloc] WARNING: Pareto footprint pricing unavailable: {exc}",
+                  flush=True)
+            return None
+        return _footprint_ctx
+
+    def _artifact_size_for(expanded_assignment):
+        ctx = _footprint_scalars()
+        if not ctx:
+            return None
+        try:
+            info = ctx["fp"].assignment_artifact_bytes(
+                expanded_assignment, ctx["stats"],
+                source_total_bytes=ctx["source_total_bytes"],
+                source_manifest=ctx["source_manifest"],
+                regime=ctx["regime"],
+                context="pareto candidate footprint",
+                cb_serialization_context=cb_serialization_context,
+            )
+            if info["n_missing_stats"]:
+                sample = ", ".join(info["missing_stats_names"][:10])
+                raise ValueError(
+                    f"{info['n_missing_stats']} assigned Linear(s) have no "
+                    f"shape stats and cannot receive an exact artifact price: "
+                    f"{sample}"
+                )
+            tensor_payload_bytes = int(info["artifact_payload_bytes"])
+            reserve_bytes = int(args.artifact_overhead_reserve_bytes or 0)
+            return {
+                "artifact_tensor_payload_bytes": tensor_payload_bytes,
+                "artifact_tensor_payload_scope": info["artifact_byte_scope"],
+                **({
+                    "whole_artifact_upper_bound_bytes": (
+                        tensor_payload_bytes + reserve_bytes
+                    ),
+                    "artifact_bytes": tensor_payload_bytes + reserve_bytes,
+                    "artifact_byte_scope": (
+                        "selection_upper_bound_tensor_payload_plus_"
+                        "operator_non_tensor_reserve"
+                    ),
+                } if args.target_disk_gb is not None else {}),
+            }
+        except Exception as exc:
+            if args.target_disk_gb is not None:
+                raise SystemExit(
+                    "[alloc] ERROR: exact Pareto artifact pricing failed "
+                    f"under --target-disk-gb: {exc}"
+                ) from None
+            print(f"[alloc] WARNING: could not price a Pareto candidate: {exc}",
+                  flush=True)
+            return None
+
+    if args.pareto_output_dir:
+        for record in pareto_seed_records:
+            sized = _artifact_size_for(record["assignment"])
+            if sized is not None:
+                record.update(sized)
+
+        # Collapse the Pareto set to the rungs that can actually ship. On an
+        # 11-rung sweep under a card, 8 of those rungs are decided before a
+        # single KL is measured — the narrowing is what makes byte-budget
+        # selection ~3 KL evals instead of 11. Computed from the priced grid,
+        # never hardcoded, and skipped (loudly) when pricing is unavailable.
+        if args.target_disk_gb is not None and pareto_seed_records:
+            from . import footprint as _fp_gb
+            budget_bytes_pareto = int(
+                math.floor(float(args.target_disk_gb) * _fp_gb.GB)
+            )
+            priced = [r for r in pareto_seed_records
+                      if r.get("whole_artifact_upper_bound_bytes") is not None]
+            if len(priced) != len(pareto_seed_records):
+                print("[alloc] WARNING: byte-budget Pareto narrowing skipped — "
+                      f"{len(pareto_seed_records) - len(priced)} of "
+                      f"{len(pareto_seed_records)} candidates could not be "
+                      "priced; measuring the full sweep", flush=True)
+            else:
+                ordered = sorted(pareto_seed_records,
+                                 key=lambda r: r["whole_artifact_upper_bound_bytes"])
+                fits = [i for i, r in enumerate(ordered)
+                        if r["whole_artifact_upper_bound_bytes"] <= budget_bytes_pareto]
+                if fits:
+                    top = fits[-1]
+                    keep_positions = {max(0, top - 1), top,
+                                      min(len(ordered) - 1, top + 1)}
+                    reason = (
+                        f"largest fitting rung achieved="
+                        f"{ordered[top]['achieved_bits']:.3f} bpp at "
+                        f"{ordered[top]['whole_artifact_upper_bound_bytes'] / _fp_gb.GB:.3f}GB "
+                        "selection upper bound")
+                else:
+                    keep_positions = set(range(min(2, len(ordered))))
+                    reason = ("NOTHING fits the card; keeping the cheapest "
+                              "rungs so the measurement shows the shortfall")
+                keep = {id(ordered[i]) for i in sorted(keep_positions)}
+                before = len(pareto_seed_records)
+                pareto_seed_records = [r for r in pareto_seed_records
+                                       if id(r) in keep]
+                print(f"[alloc] byte-budget Pareto narrowing: {before} -> "
+                      f"{len(pareto_seed_records)} rungs "
+                      f"(card={args.target_disk_gb:.2f}GB; {reason})",
+                      flush=True)
+
     if args.pareto_output_dir:
         out_dir = Path(args.pareto_output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2012,8 +4386,31 @@ def main():
                 f"_achieved_{record['achieved_bits']:.4f}_{digest}"
             ).replace(".", "p")
             path = out_dir / f"{label}.json"
+            record_budget_stamp = None
+            if args.target_disk_gb is not None:
+                record_budget_bytes = int(math.floor(
+                    float(args.target_disk_gb) * 1_000_000_000.0
+                ))
+                upper = record.get("whole_artifact_upper_bound_bytes")
+                payload_bytes = record.get("artifact_tensor_payload_bytes")
+                if (
+                    isinstance(upper, int)
+                    and isinstance(payload_bytes, int)
+                    and upper <= record_budget_bytes
+                ):
+                    record_budget_stamp = whole_artifact_budget_stamp(
+                        budget_bytes=record_budget_bytes,
+                        selection_tensor_payload_bytes=payload_bytes,
+                        selection_non_tensor_reserve_bytes=int(
+                            args.artifact_overhead_reserve_bytes
+                        ),
+                        selection_assignment=assignment,
+                        excluded_source_prefixes=(
+                            getattr(args, "exclude_source_prefix", None) or ()
+                        ),
+                    )
             payload = {
-                "schema": "prismaquant.allocator.pareto_assignment.v1",
+                "schema": "prismaquant.allocator.pareto_assignment.v2",
                 "label": label,
                 "source": "allocator_pareto",
                 "target_bits": float(record["target_bits"]),
@@ -2025,7 +4422,48 @@ def main():
                     record["total_predicted_dloss_with_aux"]
                 ),
                 "format_counts": record["format_counts"],
+                "artifact_bytes": record.get("artifact_bytes"),
+                "artifact_byte_scope": record.get("artifact_byte_scope"),
+                "artifact_tensor_payload_bytes": record.get(
+                    "artifact_tensor_payload_bytes"
+                ),
+                "artifact_tensor_payload_scope": record.get(
+                    "artifact_tensor_payload_scope"
+                ),
+                "whole_artifact_upper_bound_bytes": record.get(
+                    "whole_artifact_upper_bound_bytes"
+                ),
+                "target_profile": target_profile,
                 "assignment": dict(sorted(assignment.items())),
+                # Two independent facts, so two independent guards. A CB
+                # assignment always carries per-tensor serialized identities,
+                # but it carries a render identity only when the cost table had
+                # a validated one to project from: under
+                # ``--accept-research-cost-table``
+                # ``_cb_render_identity_for_assignment`` deliberately returns
+                # None rather than fabricate one (see its comment), and
+                # ``cb_cost_render_identity`` is never assigned on that path at
+                # all. Gating the render-identity fields on the *identities*
+                # field therefore KeyErrors on every research-cost run that
+                # writes a Pareto point with any CB format. The final-assignment
+                # writer already guards on the render identity itself; this
+                # makes the Pareto writer agree with it.
+                **({
+                    CB_ASSIGNMENT_IDENTITIES_FIELD: dict(sorted(
+                        record.get(CB_ASSIGNMENT_IDENTITIES_FIELD, {}).items()
+                    )),
+                } if record.get(CB_ASSIGNMENT_IDENTITIES_FIELD) else {}),
+                **({
+                    "cb_serialized_payload": record[
+                        "cb_render_identity"
+                    ]["cb_serialized_payload"],
+                    "cb_render_identity": record["cb_render_identity"],
+                } if record.get("cb_render_identity") is not None else {}),
+                **({
+                    "whole_artifact_budget": record_budget_stamp,
+                } if record_budget_stamp is not None else {}),
+                **({"serve_constraints": _serve_feasibility(assignment).as_dict()}
+                   if measured_runtime_table is not None else {}),
             }
             path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
             manifest_rows.append({
@@ -2045,12 +4483,27 @@ def main():
                 ),
                 "fixed_predicted_dloss": float(record["fixed_predicted_dloss"]),
                 "format_counts": record["format_counts"],
+                "artifact_bytes": record.get("artifact_bytes"),
+                "artifact_byte_scope": record.get("artifact_byte_scope"),
+                "artifact_tensor_payload_bytes": record.get(
+                    "artifact_tensor_payload_bytes"
+                ),
+                "whole_artifact_upper_bound_bytes": record.get(
+                    "whole_artifact_upper_bound_bytes"
+                ),
             })
         (out_dir / "manifest.json").write_text(json.dumps({
             "schema": "prismaquant.allocator.pareto_manifest.v1",
             "probe": str(args.probe),
             "costs": str(args.costs),
-            "propagated_sensitivity_costs": propagated_sensitivity_summary,
+            "target_profile": target_profile,
+            "target_disk_gb": (float(args.target_disk_gb)
+                               if args.target_disk_gb is not None else None),
+            "artifact_overhead_reserve_bytes": (
+                int(args.artifact_overhead_reserve_bytes)
+                if args.artifact_overhead_reserve_bytes is not None
+                else None
+            ),
             "formats": [s.name for s in specs_sorted],
             "target_bits": [float(x) for x in targets],
             "knees": knee_summary,
@@ -2098,13 +4551,18 @@ def main():
         print(f"  {row['target_bits']:>6.3f}  {row['achieved_bits']:>7.3f}  "
               f"{dloss_str:>20}   {fmt_str}")
 
-    # ----- Byte-budget ("fit the card") ship-bpp selection -----
+    # ----- Whole-artifact budget ("fit the card") ship-bpp selection -----
     # When --target-disk-gb is given, the ship bpp is set by the card, not by
-    # --target-bits: pick the highest-bpp allocation whose EXACT exported
-    # footprint fits the budget (the RD curve is log-linear, so there is no
-    # intrinsic knee to find — see rd_curve diagnostic). This is a selector over
-    # Pareto candidates with an exact, measurement-free byte objective, then a
-    # bisection of the same sub-second DP between grid rungs for an exact fit.
+    # --target-bits: the card supplies the CONSTRAINT.  Selection uses a
+    # conservative upper bound (exact tensor spans + required non-tensor
+    # reserve); final export stats the whole directory and fails closed. The RD
+    # curve is log-linear, so there is no intrinsic knee to
+    # find — see rd_curve diagnostic) and predicted Δloss supplies the
+    # OBJECTIVE (minimize it among the allocations that fit). This is a
+    # selector over Pareto candidates whose feasibility test needs no
+    # measurement, then a bisection of the same sub-second DP between grid
+    # rungs to search denser fitting allocations.
+    selected_whole_artifact_budget_stamp = None
     if args.target_disk_gb is not None:
         from . import footprint as _fp
         from .saturation_select import select_under_byte_budget
@@ -2113,7 +4571,12 @@ def main():
                 "[alloc] --target-disk-gb needs the source model path (probe "
                 "meta.model or --model-override) to size the non-quantizable "
                 "floor (lm_head/embed/norms).")
-        budget_bytes = float(args.target_disk_gb) * _fp.GB
+        # What the ratchet optimizes, recorded in selection.json: the shipped
+        # objective must be recoverable from the artifact, not inferred from
+        # the code version that produced it.
+        _RATCHET_OBJECTIVE = "min_predicted_dloss__ties_to_larger_footprint"
+        budget_bytes = int(math.floor(float(args.target_disk_gb) * _fp.GB))
+        overhead_reserve_bytes = int(args.artifact_overhead_reserve_bytes)
         src_total, src_by_dtype = _fp.source_checkpoint_bytes(probe_model_path)
         regime = _fp.source_regime(src_by_dtype)  # recorded for reporting only
         # Per-tensor source-byte manifest: each re-encoded Linear is charged
@@ -2122,39 +4585,102 @@ def main():
         # DSv4-Flash checkpoint: I8 nibble experts + E8M0 scales, F8
         # attention, BF16 floor) the old regime accounting removed more
         # bytes than the checkpoint holds, driving the floor negative.
+        # `expert_parent_for_projection` bridges the per-expert-on-disk /
+        # packed-live MoE layouts (…experts.{i}.gate_proj -> the packed
+        # …experts.gate_up_proj the allocator names), same mapping the
+        # layer-streaming pack bridge uses.
         src_manifest = _fp.source_tensor_bytes_manifest(
             probe_model_path,
             name_map=getattr(model_profile, "checkpoint_to_live_name", None),
+            expert_parent_for_projection=getattr(
+                model_profile, "packed_expert_parent_for_projection", None),
         )
-        manifest_missing: set[str] = set()
+        # Must apply the SAME partition the Pareto sweep priced against, or
+        # the narrowing pass and the ratchet would disagree about which rungs
+        # fit the card.
+        src_total_full = int(src_total)
+        src_total, source_partition = _partition_source_total(
+            _fp, src_total, src_manifest, where="byte-budget selection",
+            assigned_names={**accounting_stats, **fixed_stats, **stats})
+
+        # Stats view for the footprint accounting: the same three-map
+        # precedence `_stats_entry_for_assignment_name` uses (aggregated DP
+        # stats > fixed MTP/visual > pre-aggregation accounting stats), so
+        # every name in an EXPANDED assignment resolves and the shared
+        # function prices exactly the tensors the inlined copy did.
+        _footprint_stats = {**accounting_stats, **fixed_stats, **stats}
 
         def _artifact_for_target(t: float):
             assign_t, ach_t, tot_t, _mut = _solve_for_target(t)
             if assign_t is None:
                 return None
             expanded_t = _expand_assignment_for_seed_json(assign_t)
-            body_aux = _assignment_bits_total(expanded_t) / 8.0
-            reenc_by_name: dict[str, int] = {}
-            for n in expanded_t:
-                nb = src_manifest.get(n)
-                if nb is None and n.endswith(".weight"):
-                    nb = src_manifest.get(n[: -len(".weight")])
-                if nb is None:
-                    # Not resolvable in the checkpoint headers: leave the
-                    # tensor priced in the floor (conservative — the artifact
-                    # estimate can only over-count, never under-count) and
-                    # report it loudly after the grid pass.
-                    manifest_missing.add(n)
-                    continue
-                reenc_by_name[n] = int(nb)
-            floor = float(src_total) - sum(reenc_by_name.values())
-            _fp.check_floor_non_negative(
-                floor, float(src_total), reenc_by_name,
-                context=f"byte-budget selector (target_bits={t:.3f})")
+            ctx = f"byte-budget selector (target_bits={t:.3f})"
+            # ONE accounting path: footprint.assignment_artifact_bytes owns
+            # the manifest -> resolve -> check-non-negative -> floor sequence
+            # (shared with floor_bytes_for_model, whose exact agreement the
+            # footprint tests pin) plus the body-byte sum. Inlining a third
+            # copy here meant the shipped selector was the one path that
+            # agreement was never tested against.
+            #
+            # Both failure modes are hard errors raised BEFORE any selection
+            # number is consumed: a re-encoded name the manifest cannot
+            # resolve (its source bytes stay in the floor while its quantized
+            # bytes are still added — on a packed-MoE model the whole expert
+            # mass, after which every rung reads "below the floor"), and two
+            # names resolving to the same source span (bytes removed twice, so
+            # an over-budget artifact reads as fitting).
+            try:
+                info = _fp.assignment_artifact_bytes(
+                    expanded_t, _footprint_stats,
+                    source_total_bytes=int(src_total),
+                    source_manifest=src_manifest,
+                    regime=regime,
+                    context=ctx,
+                    cb_serialization_context=cb_serialization_context,
+                )
+            except ValueError as exc:
+                # House idiom for an operator-facing fatal in main(): a
+                # SystemExit line, not a raw traceback. The footprint
+                # messages already name the offending tensors.
+                raise SystemExit(f"[alloc] ERROR: {exc}") from None
+            # A name with no stats entry is priced at source precision by
+            # assignment_artifact_bytes (left in the floor, no body bytes) —
+            # correct for a verbatim tensor, but for a name the DP actually
+            # allocated it silently under-counts the body. It also breaks the
+            # provable byte-for-byte identity with the inlined accounting this
+            # replaced (which subtracted every expanded name from the floor).
+            # Any such name is an allocator/probe bug, so refuse rather than
+            # ship a number that no longer means what the label says.
+            if info["n_missing_stats"]:
+                sample = ", ".join(info["missing_stats_names"][:10])
+                raise SystemExit(
+                    f"[alloc] ERROR: {info['n_missing_stats']} allocated "
+                    f"Linear(s) have no probe stats entry, so their exported "
+                    f"bytes cannot be priced ({ctx}): {sample}"
+                    + (", …" if info["n_missing_stats"] > 10 else "")
+                    + ". The byte-budget selector would price them at source "
+                    "precision and under-count the artifact. Fix the probe / "
+                    "expansion so every allocated name carries stats.")
+            # The SECOND hard axis (ultraplan P5c), evaluated on the same
+            # exact expanded assignment the byte axis just priced — after
+            # super-item expansion and serving-unit promotion, so the verdict
+            # is about the assignment that would actually ship. Resident bytes
+            # are the exact serialized tensor payload (assumption A6).
+            serve = _serve_feasibility(
+                expanded_t,
+                resident_bytes=int(info["artifact_payload_bytes"]),
+            )
             return {
                 "target_bits": float(t), "achieved_bits": float(ach_t),
                 "bpp": float(ach_t), "dloss": float(tot_t),
-                "disk_bytes": floor + body_aux, "floor_bytes": floor,
+                "assignment": expanded_t,
+                "tensor_payload_bytes": int(info["artifact_payload_bytes"]),
+                "whole_artifact_upper_bound_bytes": int(
+                    info["artifact_payload_bytes"]
+                ) + overhead_reserve_bytes,
+                "floor_bytes": float(info["floor_bytes"]),
+                "serve": serve,
             }
 
         grid = []
@@ -2164,128 +4690,665 @@ def main():
             r = _artifact_for_target(float(row["target_bits"]))
             if r is not None:
                 grid.append(r)
-        if manifest_missing:
-            print(
-                "[alloc] WARNING: "
-                f"{len(manifest_missing)} re-encoded Linears not found in the "
-                "source checkpoint manifest; their source bytes stay in the "
-                "floor (artifact size over-counted, never under-counted). "
-                f"Sample: {sorted(manifest_missing)[:8]}",
-                flush=True,
-            )
-        sel = select_under_byte_budget(grid, budget_bytes)
+
+        def _menu_floor_target_bits() -> float | None:
+            """Exact bpp of the cheapest allocation this run's MENU can reach.
+
+            Every DP unit takes its own cheapest candidate; the proposal is
+            expanded and priced through the same exact accountant
+            ``_solve_for_target`` filters against, so the returned bpp is a
+            target the solver can actually land on (an epsilon-below value
+            like the format's nominal rate is NOT: per-shape row scales and
+            the shared CB sidecar push the achievable mean a hair above it,
+            and the rung comes back INFEASIBLE).
+
+            ``None`` when a unit has no candidate at all or the proposal
+            cannot be priced — both are upstream legality/coverage bugs that
+            their own gates report; this probe stays silent about them.
+            """
+            cheapest_fmt: dict[str, str] = {}
+            for cand_name, cand_list in candidates.items():
+                if not cand_list:
+                    return None
+                cheapest_fmt[cand_name] = min(
+                    cand_list, key=lambda c: (c.memory_bytes, c.fmt)).fmt
+            try:
+                expanded_floor = _expand_assignment_for_seed_json(
+                    cheapest_fmt, include_auxiliary=False)
+                totals = _assignment_payload_totals(
+                    expanded_floor, require_all_stats=True)
+            except Exception:
+                return None
+            floor_bits = float(totals["bits_per_param"])
+            if not math.isfinite(floor_bits) or floor_bits <= 0.0:
+                return None
+            return floor_bits
+
+        def _extend_grid_to_menu_floor() -> dict:
+            """Probe below the swept grid before calling a budget infeasible.
+
+            The Pareto grid is a COARSE SAMPLE of the RD curve, but the
+            byte-budget selector reads its cheapest point as "the cheapest
+            allocation". That reading holds only while the grid actually
+            reaches the bottom of the format menu, and ``--pareto-targets``
+            defaults to 4.5..8.25 — a range written for a 4-bit/8-bit menu.
+            On the CB menu (NVFP4-CB is ~2.03 bpp) every sampled point is
+            more than twice as dense as the operator's budget, so a budget
+            the menu can meet with room to spare is rejected as "below the
+            floor" and the remedy printed with it ("raise the budget, widen
+            the menu") is exactly backwards. Measured on DeepSeek-V4-Flash:
+            a 92.0 GB budget whose menu floor is 87.2 GB was reported
+            infeasible against a "cheapest allocation" of 172.4 GB, which is
+            simply the 4.5 bpp rung.
+
+            This runs ONLY after the swept grid has already failed, so a run
+            that selects today keeps its exact grid, ratchet and selection.
+            A run that would have died gets the rungs it was missing, and a
+            budget genuinely below the menu floor gets a truthful floor in
+            the error instead of an artifact of where the sweep happened to
+            start.
+            """
+            record: dict = {
+                "swept_min_target_bits": (min(targets) if targets else None),
+                "menu_floor_target_bits": None,
+                "added_targets": [],
+                "infeasible_targets": [],
+                "reason": None,
+            }
+            floor_bits = _menu_floor_target_bits()
+            record["menu_floor_target_bits"] = floor_bits
+            if floor_bits is None:
+                record["reason"] = "menu_floor_not_priceable"
+                return record
+            swept_min = record["swept_min_target_bits"]
+            if swept_min is None or float(swept_min) <= floor_bits + 1e-9:
+                record["reason"] = "swept_grid_already_reaches_menu_floor"
+                return record
+            record["reason"] = "swept_grid_min_target_above_menu_floor"
+            # Geometric fill: densest sampling at the floor, where a budget
+            # that the sweep missed by this much almost always sits.
+            n_fill = 8
+            ratio = (float(swept_min) / floor_bits) ** (1.0 / n_fill)
+            for step in range(n_fill):
+                probe_t = floor_bits * (ratio ** step)
+                probe = _artifact_for_target(float(probe_t))
+                if probe is None:
+                    record["infeasible_targets"].append(float(probe_t))
+                    continue
+                grid.append(probe)
+                record["added_targets"].append(float(probe_t))
+            grid.sort(key=lambda c: float(c["target_bits"]))
+            return record
+
+        # select_under_byte_budget is used here as the FEASIBILITY gate
+        # (feasible / below_floor / rejected_next). Its own `chosen` is the
+        # largest-footprint fitting candidate, which is deliberately NOT the
+        # ship pick — see the objective note below; it is recorded as
+        # `max_bytes_pick_*` so the two objectives stay comparable in the
+        # artifact.
+        sel = select_under_byte_budget(
+            grid,
+            budget_bytes,
+            bytes_key="whole_artifact_upper_bound_bytes",
+        )
+        grid_extension: dict | None = None
+        if not sel["feasible"]:
+            grid_extension = _extend_grid_to_menu_floor()
+            if grid_extension["added_targets"]:
+                print(
+                    "[alloc] byte-budget: the swept Pareto grid bottoms out "
+                    f"at {grid_extension['swept_min_target_bits']:.4f} bpp, "
+                    "above this menu's cheapest allocation "
+                    f"({grid_extension['menu_floor_target_bits']:.4f} bpp) — "
+                    f"probing {len(grid_extension['added_targets'])} rung(s) "
+                    "below the sweep so 'the cheapest allocation' means the "
+                    "cheapest the MENU can reach, not the cheapest that was "
+                    "sampled. Pass --pareto-targets covering the menu to see "
+                    "these rungs on the Pareto curve too.",
+                    flush=True,
+                )
+                sel = select_under_byte_budget(
+                    grid,
+                    budget_bytes,
+                    bytes_key="whole_artifact_upper_bound_bytes",
+                )
 
         rd = knee_summary.get("rd_curve") if isinstance(knee_summary, dict) else None
         selection = {
-            "schema": "prismaquant.allocator.byte_budget_selection.v1",
+            "schema": "prismaquant.allocator.byte_budget_selection.v3",
             "mode": "byte-budget",
             "target_disk_gb": float(args.target_disk_gb),
             "budget_bytes": budget_bytes,
+            "artifact_overhead_reserve_bytes": overhead_reserve_bytes,
             "source_total_bytes": float(src_total),
             "source_regime": regime,
             "source_accounting": "per_tensor_manifest_v2",
-            "manifest_missing_linears": len(manifest_missing),
+            # Present only when --exclude-source-prefix partitioned the ship.
+            # Without it `source_total_bytes` above would not reconcile with
+            # the checkpoint on disk and a later reader would have no way to
+            # tell a partitioned artifact from a mis-measured one.
+            **({
+                "source_partition": {
+                    "excluded_prefixes": list(
+                        source_partition["excluded_prefixes"]),
+                    "excluded_source_bytes": int(
+                        source_partition["excluded_source_bytes"]),
+                    "n_excluded_source_tensors": int(
+                        source_partition["n_excluded"]),
+                    "source_total_bytes_unpartitioned": src_total_full,
+                    "rationale": (
+                        "tensors under these prefixes ship as a separate "
+                        "artifact and are absent from this one"
+                    ),
+                },
+            } if source_partition else {}),
+            "footprint_path": "footprint.assignment_artifact_bytes",
             "source_bytes_per_param": int(
                 _fp.dominant_source_bytes_per_param(src_by_dtype)),
+            "selection_feasibility_test": (
+                "exact_tensor_payload_bytes + operator_non_tensor_reserve_bytes "
+                "<= whole_artifact_budget_bytes"
+            ),
+            "final_feasibility_test": (
+                "stat_all_regular_files_recursive <= whole_artifact_budget_bytes"
+            ),
+            "feasibility_test": (
+                "selection_whole_artifact_upper_bound_bytes <= budget_bytes; "
+                "final_recursive_inventory_fail_closed"
+            ),
+            "ratchet_objective": _RATCHET_OBJECTIVE,
             "feasible": bool(sel["feasible"]),
             "below_floor": bool(sel["below_floor"]),
-            "lm_head_unpinned": bool(allow_pinned),
+            "lm_head_unpinned": bool(lm_head_dp_unpinned),
+            "lm_head_format": lm_head_format_canonical,
+            "lm_head_mode": (
+                "dp" if lm_head_dp_unpinned
+                else "fixed" if fixed_lm_head_quantized
+                else "profile_pinned_bf16"
+            ),
+            # Present only when the swept grid failed and rungs below it were
+            # probed; ``menu_floor_target_bits`` is what "the cheapest
+            # allocation" is measured against from here on.
+            "pareto_grid_extension": grid_extension,
             "rd_curve": rd,
             "grid": [
                 {"target_bits": c["target_bits"],
                  "achieved_bits": c["achieved_bits"],
-                 "disk_gb": c["disk_bytes"] / _fp.GB, "dloss": c["dloss"],
-                 "fits": c["disk_bytes"] <= budget_bytes}
+                 "tensor_payload_gb": c["tensor_payload_bytes"] / _fp.GB,
+                 "whole_artifact_upper_bound_gb": (
+                     c["whole_artifact_upper_bound_bytes"] / _fp.GB
+                 ),
+                 "dloss": c["dloss"],
+                 "fits": c["whole_artifact_upper_bound_bytes"] <= budget_bytes}
                 for c in grid
             ],
+            **propagated_cost_provenance(research_cost_provenance),
         }
         sel_path = Path(args.pareto_csv).with_name("selection.json")
         if not sel["feasible"]:
             cheapest = sel.get("rejected_next") or (grid[0] if grid else None)
-            cheapest_gb = (cheapest["disk_bytes"] / _fp.GB) if cheapest else float("nan")
-            selection["cheapest_artifact_gb"] = cheapest_gb
+            cheapest_gb = (
+                cheapest["whole_artifact_upper_bound_bytes"] / _fp.GB
+                if cheapest else float("nan")
+            )
+            selection["cheapest_whole_artifact_upper_bound_gb"] = cheapest_gb
             sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
+            # The floor probe already ran (above), so this number is the
+            # menu's floor and not the sweep's — EXCEPT when the probe itself
+            # could not be priced or came back INFEASIBLE, which is the one
+            # case where "cheapest" may still be an artifact of the sweep.
+            # Say so rather than let the operator read a sampling boundary as
+            # a property of the model.
+            floor_caveat = ""
+            if grid_extension is not None and not grid_extension["added_targets"]:
+                if grid_extension["reason"] == "menu_floor_not_priceable":
+                    floor_caveat = (
+                        " NOTE: the menu's own cheapest allocation could not "
+                        "be priced, so this figure is the cheapest SAMPLED "
+                        "rung; widen --pareto-targets before trusting it as "
+                        "a floor.")
+                elif grid_extension["infeasible_targets"]:
+                    floor_caveat = (
+                        " NOTE: rungs below the sweep were probed down to "
+                        f"{grid_extension['menu_floor_target_bits']:.4f} bpp "
+                        "and the solver could not land any of them, so this "
+                        "figure is the cheapest SAMPLED rung.")
             raise SystemExit(
                 f"[alloc] --target-disk-gb={args.target_disk_gb:.3f} is below the "
                 f"floor: the cheapest allocation is {cheapest_gb:.3f}GB. Raise the "
-                f"budget, unpin lm_head (--allow-pinned lm_head), or widen the "
-                f"format menu. Selection written to {sel_path}.")
+                "budget, fix lm_head to a smaller measured format "
+                "(--lm-head-format FP8_E4M3), unpin it for a research DP "
+                "(--allow-pinned lm_head), or widen the format menu. "
+                f"Selection written to {sel_path}." + floor_caveat)
 
-        # Pick the largest-footprint allocation that fits, by RATCHETING the
-        # sub-second DP from the grid pick up to a near-lossless cap (all the
-        # most-expensive format). The ratchet (accept a probe only when it fits
-        # AND is no smaller than the best fit so far, seeded at the grid pick)
-        # guarantees we never ship below the grid pick the selector already
-        # proved feasible — robust to the DP/serving-unit-promotion making
-        # disk(target) non-monotone — and the cap lets it bisect ABOVE the
-        # densest grid rung to actually fill a roomy card (not just snap to the
-        # grid ceiling). chosen always satisfies disk <= budget by construction.
-        search_hi = float(max(int(s.weight_bits) for s in specs_sorted)) + 1.0
+        # Among allocations whose conservative selection upper bound fits the
+        # card, ship the
+        # one with the LOWEST predicted Δloss — ties broken toward the larger
+        # footprint (spend the budget only when it costs nothing in predicted
+        # quality). "Fill the card" was a proxy for that, valid only while
+        # more bytes implied lower Δloss; it does not (5.5 bpp has beaten 6.0
+        # bpp on served PPL, and serving-unit promotion can flip a group into
+        # a denser-but-worse format), so ratcheting on MAX bytes could
+        # actively select a denser artifact with WORSE predicted Δloss than a
+        # sparser one that also fits. Same objective and same tie-break the
+        # solver's own feasible-iterate ratchet uses (solve_with_promotion).
+        #
+        # Δloss is comparable across rungs: every rung's value is
+        # compute_assignment_predicted_dloss over the SAME DP item set (the
+        # multi-choice knapsack assigns every item exactly one candidate at
+        # every target), in the same ½·h_trace·MSE units, and the fixed
+        # auxiliary (MTP/visual) Δloss excluded from all of them is a
+        # rung-invariant constant, so it cannot reorder them.
+        #
+        # Selection feasibility is tensor spans + reserve <= budget. Final
+        # feasibility is intentionally deferred to the exporter, which stats
+        # the recursive regular-file set and fails closed. The ratchet is
+        # seeded at the grid pick already proven selection-feasible.
+        def _fits_bytes(cand) -> bool:
+            return (
+                cand is not None
+                and cand["whole_artifact_upper_bound_bytes"] <= budget_bytes
+            )
+
+        def _serve_ok(cand) -> bool:
+            """The second hard axis. Always True when constraints are absent.
+
+            Deliberately a separate predicate from the byte test so the two
+            reasons a probe was rejected stay distinguishable in the trace —
+            and so that with no constraints supplied ``_fits`` is the
+            pre-P5c function, evaluated on the pre-P5c inputs.
+            """
+            if cand is None:
+                return False
+            serve = cand.get("serve")
+            return serve is None or bool(serve.feasible)
+
+        def _fits(cand) -> bool:
+            """Feasibility = BOTH hard axes (policy §1).
+
+            Bytes and SLOs are constraints, never terms in the objective. A
+            probe that misses either is removed from the candidate set; it is
+            not ranked below the others. The ratchet below then minimises
+            predicted Δloss over exactly the survivors, with its tie-break
+            unchanged.
+            """
+            return _fits_bytes(cand) and _serve_ok(cand)
+
+        def _beats(cand, best) -> bool:
+            """The ratchet objective: min Δloss, ties -> larger footprint."""
+            if best is None:
+                return True
+            if cand["dloss"] != best["dloss"]:
+                return cand["dloss"] < best["dloss"]
+            return (
+                cand["whole_artifact_upper_bound_bytes"]
+                > best["whole_artifact_upper_bound_bytes"]
+            )
+
+        best = None
+        emit_target = None
+        ratchet_trace: list[dict] = []
+        # Every probe the SLO axis removed, and which limit removed it. Empty
+        # (and omitted from selection.json) when constraints are inactive.
+        serve_rejections: list[dict] = []
+        serve_probe_rows: list[dict] = []
+
+        def _record_serve(cand, target: float, stage: str) -> None:
+            """Note a probe's serving verdict; nothing when constraints are off."""
+            if cand is None or not serving_constraints_active:
+                return
+            serve = cand["serve"]
+            serve_probe_rows.append({
+                "label": f"{stage}@{float(target):.4f}",
+                "feasible": bool(serve.feasible),
+                "predicted": dict(serve.predicted),
+            })
+            if not serve.feasible:
+                serve_rejections.append(rejection_record(
+                    serve,
+                    stage=stage,
+                    target_bits=float(target),
+                    achieved_bits=float(cand["achieved_bits"]),
+                    dloss=float(cand["dloss"]),
+                ))
+
+        def _consider(cand, target: float, stage: str) -> bool:
+            """Ratchet ``cand`` in; record the probe. Returns whether it fits."""
+            nonlocal best, emit_target
+            fits = _fits(cand)
+            accepted = bool(fits and _beats(cand, best))
+            _record_serve(cand, target, stage)
+            ratchet_trace.append({
+                "stage": stage,
+                "target_bits": float(target),
+                "achieved_bits": (
+                    float(cand["achieved_bits"]) if cand is not None else None),
+                "tensor_payload_gb": (
+                    cand["tensor_payload_bytes"] / _fp.GB
+                    if cand is not None else None
+                ),
+                "whole_artifact_upper_bound_gb": (
+                    cand["whole_artifact_upper_bound_bytes"] / _fp.GB
+                    if cand is not None else None
+                ),
+                "dloss": float(cand["dloss"]) if cand is not None else None,
+                "fits": fits,
+                "accepted": accepted,
+                # Additive and CONDITIONAL: with no constraints supplied the
+                # trace rows are byte-identical to the pre-P5c allocator's.
+                **({
+                    "fits_bytes": _fits_bytes(cand),
+                    "serve_feasible": (
+                        bool(cand["serve"].feasible)
+                        if cand is not None else None),
+                    "serve_binding_constraint": (
+                        cand["serve"].binding_constraint
+                        if cand is not None else None),
+                    "serve_violated_constraints": (
+                        list(cand["serve"].violation_names())
+                        if cand is not None else None),
+                } if serving_constraints_active else {}),
+            })
+            if accepted:
+                best, emit_target = cand, float(target)
+            return fits
+
+        fitting = [c for c in grid if _fits(c)]
+        for cand in grid:
+            _record_serve(cand, float(cand["target_bits"]), "grid")
+        grid_pick = None
+        for cand in fitting:
+            if _beats(cand, grid_pick):
+                grid_pick = cand
+
+        if grid_pick is None:
+            # Bytes alone were satisfiable (checked above) but the serving
+            # constraints removed every grid rung. That is an INFEASIBLE
+            # problem, not a reason to relax an SLO silently: policy §1 makes
+            # these hard constraints. Write the evidence, then exit naming the
+            # limits that bound.
+            binding = sorted({
+                str(r["binding_constraint"]) for r in serve_rejections
+                if r.get("binding_constraint")
+            })
+            selection.update({
+                "feasible": False,
+                "serve_constraints_infeasible": True,
+                "serve_constraints": {
+                    **serve_context.stamp_inactive(),
+                    "active": True,
+                    "reason": "no_grid_rung_satisfied_the_serving_constraints",
+                    "binding_constraints": binding,
+                    "rejected_assignments": serve_rejections,
+                },
+            })
+            sel_path.write_text(
+                json.dumps(selection, indent=2, sort_keys=True) + "\n")
+            raise SystemExit(
+                "[alloc] every allocation that fits the "
+                f"{args.target_disk_gb:.3f}GB card misses a hard serving "
+                f"constraint ({', '.join(binding) or 'unpriced'}). Policy §1 "
+                "makes these constraints, not penalties: nothing here is "
+                "'close enough'. Raise the SLO, widen --formats, change "
+                "--serve-workload-mix, or supply a dispatch table that prices "
+                f"the families in this menu. Selection written to {sel_path}.")
+
+        # Near-lossless cap: all of the most expensive format, +1 bit of slack
+        # so the DP can actually reach it.
+        search_hi_cap = float(max(int(s.weight_bits) for s in specs_sorted)) + 1.0
         # Bound the ratchet by the cheapest grid rung that does NOT fit:
         # bisecting toward the near-lossless cap on a card that only fits
         # the low rungs wastes dozens of expensive DP solves at high-bin
-        # targets. disk(target) is only locally non-monotone, and the
-        # ratchet never accepts a probe below the proven grid pick, so
-        # tightening the ceiling to the first non-fitting rung is safe.
-        over_budget = [c for c in grid if c["disk_bytes"] > budget_bytes]
-        if over_budget:
-            search_hi = min(
-                search_hi,
-                min(float(c["target_bits"]) for c in over_budget),
-            )
+        # targets. HEURISTIC: this assumes disk(target) is only LOCALLY
+        # non-monotone — if a fitting allocation existed above the first
+        # non-fitting rung, the tightened ceiling would forgo it, and the
+        # min-Δloss objective makes that premise weaker, not stronger. The
+        # ratchet never accepts a probe worse than the proven grid pick, so
+        # the downside is bounded at shipping the grid pick, never worse —
+        # but it IS a forgone option, so both the cap and the tightening are
+        # recorded in selection.json rather than left invisible.
+        over_budget = [
+            c for c in grid
+            if c["whole_artifact_upper_bound_bytes"] > budget_bytes
+        ]
+        tightening_rung = (
+            min(float(c["target_bits"]) for c in over_budget)
+            if over_budget else None)
+        search_hi = (search_hi_cap if tightening_rung is None
+                     else min(search_hi_cap, tightening_rung))
+
+        _consider(grid_pick, float(grid_pick["target_bits"]), "grid_pick")
         top = _artifact_for_target(search_hi)  # densest possible (all-expensive)
-        grid_pick = sel["chosen"]
-        if top is not None and top["disk_bytes"] <= budget_bytes:
-            chosen_info, emit_target, has_slack = top, search_hi, True
+        has_slack = _consider(top, search_hi, "search_hi_cap")
+        bisection_skipped_reason = None
+        if has_slack:
+            # The cap itself fits the card: nothing denser exists to bisect
+            # toward. NB the cap is only *considered*, not forced — if the
+            # grid pick has strictly lower predicted Δloss it still ships.
+            bisection_skipped_reason = "search_hi_fits_budget"
+        elif search_hi <= float(grid_pick["target_bits"]) + 0.005:
+            # The tightened ceiling landed at/below the grid pick's target, so
+            # the bracket is empty and the bisection below would break on
+            # iteration 0 — it ships the grid pick with no exploration. That
+            # used to be silent; name it.
+            bisection_skipped_reason = (
+                "tightened_search_hi_at_or_below_grid_pick_target")
         else:
-            best, emit_target = grid_pick, float(grid_pick["target_bits"])
             a_t, b_t = float(grid_pick["target_bits"]), search_hi
             for _ in range(40):
                 if (b_t - a_t) <= 0.005:
                     break
                 mid = 0.5 * (a_t + b_t)
-                rm = _artifact_for_target(mid)
-                if rm is not None and rm["disk_bytes"] <= budget_bytes:
+                if _consider(_artifact_for_target(mid), mid, "bisect"):
                     a_t = mid
-                    if rm["disk_bytes"] >= best["disk_bytes"]:  # ratchet up only
-                        best, emit_target = rm, mid
                 else:
                     b_t = mid
-            chosen_info, has_slack = best, False
+        chosen_info = best
 
+        max_bytes_pick = sel["chosen"]  # what "fill the card" would have shipped
         args.target_bits = float(emit_target)  # override emit target below
+        selected_whole_artifact_budget_stamp = whole_artifact_budget_stamp(
+            budget_bytes=budget_bytes,
+            selection_tensor_payload_bytes=int(
+                chosen_info["tensor_payload_bytes"]
+            ),
+            selection_non_tensor_reserve_bytes=overhead_reserve_bytes,
+            selection_assignment=chosen_info["assignment"],
+            excluded_source_prefixes=(
+                getattr(args, "exclude_source_prefix", None) or ()
+            ),
+        )
         selection.update({
             "has_slack": bool(has_slack),
             "chosen_target_bits": float(emit_target),
             "chosen_achieved_bits": float(chosen_info["achieved_bits"]),
-            "predicted_artifact_gb": chosen_info["disk_bytes"] / _fp.GB,
+            "predicted_tensor_payload_gb": (
+                chosen_info["tensor_payload_bytes"] / _fp.GB
+            ),
+            "predicted_whole_artifact_upper_bound_gb": (
+                chosen_info["whole_artifact_upper_bound_bytes"] / _fp.GB
+            ),
             "predicted_floor_gb": chosen_info["floor_bytes"] / _fp.GB,
-            "predicted_body_gb": (chosen_info["disk_bytes"] - chosen_info["floor_bytes"]) / _fp.GB,
+            "predicted_body_tensor_payload_gb": (
+                chosen_info["tensor_payload_bytes"]
+                - chosen_info["floor_bytes"]
+            ) / _fp.GB,
             "predicted_dloss": float(chosen_info["dloss"]),
-            "headroom_gb": (budget_bytes - chosen_info["disk_bytes"]) / _fp.GB,
+            "predicted_dloss_scope": (
+                "dp_body_items_only__excludes_fixed_auxiliary_mtp_visual"),
+            "selection_headroom_gb": (
+                budget_bytes
+                - chosen_info["whole_artifact_upper_bound_bytes"]
+            ) / _fp.GB,
             "grid_pick_target_bits": float(grid_pick["target_bits"]),
+            "grid_pick_dloss": float(grid_pick["dloss"]),
+            # The tightened ceiling the ratchet actually searched under, the
+            # untightened near-lossless cap, and what tightened it: a denser
+            # allocation forgone by the tightening leaves a trace here.
+            "search_hi_target_bits": float(search_hi),
+            "search_hi_cap_target_bits": float(search_hi_cap),
+            "search_hi_tightened_by_rung": (
+                float(tightening_rung) if tightening_rung is not None else None),
+            "search_hi_tightened": bool(search_hi < search_hi_cap),
+            "bisection_ran": bool(bisection_skipped_reason is None),
+            "bisection_skipped_reason": bisection_skipped_reason,
+            "ratchet_trace": ratchet_trace,
+            # The retired MAX-bytes objective, kept for auditability: when
+            # these agree the objective change was a no-op on this run.
+            "max_bytes_pick_target_bits": (
+                float(max_bytes_pick["target_bits"])
+                if max_bytes_pick is not None else None),
+            "max_bytes_pick_dloss": (
+                float(max_bytes_pick["dloss"])
+                if max_bytes_pick is not None else None),
+            "max_bytes_grid_pick_agrees": bool(
+                max_bytes_pick is not None
+                and max_bytes_pick["target_bits"] == grid_pick["target_bits"]),
+            "whole_artifact_budget": selected_whole_artifact_budget_stamp,
+            # Ultraplan P5a/P5b provenance for the SHIPPED assignment: how
+            # each selected unit's activation cost was priced, whether this
+            # run's per-family ladder fits are cross-comparable, and which
+            # selected rungs ride a backed fused mid-M lane vs the
+            # expand+GEMM fallback.
+            "activation_fair_pricing": activation_pricing.as_dict(),
+            "cb_ladder_cross_family_verdict": cross_family_verdict,
+            "serving_lane_provenance": selection_serving_lane_provenance(
+                chosen_info["assignment"], candidates, target_profile,
+                context_by_unit=tessera_context_by_unit),
+            **({"tessera_serving_scope": scope_provenance(
+                tessera_serving_target, tessera_context_by_unit)}
+               if tessera_serving_target is not None else {}),
+            # How big the per-unit menu was BEFORE the DP saw it, and which
+            # of the two reductions shrank it (see reduce_continuous_menu).
+            # Empty on a run with no Tessera rung on the menu. Without this a
+            # coarse-looking set of selected rates cannot be attributed: a
+            # campaign that priced few rungs and a bin width that swallowed
+            # many look identical in the output.
+            "tessera_group_knapsack": dict(tessera_group_menu_report),
+            **({"tessera_dev_pin": dict(tessera_dev_pin)} if tessera_dev_pin else {}),
+            "tessera_menu": {
+                "per_linear": dict(tessera_menu_report),
+                "aggregated": dict(tessera_menu_report_agg),
+                **tessera_menu_widths,
+                **({"selection_caveat": surrogate_selection_caveat()}
+                   if tessera_menu_widths else {}),
+            },
+            # DP wall time per solved target, summed over the tightening
+            # retries that target needed. `_solve_diagnostics` was previously
+            # read only by the infeasibility message, so the cost of a solve
+            # was invisible to anything that consumed the output; a continuous
+            # menu is exactly the case where that number stops being obvious.
+            "solve_diagnostics": {
+                str(k): {
+                    "solver_seconds": v.get("solver_seconds"),
+                    "solver_calls": v.get("solver_calls"),
+                    "evals": v.get("evals"),
+                }
+                for k, v in _solve_diagnostics.items()
+                if isinstance(v, dict) and "solver_seconds" in v
+            },
+            # Ultraplan P5c: which hard serving constraints were active, which
+            # probed assignments the axis REJECTED and for which SLO, and
+            # which constraint binds at the shipped optimum. Present on every
+            # run; when no table/SLO was supplied it says exactly that and
+            # nothing else in this file differs from the pre-P5c allocator.
+            "serve_constraints": (
+                {
+                    **chosen_info["serve"].as_dict(),
+                    "rejected_assignments": serve_rejections,
+                    "n_probes_rejected_by_serving_constraints": len(
+                        serve_rejections),
+                    "binding_constraint_at_optimum": (
+                        chosen_info["serve"].binding_constraint),
+                    "fastest_feasible_reference": fastest_feasible_summary(
+                        serve_probe_rows,
+                        prediction_metrics=(
+                            ("operator_sum_prefill_ms", "operator_sum_decode_ms")
+                            if measured_runtime_table is not None
+                            else ("p95_ttft_ms", "p95_itl_ms")),
+                        scope_note=(
+                            "Scope: the assignments this byte-budget ratchet "
+                            "PROBED (grid rungs, the near-lossless cap, and "
+                            "the bisection midpoints) — not an enumeration of "
+                            "the globally feasible set. Treat it as the "
+                            "fastest feasible assignment SEEN, and say so "
+                            "wherever it is used as a denominator."
+                        ),
+                    ),
+                }
+                if serving_constraints_active
+                else serve_context.stamp_inactive()
+            ),
         })
         sel_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n")
         print(
             f"[alloc] byte-budget: card={args.target_disk_gb:.2f}GB ({regime} src) "
             f"-> ship {chosen_info['achieved_bits']:.3f} bpp "
-            f"({chosen_info['disk_bytes'] / _fp.GB:.3f}GB: floor "
+            f"(selection upper bound "
+            f"{chosen_info['whole_artifact_upper_bound_bytes'] / _fp.GB:.3f}GB: "
+            f"tensor floor "
             f"{chosen_info['floor_bytes'] / _fp.GB:.3f} + body "
-            f"{(chosen_info['disk_bytes'] - chosen_info['floor_bytes']) / _fp.GB:.3f}, "
-            f"headroom {(budget_bytes - chosen_info['disk_bytes']) / _fp.GB:.3f}GB)"
-            + ("  [card has slack beyond near-lossless; shipping all-"
-               + max(specs_sorted, key=lambda s: s.weight_bits).name + "]"
-               if has_slack else "")
+            f"{(chosen_info['tensor_payload_bytes'] - chosen_info['floor_bytes']) / _fp.GB:.3f} "
+            f"+ reserve {overhead_reserve_bytes / _fp.GB:.3f}, "
+            f"headroom {(budget_bytes - chosen_info['whole_artifact_upper_bound_bytes']) / _fp.GB:.3f}GB, "
+            f"Δloss={chosen_info['dloss']:.4e} = min over "
+            f"{sum(1 for r in ratchet_trace if r['fits'])} fitting probes)"
+            + ("  [card has slack beyond near-lossless]" if has_slack else "")
+            + (f"  [search_hi tightened {search_hi_cap:.3f}->{search_hi:.3f} by "
+               f"the cheapest non-fitting rung; denser allocations above it "
+               f"were not explored]" if search_hi < search_hi_cap else "")
+            + (f"  [bisection skipped: {bisection_skipped_reason}]"
+               if bisection_skipped_reason else "")
             + f" -> {sel_path}",
             flush=True,
         )
+        if serving_constraints_active:
+            chosen_serve = chosen_info["serve"]
+            print(
+                "[alloc] serving constraints: "
+                + "; ".join(
+                    f"{c.name} {c.predicted if c.predicted is None else round(c.predicted, 4)}"
+                    f" {c.direction} {c.limit} {c.units} "
+                    f"[{'ok' if c.satisfied else 'VIOLATED'}]"
+                    for c in chosen_serve.checks
+                )
+                + f" | binding={chosen_serve.binding_constraint} | "
+                + f"{len(serve_rejections)} probed assignment(s) rejected by "
+                + "the SLO axis. Proposal data (table-driven); the served "
+                + "NATIVE-PARITY protocol is the release gate.",
+                flush=True,
+            )
 
     # Emit chosen layer_config for target_bits.
     assignment, achieved, total, mutable_total = _solve_for_target(args.target_bits)
     if assignment is None:
+        # An infeasibility exit must say WHICH wall was hit: a target under the
+        # format floor needs a different --formats menu, while a target the
+        # floor clears but serving-group promotion overshoots needs a slightly
+        # looser target. The solver recorded both; report them.
+        d = _solve_diagnostics.get(round(float(args.target_bits), 9), {})
+        if measured_runtime_table is not None:
+            raise SystemExit(
+                f"[alloc] measured runtime proposal infeasible at target_bits={args.target_bits}: "
+                f"{d.get('reason', 'no assignment meets the declared resource budgets')}. "
+                "Inspect the independent prefill/decode/device budgets and measured menu.")
+        floor = d.get("min_bits")
         raise SystemExit(
-            f"Infeasible at target_bits={args.target_bits}. "
-            "Consider raising the target or widening the format set.")
+            f"Infeasible at target_bits={args.target_bits}."
+            + (f" The format floor (cheapest legal format everywhere) is "
+               f"{floor:.3f} bpp" if isinstance(floor, (int, float)) else "")
+            + (f", and that floor solve itself promotes to "
+               f"{d['floor_achieved_bits']:.3f} bpp"
+               if isinstance(d.get("floor_achieved_bits"), (int, float)) else "")
+            + (f". Closest of {d.get('evals', 0)} DP solves: "
+               f"{d['closest_achieved_bits']:.3f} bpp"
+               if isinstance(d.get("closest_achieved_bits"), (int, float))
+               else "")
+            + (f" against an overshoot tolerance of "
+               f"{d['overshoot_tolerance']}" if "overshoot_tolerance" in d
+               else "")
+            + ". Raise --target-bits above the achievable value above, or "
+              "widen --formats so the floor drops.")
     print(
         f"[alloc] target_bits={args.target_bits}: "
         f"achieved_bits={achieved:.3f}, Δloss={total:.3e}",
@@ -2310,12 +5373,18 @@ def main():
     # vLLM's FusedMoE requires all projections of the same expert to share
     # one scheme. Packed groups are first-class DP units, so this promotion
     # is a validated no-op (validate_final_serving_promotion_noop below);
-    # it stays as the serve-time coherence backstop for groups that fell
-    # back to individual rows (no common legal format).
+    # it stays as the serve-time coherence backstop for the un-aggregated
+    # paths (--no-packed-aggregation / --no-fused-aggregation). It is handed
+    # per-Linear legality so the shared format it lands on is runnable for
+    # every member, and it is still a no-op here by construction: an
+    # aggregated unit's format came from the intersection of its members'
+    # candidate sets, and the un-aggregated paths were already promoted
+    # against the same sets inside solve_with_promotion.
     assignment_expanded = promote_serving_units(
         assignment_expanded,
         format_rank,
         profile=model_profile,
+        legal_formats=per_linear_legal_formats,
     )
     validate_final_serving_promotion_noop(
         assignment_before_serving_promotion,
@@ -2348,10 +5417,7 @@ def main():
               f"to --visual-format={visual_format} (Phase 1 uniform).",
               flush=True)
 
-    if probe_model_path:
-        visual_names_src = discover_visual_linears_from_source(probe_model_path)
-    else:
-        visual_names_src = []
+    visual_names_src = sorted(source_visual_stats)
 
     if visual_names_src:
         for vname in visual_names_src:
@@ -2387,6 +5453,24 @@ def main():
         print(
             f"[alloc] --mtp-format={mtp_format_canonical}: assigned "
             f"{mtp_count} MTP Linears uniformly",
+            flush=True,
+        )
+
+    if fixed_lm_head_names:
+        head_fmts = {
+            assignment_expanded[name]
+            for name in fixed_lm_head_names
+            if name in assignment_expanded
+        }
+        if head_fmts != {lm_head_format_canonical}:
+            raise AssertionError(
+                "lm_head assignment drifted after fixed-format accounting: "
+                f"expected {[lm_head_format_canonical]}, got "
+                f"{sorted(head_fmts)}"
+            )
+        print(
+            f"[alloc] --lm-head-format={lm_head_format_canonical}: assigned "
+            f"{len(fixed_lm_head_names)} lm_head Linear(s) uniformly",
             flush=True,
         )
 
@@ -2431,6 +5515,76 @@ def main():
                 "PASSTHROUGH_SOURCE_REQUIREMENTS deliberately."
             )
 
+    final_body_assignment = {
+        name: fmt
+        for name, fmt in assignment_expanded.items()
+        if (
+            not _is_visual_linear(name)
+            and not _is_mtp_linear(name)
+            and name not in fixed_lm_head_names
+        )
+    }
+    final_body_payload = _assignment_payload_totals(
+        final_body_assignment,
+        require_all_stats=True,
+    )
+    final_body_achieved = float(final_body_payload["bits_per_param"])
+    if not math.isclose(
+        final_body_achieved,
+        float(achieved),
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise AssertionError(
+            "final expanded assignment payload does not reconcile with the "
+            f"exact-filtered solve: final={final_body_achieved}, "
+            f"solve={achieved}"
+        )
+    final_assignment_payload = _assignment_payload_totals(
+        assignment_expanded,
+        require_all_stats=False,
+    )
+
+    # ---- Hard serving constraints on the SHIPPED assignment (P5c) ----
+    # The byte-budget selector already filtered its probes; this is the check
+    # on the emit path, which the plain --target-bits mode reaches without any
+    # ratchet. Policy §1 makes an SLO miss INFEASIBLE, so a violation exits
+    # rather than shipping a layer_config that quietly does not meet the
+    # deployment constraint the operator stated. Inactive -> no evaluation, no
+    # stamp, no behaviour change.
+    final_serve_feasibility = None
+    if serving_constraints_active:
+        final_serve_feasibility = _serve_feasibility(
+            assignment_expanded if measured_runtime_table is not None else final_body_assignment,
+            resident_bytes=int(
+                round(float(final_body_payload["bits_total"]) / 8.0)),
+        )
+        if not final_serve_feasibility.feasible:
+            violated = ", ".join(
+                f"{c.name}: predicted={c.predicted} {c.direction} "
+                f"{c.limit} {c.units}"
+                + (f" (unpriced: {c.unpriced_reason})"
+                   if c.unpriced_reason else "")
+                for c in final_serve_feasibility.violations
+            )
+            raise SystemExit(
+                "[alloc] ERROR: the emitted assignment at "
+                f"target_bits={args.target_bits} misses a hard serving "
+                f"constraint — {violated}. Binding: "
+                f"{final_serve_feasibility.binding_constraint}. Policy §1 "
+                "(docs/lanes/nvfp4-cb/format-speed-policy.md) makes these "
+                "hard constraints, not penalties: there is no λ that trades "
+                "them against predicted Δloss. Raise the SLO, widen "
+                "--formats, adjust --serve-workload-mix, or supply a dispatch "
+                "table that prices this menu's format families."
+            )
+
+    final_cb_serialization_stamps = _cb_stamps_for_assignment(
+        assignment_expanded
+    )
+    final_cb_render_identity = _cb_render_identity_for_assignment(
+        assignment_expanded
+    )
     layer_cfg = {}
     for name, fmt in assignment_expanded.items():
         if fmt in format_specs:
@@ -2440,6 +5594,175 @@ def main():
             # passed --formats NVFP4,BF16 plus --visual-format MXFP8_E4M3).
             # Resolve from the global registry.
             layer_cfg[name] = fr.get_format(fmt).autoround_config()
+        if name in final_cb_serialization_stamps:
+            layer_cfg[name][CB_TENSOR_IDENTITY_FIELD] = (
+                final_cb_serialization_stamps[name]
+            )
+
+    # The resolved serving profile travels WITH the assignment (re-vet R11 /
+    # debt D4). Before this, it landed only in the side report
+    # format_applicability.json, which export never reads, so the exporter
+    # re-resolved the profile from the architecture spec and could legality-
+    # audit under a different one than the allocator solved with — measured
+    # 2026-07-11: 226 dense FP8 Linears silently coerced to BF16 on the Hy3
+    # compressed-tensors export. PRISMAQUANT_TARGET_PROFILE remains the
+    # override for direct exporter invocations.
+    layer_cfg[LAYER_CONFIG_META_KEY] = {
+        "schema": "prismaquant.layer_config_meta.v1",
+        "target_profile": target_profile,
+        **({"tessera_serving_scope": scope_provenance(
+                tessera_serving_target, tessera_context_by_unit),
+            "serving_lane_provenance": selection_serving_lane_provenance(
+                assignment_expanded, candidates, target_profile,
+                context_by_unit=tessera_context_by_unit)}
+           if tessera_serving_target is not None else {}),
+        "target_profile_requested": args.target_profile,
+        "target_profile_default": str(args.target_profile_default or "research"),
+        "lm_head_format": lm_head_format_canonical,
+        "lm_head_mode": (
+            "dp" if lm_head_dp_unpinned
+            else "fixed" if fixed_lm_head_quantized
+            else "profile_pinned_bf16"
+        ),
+        "lm_head_cost_pricing": fixed_lm_head_cost_pricing,
+        "target_bits": float(args.target_bits),
+        "achieved_bits": final_body_achieved,
+        "achieved_bits_scope": (
+            "body_assignment_tensor_payload_including_deduplicated_cb_sidecars"
+        ),
+        "body_assignment_payload_bits_total": float(
+            final_body_payload["bits_total"]
+        ),
+        "body_assignment_quantizable_params": int(
+            final_body_payload["quantizable_params"]
+        ),
+        "body_shared_cb_sidecar_bits": float(
+            final_body_payload["cb_shared_sidecar_bits"]
+        ),
+        "solver_contract": (
+            "additive_candidate_proposal_then_exact_assignment_filter"
+        ),
+        "global_optimality_claimed": False,
+        # Continuous-menu provenance, written on EVERY run rather than only on
+        # the byte-budget path: how wide the Tessera menu was before the DP saw
+        # it, which of the two exact reductions shrank it (per-Linear and, for
+        # aggregated super items, again after aggregation), and what the solve
+        # cost in wall time. On a menu of thousands of rungs those are the
+        # numbers that say whether a coarse-looking result is the allocator's
+        # answer or the menu's. Absent keys mean no Tessera rung was on the
+        # menu, so a stock run's metadata is unchanged.
+        **({"tessera_menu": {
+                "per_linear": dict(tessera_menu_report),
+                "aggregated": dict(tessera_menu_report_agg),
+                **tessera_menu_widths,
+                **({"selection_caveat": surrogate_selection_caveat()}
+                   if tessera_menu_widths else {}),
+            }} if (tessera_menu_report or tessera_menu_report_agg
+                   or tessera_menu_widths) else {}),
+        **({"tessera_group_knapsack": dict(tessera_group_menu_report)}
+           if tessera_group_menu_report else {}),
+        **({"tessera_hessian": dict(tessera_hessian_identity)}
+           if (tessera_hessian_identity.get("stamped_rows")
+               or tessera_hessian_identity.get("unstamped_rows")) else {}),
+        # The static A-side scale VALUE each selected Tessera unit was priced
+        # under, read from its own cost row (RobTand/prismaquant#204). The
+        # export gate compares the exporter's --input-scales file against
+        # this, value for value; until it existed the gate could only check
+        # that a key was present. Absent when no Tessera unit is selected, so
+        # a stock run's metadata is unchanged. Read from the unfiltered table
+        # (`cost_data["costs"]`): every selected unit's row is there whatever
+        # the lm_head / visual filters removed from the DP's view.
+        **({"tessera_activation_static_scales": priced_static_scales(
+                {name: fmt for name, fmt in assignment_expanded.items()
+                 if str(fmt).startswith("TESSERA_")},
+                cost_data["costs"])}
+           if any(str(fmt).startswith("TESSERA_")
+                  for fmt in assignment_expanded.values()) else {}),
+        **({"tessera_dev_pin": dict(tessera_dev_pin)} if tessera_dev_pin else {}),
+        **({"solve_diagnostics": {
+                str(k): {
+                    "solver_seconds": v.get("solver_seconds"),
+                    "solver_calls": v.get("solver_calls"),
+                }
+                for k, v in _solve_diagnostics.items()
+                if isinstance(v, dict) and "solver_seconds" in v
+            }} if any(
+                isinstance(v, dict) and "solver_seconds" in v
+                for v in _solve_diagnostics.values()) else {}),
+        # The artifact-wide CB context the per-tensor identities above were
+        # computed under. Without it the exporter cannot know which contract
+        # produced them: it reads this key
+        # (`cb_serialization_metadata_from_assignment_payload`) to decide
+        # whether to claim the W4A4 activation contract. Absent, it falls back
+        # to no-contract/payload-v2, drops the 4-byte input_global_scale, and
+        # EVERY per-tensor stamp mismatches -- measured 2026-08-08 on DSv4:
+        # 24851/24851 mismatched, which is the root cause of the four earlier
+        # "CB per-layer serialization identity mismatch" export failures.
+        **({"cb_serialized_payload": cb_serialization_context_stamp(
+                cb_serialization_context,
+                formats=sorted({
+                    str(fmt) for fmt in assignment_expanded.values()
+                    if is_cb_format(str(fmt))
+                }) or None,
+            )}
+           if cb_serialization_context is not None
+           and final_cb_serialization_stamps else {}),
+        **propagated_cost_provenance(research_cost_provenance),
+        "assignment_payload_bits_total": (
+            float(final_assignment_payload["bits_total"])
+            if not final_assignment_payload["missing_stats_names"]
+            else None
+        ),
+        "assignment_payload_bits_scope": (
+            "all_assignment_tensor_payload_including_deduplicated_cb_sidecars"
+        ),
+        "assignment_payload_missing_stats_names": final_assignment_payload[
+            "missing_stats_names"
+        ],
+        **({
+            "cb_serialized_payload": final_cb_render_identity[
+                "cb_serialized_payload"
+            ],
+            "cb_render_identity": final_cb_render_identity,
+        } if final_cb_render_identity is not None else {}),
+        **({
+            "whole_artifact_budget": selected_whole_artifact_budget_stamp,
+        } if selected_whole_artifact_budget_stamp is not None else {}),
+        # Only when the constraint axis actually ran, so an unconstrained run
+        # writes byte-identical layer-config metadata (the "constraints were
+        # absent" stamp lives in selection.json, which every byte-budget run
+        # writes anyway).
+        **({
+            "serve_constraints": final_serve_feasibility.as_dict(),
+        } if final_serve_feasibility is not None else {}),
+        **({"measured_runtime_search": {
+                "research_only": True,
+                "promotion_status": "requires_fixed_teacher_and_end_to_end_validation",
+                "target_diagnostics": _solve_diagnostics.get(round(float(args.target_bits), 9), {}),
+            }} if measured_runtime_table is not None else {}),
+    }
+    # What this allocation carries about the priced expert population
+    # (PrismaQuant #183): the campaign's population statement (which units
+    # were priced, which omitted), the producer's projection they were priced
+    # under, and -- for every projected unit -- the receipt of exactly the rung
+    # selected here, so the export lane hands the exporter the priced bytes
+    # and nothing else.  A selected rung the campaign never priced as a wire,
+    # or a projected unit this allocation does not place, is refused by name
+    # before the layer config is written.  Additive: a stock cost table adds
+    # no keys, and a table carrying a population but no projection carries
+    # only the population.
+    if args.tessera_materialization_plan:
+        from .tessera_materialization import write_selection_request
+        write_selection_request(args.tessera_materialization_plan,
+            layer_config=layer_cfg, assignment=assignment_expanded,
+            cost_path=args.costs, cost_payload=cost_data, output_path=args.layer_config)
+        print(f"[alloc] non-exportable selected-wire request → {args.tessera_materialization_plan}")
+        return
+    try:
+        layer_cfg[LAYER_CONFIG_META_KEY].update(
+            allocation_expert_projection_block(cost_data, assignment_expanded))
+    except ExpertProjectionError as exc:
+        raise SystemExit(f"[alloc] ERROR: expert projection: {exc}") from exc
 
     out = Path(args.layer_config)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -2449,7 +5772,10 @@ def main():
     counts = defaultdict(int)
     for fmt in assignment_expanded.values():
         counts[fmt] += 1
-    print(f"\n[alloc] target={args.target_bits} achieved={achieved:.3f}")
+    print(
+        f"\n[alloc] target={args.target_bits} "
+        f"exact_assignment_payload_bpp={final_body_achieved:.3f}"
+    )
     for fmt, n in sorted(counts.items(), key=lambda kv: -kv[1]):
         print(f"  {fmt:>14}: {n:>5} layers")
     print(f"\nLayer config → {out}")
@@ -2461,11 +5787,12 @@ def main():
         args.bit_attribution_json,
         args.bit_attribution_csv,
         target_bits=args.target_bits,
-        achieved_bits=achieved,
+        achieved_bits=final_body_achieved,
         assignment_expanded=assignment_expanded,
         candidates=candidates,
         stats_entry_for=_stats_entry_for_assignment_name,
         format_specs=format_specs,
+        cb_serialization_context=cb_serialization_context,
     )
 
 

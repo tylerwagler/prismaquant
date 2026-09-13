@@ -85,9 +85,19 @@ class WeightSession:
         self._strict_production_cache = bool(strict_production_cache)
         self._linear_by_qname: dict[str, tuple[nn.Module, str]] = {}
         if profile is None:
+            from prismaquant.model_profiles import (
+                DeadVendoredOverrideError,
+                profile_from_model,
+            )
             try:
-                from prismaquant.model_profiles import profile_from_model
                 profile = profile_from_model(model)
+            except DeadVendoredOverrideError:
+                # The profile is handed straight to `iter_quantizable_tensors`
+                # below to build the qname -> live Linear map this session
+                # swaps weights through. A dead override silently builds that
+                # map over a different set of tensors, so the session reverts
+                # and re-renders the wrong ones (#202).
+                raise
             except Exception:
                 profile = None
         self._profile = profile
@@ -278,6 +288,20 @@ class WeightSession:
         # Strict production-cache mode turns this into a hard miss for
         # every non-BF16 format.
         self._rtn_fallbacks.append((qname, fmt_canon))
+        # Ahead of ``get_format``, whose failure path here is ``return None``:
+        # on a box without the ``tessera`` package that would turn the refusal
+        # below into a silent None, which is the shape of the bug it exists to
+        # stop.
+        if fr.is_tessera_format_name(fmt_canon):
+            raise RuntimeError(
+                f"production_weight_cache is required for Tessera "
+                f"({qname!r}, {fmt_canon!r}) in WeightSession; the registry "
+                "render is a weights-only reconstruction, not the decoded "
+                "wire and not the H-aware encode that ships, so this "
+                "fallback would price different bytes under the same format "
+                "name -- exactly what STRICT_PRODUCTION_CACHE=0 is not "
+                "permission to do"
+            )
         bf16 = self._ensure_bf16_snapshot(qname)
         if bf16 is None:
             return None
@@ -285,6 +309,14 @@ class WeightSession:
             spec = fr.get_format(fmt_canon)
         except Exception:
             return None
+        from .nvfp4_cb_footprint import is_cb_format
+
+        if is_cb_format(fmt_canon):
+            raise RuntimeError(
+                f"production_weight_cache is required for CB fallback "
+                f"({qname!r}, {fmt_canon!r}) in WeightSession; the direct "
+                "registry render is unweighted and layout-stale"
+            )
         return spec.quantize_dequantize(bf16.detach().clone())
 
     # ------------------------------------------------------------------

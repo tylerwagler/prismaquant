@@ -10,11 +10,17 @@ RTN-quantized just for that module call and restored in the forward hook.
 from __future__ import annotations
 
 import hashlib
+import io
+import math
 import json
 import os
+import pickle
+import pickletools
 import re
+import stat
+import struct
 import sys
-import tempfile
+import zipfile
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -33,6 +39,9 @@ from prismaquant.memory_management import (
     env_truthy as _env_truthy,
     model_device as _model_device,
     register_budget_evictor,
+)
+from prismaquant.nvfp4_activation_contract import (
+    require_matching_input_global_scale,
 )
 
 _FNAME_SUB = re.compile(r"[^A-Za-z0-9_-]")
@@ -97,13 +106,16 @@ def _maybe_clip_activations(
 def _served_nvfp4_act_qdq_enabled() -> bool:
     """Opt-in serve-faithful NVFP4 activation emulation (default OFF).
 
-    When on, NVFP4 activation quantization in the emulation hooks models
-    the SERVED two-level semantics (static input_global_scale + FP8 snap
-    of the per-16-group block scale, via
-    format_registry.nvfp4_activation_qdq_served) instead of the dynamic
-    exact-fp32-scale RTN. Closes the M18-residual/C1 measurement gap the
-    2026-07-02 audit flagged; default-off pending a served correlation
-    study (the dynamic path is the long-standing screen baseline)."""
+    When on, activation quantization in the emulation hooks for a spec whose
+    served contract is static-scale (``FormatSpec.static_activation_contract``,
+    i.e. stock NVFP4) models the SERVED two-level semantics (static
+    input_global_scale + FP8 snap of the per-16-group block scale, via the
+    contract's own oracle) instead of the dynamic exact-fp32-scale RTN.
+    Closes the M18-residual/C1 measurement gap the 2026-07-02 audit flagged;
+    default-off pending a served correlation study (the dynamic path is the
+    long-standing screen baseline).  A spec whose contract says
+    ``measured_as_served`` (a Tessera W4A4 rung) does not consult this lever:
+    the served oracle is its only measurement."""
     return os.environ.get(
         "PRISMAQUANT_NVFP4_ACT_EMULATE_SERVED_SCALES", "0") == "1"
 
@@ -113,33 +125,738 @@ def _activation_qdq(
     act_spec,
     activation_max_abs: dict,
     param_name: str | None,
+    priced_input_global_scales: Mapping[str, float] | None = None,
 ) -> torch.Tensor:
     """Shared activation quantize-dequantize for the emulation hooks.
 
-    Default: act-clip to the calibrated max_abs then dynamic per-group
-    RTN (the historical screen semantics). With
-    PRISMAQUANT_NVFP4_ACT_EMULATE_SERVED_SCALES=1 and an NVFP4 act spec
-    whose calibrated max_abs is known, use the serve-faithful two-level
-    quantizer instead — NO clamp (serving does not clamp; the static
-    scale itself clips blocks above the calibration amax)."""
-    if (
-        _served_nvfp4_act_qdq_enabled()
-        and fr.canonical_format_name(act_spec.name) == "NVFP4"
-        and x.shape[-1] % 16 == 0
-    ):
+    Which quantizer a spec serves is the SPEC's answer
+    (``FormatSpec.static_activation_contract``), never a compare of its name
+    against ``"NVFP4"`` -- a Tessera rung routed through the same kernel has
+    the same contract and a different name (#205).
+
+    * No static contract (FP8/MX dynamic W8A8, or an A16 row that reached
+      the hook): act-clip to the calibrated max_abs, then the row's own
+      dynamic quantizer.
+    * Static contract, ``measured_as_served`` (Tessera W4A4): the served
+      oracle at the unit's G -- NO clamp (serving does not clamp; the static
+      scale itself clips blocks above the calibration amax) -- and a refusal
+      by name when the unit has no calibrated maximum.
+    * Static contract, screen default (stock NVFP4): the historical clip +
+      dynamic RTN, or the served oracle when
+      ``PRISMAQUANT_NVFP4_ACT_EMULATE_SERVED_SCALES=1`` and the maximum is
+      known.
+
+    ``priced_input_global_scales`` is the G each unit's cached render score was
+    priced at (``ProductionWeightCache`` ``render_scores`` provenance, via
+    ``production_cache_priced_input_global_scales``).  When one is known it is
+    compared against the G this hook is about to apply, and a disagreement
+    refuses by name: measuring an assignment whose costs were priced under one
+    activation-scale policy through a hook quantizing under another compares
+    two different quantizers (#227).  Absent -- no production cache, or a cache
+    with no served rows -- there is nothing to disagree with and the hook is
+    unchanged."""
+    contract = getattr(act_spec, "static_activation_contract", None)
+    if contract is not None:
         max_abs = _activation_max_abs_lookup(activation_max_abs, param_name)
-        if max_abs is not None and max_abs > 0:
-            from prismaquant.export_native_compressed import (
-                _nvfp4_input_global_scale_from_max_abs,
+        if contract.measured_as_served:
+            g = contract.require_input_global_scale(
+                max_abs, qname=param_name, consumer="assignment-KL hook")
+            g = require_matching_input_global_scale(
+                _activation_max_abs_lookup(
+                    priced_input_global_scales or {}, param_name),
+                g,
+                qname=param_name,
+                consumer="assignment-KL hook",
             )
-            g = _nvfp4_input_global_scale_from_max_abs(float(max_abs))
-            return fr.nvfp4_activation_qdq_served(x, g)
+            return contract.quantize_dequantize(x, g)
+        if (
+            _served_nvfp4_act_qdq_enabled()
+            and x.shape[-1] % int(contract.group_size) == 0
+            and max_abs is not None and max_abs > 0
+        ):
+            g = contract.input_global_scale_from_max_abs(float(max_abs))
+            return contract.quantize_dequantize(x, g)
     x = _maybe_clip_activations(x, activation_max_abs, param_name)
     return act_spec.activation_quantize_dequantize(x)
 
 
 def activation_cache_filename(name: str) -> str:
     return _FNAME_SUB.sub("__", name) + ".pt"
+
+
+def write_activation_cache_entry(cache_dir, name, inputs, *, source="perturbed_x",
+                                 durable=False, **metadata):
+    """Atomically store already-selected rows without changing their precision."""
+    import os
+    path = Path(cache_dir) / activation_cache_filename(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".pt.tmp")
+    with temporary.open("wb") as handle:
+        torch.save({**metadata, "inputs": inputs.contiguous(), "name": name,
+                    "source": source}, handle)
+        if durable:
+            handle.flush()
+            os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    if durable:
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    return path
+
+
+def cache_file_stat_signature(value):
+    """Stable file identity shared by the existing activation and PWC owners."""
+    return (value.st_dev, value.st_ino, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _preflight_torch_zip_directory(source, *, metadata_cap, label):
+    """Bound directory objects before ZipFile creates any ZipInfo instances.
+
+    Reuse zipfile's fixed-size EOCD/ZIP64 reader, then walk fixed-size central
+    headers without decoding names or allocating a roster. ZipFile ignores the
+    EOCD entry count when building its roster, so both count and extent matter.
+    """
+    source.seek(0, os.SEEK_END)
+    file_bytes = source.tell()
+    end = zipfile._EndRecData(source)
+    if end is None:
+        raise RuntimeError(f'{label} has no accountable ZIP directory')
+    count = end[zipfile._ECD_ENTRIES_TOTAL]
+    size = end[zipfile._ECD_SIZE]
+    offset = end[zipfile._ECD_OFFSET]
+    if (end[zipfile._ECD_DISK_NUMBER] != 0 or end[zipfile._ECD_DISK_START] != 0 or
+            count != end[zipfile._ECD_ENTRIES_THIS_DISK] or count <= 0 or
+            count*4096 + size*16 > metadata_cap//2):
+        raise RuntimeError(f'{label} ZIP directory exceeds metadata scratch budget')
+    # Canonical Torch files are not concatenated archives. Validate the actual
+    # footer chain instead of relying on private _ECD_LOCATION semantics:
+    # patched Python 3.12 reports ZIP64 EOCD there, older versions report EOCD32.
+    position = offset
+    directory_end = offset+size
+    if position < 0 or size < 0 or directory_end > file_bytes:
+        raise RuntimeError(f'{label} has an invalid ZIP directory extent')
+    footer_position = directory_end
+    source.seek(footer_position)
+    if end[zipfile._ECD_SIGNATURE] == zipfile.stringEndArchive64:
+        data = source.read(zipfile.sizeEndCentDir64)
+        if len(data) != zipfile.sizeEndCentDir64:
+            raise RuntimeError(f'{label} has a truncated ZIP64 footer')
+        record = struct.unpack(zipfile.structEndArchive64, data)
+        if (record[0] != zipfile.stringEndArchive64 or record[1]+12 != zipfile.sizeEndCentDir64 or
+                tuple(record[6:]) != (count, count, size, offset)):
+            raise RuntimeError(f'{label} requires a canonical fixed-size ZIP64 footer')
+        locator = source.read(zipfile.sizeEndCentDir64Locator)
+        if len(locator) != zipfile.sizeEndCentDir64Locator or struct.unpack(
+                zipfile.structEndArchive64Locator, locator) != (
+                    zipfile.stringEndArchive64Locator, 0, directory_end, 1):
+            raise RuntimeError(f'{label} has an invalid ZIP64 locator')
+        footer_position += zipfile.sizeEndCentDir64 + zipfile.sizeEndCentDir64Locator
+    source.seek(footer_position)
+    footer = source.read(zipfile.sizeEndCentDir)
+    if (len(footer) != zipfile.sizeEndCentDir or not footer.startswith(zipfile.stringEndArchive) or
+            footer_position+zipfile.sizeEndCentDir+len(end[zipfile._ECD_COMMENT]) != file_bytes):
+        raise RuntimeError(f'{label} requires a canonical non-concatenated ZIP directory')
+    stop, observed = position+size, 0
+    while position < stop:
+        source.seek(position)
+        header = source.read(zipfile.sizeCentralDir)
+        if len(header) != zipfile.sizeCentralDir:
+            raise RuntimeError(f'{label} has a truncated ZIP directory')
+        values = struct.unpack(zipfile.structCentralDir, header)
+        if values[zipfile._CD_SIGNATURE] != zipfile.stringCentralDir:
+            raise RuntimeError(f'{label} has an invalid ZIP directory header')
+        observed += 1
+        if observed > count or observed*4096 + size*16 > metadata_cap//2:
+            raise RuntimeError(f'{label} ZIP directory exceeds metadata scratch budget')
+        position += zipfile.sizeCentralDir + sum(values[index] for index in (
+            zipfile._CD_FILENAME_LENGTH, zipfile._CD_EXTRA_FIELD_LENGTH, zipfile._CD_COMMENT_LENGTH))
+    if position != stop or observed != count:
+        raise RuntimeError(f'{label} ZIP directory count or extent disagrees')
+    source.seek(0)
+
+
+def _preflight_pickle_opcodes(raw, *, metadata_cap, label):
+    """Bound the C unpickler's memo/frame allocations and disable extensions."""
+    max_memo = metadata_cap//512
+    memo_operations = 0
+    last = None
+    try:
+        for opcode, argument, position in pickletools.genops(raw):
+            last = (opcode.name, position)
+            if opcode.name in ('EXT1', 'EXT2', 'EXT4', 'INST', 'OBJ', 'NEWOBJ',
+                               'NEWOBJ_EX', 'BUILD'):
+                raise RuntimeError(f'{label} has an opaque or extension pickle opcode')
+            if opcode.name in ('PUT', 'BINPUT', 'LONG_BINPUT', 'GET', 'BINGET', 'LONG_BINGET'):
+                if type(argument) is not int or not 0 <= argument < max_memo:
+                    raise RuntimeError(f'{label} pickle memo exceeds scratch budget')
+            if opcode.name in ('PUT', 'BINPUT', 'LONG_BINPUT', 'MEMOIZE'):
+                memo_operations += 1
+                if memo_operations > max_memo:
+                    raise RuntimeError(f'{label} pickle memo exceeds scratch budget')
+            if opcode.name == 'FRAME' and not 0 <= argument <= len(raw):
+                raise RuntimeError(f'{label} pickle frame exceeds bounded metadata')
+        if last != ('STOP', len(raw)-1):
+            raise RuntimeError(f'{label} has trailing or incomplete pickle metadata')
+    except (ValueError, OverflowError) as exc:
+        raise RuntimeError(f'{label} has unaccountable pickle opcodes') from exc
+
+
+def _preflight_torch_pickle_storage(archive, *, records, pickle_name, label, metadata_cap):
+    """Check every declared storage size without constructing a Torch object.
+
+    Older Torch stages CPU storage even for map_location='meta'. Only a closed
+    set of tensor reconstruction markers is accepted here; those callbacks are
+    inert. ZIP sizes and pickle sizes must agree before either Torch pass.
+    """
+    # Archive metadata was admitted before this bounded read. Inspect opcodes
+    # before constructing the C Unpickler: find_class alone does not guard its
+    # sparse memo allocation or cached extension registry.
+    raw = archive.read(pickle_name)
+    _preflight_pickle_opcodes(raw, metadata_cap=metadata_cap, label=label)
+    element_bytes = {'ByteStorage': 1, 'CharStorage': 1, 'BoolStorage': 1,
+        'ShortStorage': 2, 'HalfStorage': 2, 'BFloat16Storage': 2,
+        'IntStorage': 4, 'FloatStorage': 4, 'LongStorage': 8,
+        'DoubleStorage': 8, 'ComplexFloatStorage': 8, 'ComplexDoubleStorage': 16,
+        'UntypedStorage': 1}
+    storage_types = {}
+    def tensor_marker(*args):
+        if (len(args) < 4 or type(args[0]) is not tuple or len(args[0]) != 3 or
+                args[0][0] != 'storage' or type(args[0][1]) is not str or args[0][1] not in records or
+                type(args[0][2]) is not int or args[0][2] not in (1, 2, 4, 8, 16) or
+                type(args[1]) is not int or args[1] < 0 or
+                type(args[2]) is not tuple or type(args[3]) is not tuple or
+                len(args[2]) != len(args[3]) or len(args[2]) > 64 or
+                any(type(value) is not int or value < 0 for value in (*args[2], *args[3]))):
+            raise RuntimeError(f'{label} has unaccountable pickle tensor geometry')
+        size = args[0][2]
+        if len(args) > 6 and type(args[6]) is tuple and args[6][0] == 'dtype':
+            sizes = dict(float16=2, float32=4, float64=8, bfloat16=2, int8=1,
+                         uint8=1, int16=2, int32=4, int64=8, bool=1, complex64=8, complex128=16)
+            size = sizes[args[6][1]]
+        extent = (0 if any(value == 0 for value in args[2]) else
+                  args[1]+1+sum((dim-1)*stride for dim, stride in zip(args[2], args[3])))
+        if extent*size > records[args[0][1]]:
+            raise RuntimeError(f'{label} pickle tensor geometry exceeds its declared backing storage')
+        return None
+    class StoragePreflight(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module in ('torch', 'torch.storage') and name in element_bytes:
+                return ('storage_type', element_bytes[name])
+            if module == 'torch._utils' and name in (
+                    '_rebuild_tensor', '_rebuild_tensor_v2', '_rebuild_tensor_v3'):
+                return tensor_marker
+            if module == 'collections' and name == 'OrderedDict':
+                return OrderedDict
+            # v3 carries dtype separately; no callable Torch global escapes.
+            if module == 'torch' and name in ('float16', 'float32', 'float64',
+                    'bfloat16', 'int8', 'uint8', 'int16', 'int32', 'int64', 'bool',
+                    'complex64', 'complex128'):
+                return ('dtype', name)
+            raise RuntimeError(f'{label} has an opaque pickle global: {module}.{name}')
+
+        def persistent_load(self, value):
+            if (type(value) is not tuple or len(value) != 5 or value[0] != 'storage' or
+                    type(value[1]) is not tuple or len(value[1]) != 2 or value[1][0] != 'storage_type' or
+                    type(value[1][1]) is not int or value[1][1] not in (1, 2, 4, 8, 16) or
+                    type(value[2]) is not str or value[2] not in records or value[3] != 'cpu' or
+                    type(value[4]) is not int or value[4] < 0 or
+                    value[4]*value[1][1] != records[value[2]]):
+                raise RuntimeError(f'{label} declared pickle storage disagrees with bounded ZIP storage')
+            if storage_types.setdefault(value[2], value[1][1]) != value[1][1]:
+                raise RuntimeError(f'{label} pickle storage aliases disagree on element size')
+            return ('storage', value[2], value[1][1])
+    try:
+        StoragePreflight(io.BytesIO(raw)).load()
+    except (pickle.UnpicklingError, TypeError, ValueError, AttributeError, EOFError) as exc:
+        raise RuntimeError(f'{label} has unaccountable pickle storage metadata') from exc
+
+
+def torch_archive_storage_bytes(source, *, label='PWC window', metadata_cap=None,
+                                max_storage_bytes=None):
+    """Inspect ordinary uncompressed Torch storage records without loading them."""
+    try:
+        if metadata_cap is not None:
+            _preflight_torch_zip_directory(source, metadata_cap=metadata_cap, label=label)
+        with zipfile.ZipFile(source) as archive:
+            entries = archive.infolist()
+            names = [entry.filename for entry in entries]
+            roots = {name.split('/')[0] for name in names}
+            if (len(roots) != 1 or len(set(names)) != len(names)
+                    or not any(name.endswith('/data.pkl') for name in names)
+                    or any(entry.compress_type != zipfile.ZIP_STORED or entry.flag_bits & 1
+                           or entry.file_size != entry.compress_size for entry in entries)):
+                raise RuntimeError(f'{label} requires an uncompressed Torch archive')
+            storage = [entry for entry in entries
+                       if re.fullmatch(r'[^/]+/data/[0-9]+', entry.filename)]
+            if metadata_cap is not None:
+                # Price Python/ZIP/pickle metadata separately from tensor storage.
+                # The bounded source adapter also refuses oversized directory reads
+                # before ZipFile can construct an unbounded member list.
+                metadata_bytes = sum(entry.file_size for entry in entries if entry not in storage)
+                bound = sum(4096 + 8*len(name.encode()) for name in names) + 64*metadata_bytes
+                if bound > metadata_cap // 2:
+                    raise RuntimeError(f'{label} archive metadata exceeds scratch budget')
+            total = sum(entry.file_size for entry in storage)
+            if max_storage_bytes is not None:
+                if total > max_storage_bytes:
+                    raise RuntimeError(f'{label} archive backing storage exceeds its budget')
+                _preflight_torch_pickle_storage(archive,
+                    records={entry.filename.rsplit('/', 1)[1]: entry.file_size for entry in storage},
+                    pickle_name=next(name for name in names if name.endswith('/data.pkl')),
+                    label=label, metadata_cap=metadata_cap)
+            return total
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise RuntimeError(f'{label} has an unaccountable Torch archive') from exc
+
+
+def _advise_activation_descriptor(descriptor, path, expected_stat, *, offset=0,
+                                  length=0, durable=False):
+    expected = cache_file_stat_signature(expected_stat)
+    actual = os.fstat(descriptor)
+    if not stat.S_ISREG(actual.st_mode) or cache_file_stat_signature(actual) != expected:
+        raise RuntimeError('capture entry changed before page advice')
+    if durable:
+        os.fsync(descriptor)
+    if (cache_file_stat_signature(os.fstat(descriptor)) != expected or
+            cache_file_stat_signature(os.stat(path, follow_symlinks=False)) != expected):
+        raise RuntimeError('capture entry changed while completing durability')
+    os.posix_fadvise(descriptor, offset, length, os.POSIX_FADV_DONTNEED)
+
+
+def release_activation_cache_file_pages(path, *, expected_stat):
+    """Advise a verified unchanged file extent at a reader/writer boundary.
+
+    Readers check completed-entry hashes first. A serializer may also pause
+    after a synchronous tensor record and advise its stable visible prefix;
+    the same inode, size and timestamp checks and durability fence apply.
+    The artifact and tensor owners remain intact, and final publication still
+    requires the complete seal. Advice is not proof of physical release; the
+    caller's guard remains final.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        _advise_activation_descriptor(descriptor, path, expected_stat, durable=True)
+    finally:
+        os.close(descriptor)
+
+
+VERIFIED_ACTIVATION_LOAD_SCHEMA = 'prismaquant.verified_activation_load.v1'
+
+
+def normalize_verified_activation_load(config):
+    if config is None:
+        return None
+    if (not isinstance(config, dict) or set(config) !=
+            {'schema', 'max_buffer_bytes', 'max_scratch_bytes'} or
+            config.get('schema') != VERIFIED_ACTIVATION_LOAD_SCHEMA):
+        raise ValueError('verified activation load requires a complete closed v1 policy')
+    for key in ('max_buffer_bytes', 'max_scratch_bytes'):
+        if type(config[key]) is not int or config[key] <= 0:
+            raise ValueError(f'verified activation load requires positive {key}')
+    if config['max_scratch_bytes'] < 1024**2:
+        raise ValueError('verified activation load requires at least 1 MiB metadata scratch')
+    return dict(config)
+
+
+class _VerifiedBufferReader(io.RawIOBase):
+    """Read-only access to one private buffer, with no full-copy fallback."""
+    def __init__(self, buffer, *, max_copy_bytes):
+        self._view = memoryview(buffer).toreadonly()
+        self._position = 0
+        self._max_copy_bytes = max_copy_bytes
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        self._checkClosed()
+        return self._position
+
+    def seek(self, offset, whence=0):
+        self._checkClosed()
+        if whence not in (0, 1, 2):
+            raise ValueError('invalid verified-buffer seek origin')
+        position = offset + (0 if whence == 0 else self._position if whence == 1 else len(self._view))
+        if position < 0:
+            raise ValueError('negative verified-buffer seek')
+        self._position = position
+        return position
+
+    def read(self, size=-1):
+        self._checkClosed()
+        available = max(0, len(self._view) - self._position)
+        size = available if size is None or size < 0 else min(size, available)
+        if size > self._max_copy_bytes:
+            raise RuntimeError('verified-buffer copying read exceeds scratch budget; readinto required')
+        result = bytes(self._view[self._position:self._position+size])
+        self._position += size
+        return result
+
+    def readinto(self, target):
+        self._checkClosed()
+        output = memoryview(target).cast('B')
+        try:
+            size = min(len(output), max(0, len(self._view)-self._position))
+            output[:size] = self._view[self._position:self._position+size]
+            self._position += size
+            return size
+        finally:
+            output.release()
+
+    def close(self):
+        if not self.closed:
+            self._view.release()
+            self._view = None
+        super().close()
+
+
+def bounded_cpu_float32_isfinite(tensor, *, max_scratch_bytes):
+    """Validate a resident canonical tensor with two scalar reduction outputs.
+
+    The qualified CPU aminmax kernel propagates NaNs, preserves infinities and
+    uses vector accumulators plus one scalar pair per native thread. Contiguity
+    is required before the kernel's contiguous() call can create a hidden copy.
+    Torch tensor allocation is eight bytes; conservatively charge reduction
+    pairs and Python/Tensor metadata within M. Native thread-pool bookkeeping
+    remains runtime overhead, independently covered by the physical guard.
+    """
+    if (not isinstance(tensor, torch.Tensor) or tensor.device.type != 'cpu' or
+            tensor.dtype != torch.float32 or tensor.layout != torch.strided or
+            not tensor.is_contiguous() or tensor.requires_grad):
+        raise RuntimeError('bounded finite reduction requires contiguous CPU float32 storage')
+    # The pinned CPU parallel_reduce uses SmallVector<pair<float,float>,64>.
+    # This overprices its pair payload and reserves independent scalar metadata.
+    reduction_bytes = 1024 + 16*max(64, torch.get_num_threads())
+    if type(max_scratch_bytes) is not int or reduction_bytes > max_scratch_bytes//2:
+        raise RuntimeError('bounded finite reduction exceeds metadata scratch budget')
+    if tensor.numel() == 0:
+        return True  # Match isfinite(empty).all() without invoking empty aminmax.
+    minimum, maximum = torch.aminmax(tensor)
+    return math.isfinite(minimum.item()) and math.isfinite(maximum.item())
+
+
+def _verified_payload_storage(payload, *, max_storage_bytes, device, max_nodes):
+    """Charge complete backing storage and refuse opaque or oversized metadata."""
+    pending, visited, storages = [payload], set(), {}
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if len(visited) > max_nodes:
+            raise RuntimeError('verified activation payload exceeds metadata scratch budget')
+        if isinstance(value, torch.Tensor):
+            if (value.device.type != device or value.layout != torch.strided or value.is_quantized
+                    or value.requires_grad or value.numel()*value.element_size() > max_storage_bytes):
+                raise RuntimeError('verified activation payload has unaccountable tensor geometry/type')
+            storage = value.untyped_storage()
+            storages[storage._cdata] = storage.nbytes()
+            if (storage.nbytes() > max_storage_bytes or
+                    (device != 'meta' and sum(storages.values()) > max_storage_bytes)):
+                raise RuntimeError('verified activation backing storage exceeds its budget')
+        elif type(value) in (dict, OrderedDict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif type(value) in (tuple, list):
+            pending.extend(value)
+        elif value is not None and type(value) not in (str, int, float, bool, bytes):
+            raise RuntimeError('verified activation payload has an opaque metadata owner')
+    # Torch's meta restore does not preserve storage aliases (data_ptr is 0).
+    # ZIP records already bound aggregate bytes; meta checks each geometry, and
+    # the CPU pass checks the exact unique backing-storage aggregate.
+    return max(storages.values(), default=0) if device == 'meta' else sum(storages.values())
+
+
+def load_verified_activation_cache_entry(path, *, expected_sha256, policy,
+                                         max_storage_bytes, validate=None,
+                                         expected_stat=None, resource_check=None,
+                                         release_file_pages=False):
+    """Hash and deserialize one admitted byte buffer, released before return.
+
+    The metadata pass uses meta tensors to reject malformed storage/geometry
+    before a real CPU reconstruction. Torch may stage one archive storage on
+    CPU during that pass; the same S cap covers it. Neither pass rereads the
+    source file, and no CUDA transfer is performed by this owner.
+    """
+    policy = normalize_verified_activation_load(policy)
+    if policy is None or type(max_storage_bytes) is not int or max_storage_bytes <= 0:
+        raise ValueError('verified activation load requires explicit buffer and storage budgets')
+    if not isinstance(expected_sha256, str) or re.fullmatch('[0-9a-f]{64}', expected_sha256) is None:
+        raise ValueError('verified activation load requires an exact SHA256 receipt')
+    path = Path(path)
+    before = path.lstat()
+    signature = cache_file_stat_signature(before)
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError('verified activation load requires a regular nonsymlink file')
+    if expected_stat is not None and cache_file_stat_signature(expected_stat) != signature:
+        raise RuntimeError('verified activation file changed before loading')
+    if before.st_size <= 0 or before.st_size > policy['max_buffer_bytes']:
+        raise RuntimeError('verified activation file exceeds serialized buffer budget')
+    scratch = policy['max_scratch_bytes']
+    def check(label, reserve_bytes=0):
+        if resource_check is not None:
+            resource_check(label + ':' + path.name, reserve_bytes=reserve_bytes)
+    def unchanged(descriptor):
+        if (cache_file_stat_signature(os.fstat(descriptor)) != signature or
+                cache_file_stat_signature(path.lstat()) != signature):
+            raise RuntimeError('verified activation file changed during loading')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    raw = reader = value = payload = None
+    try:
+        unchanged(descriptor)
+        # Buffered file I/O can retain all source contents in the kernel even
+        # when advice is requested. Price that full F separately from private F
+        # and metadata M; page rounding/bookkeeping remain in the guard margin.
+        source_page_cache_bytes = before.st_size
+        check('before_verified_capture_buffer',
+              before.st_size + source_page_cache_bytes + max_storage_bytes + scratch)
+        if release_file_pages:
+            # Complete durability once, then advise only verified consumed ranges.
+            os.fsync(descriptor)
+            unchanged(descriptor)
+        raw = bytearray(before.st_size)
+        digest = hashlib.sha256()
+        consumed = advised = 0
+        # These are views of the already admitted F allocation, not M-sized
+        # owned scratch copies. Every bounded read retains guard/stat/advice.
+        block_bytes = 16*1024**2
+        with os.fdopen(descriptor, 'rb', buffering=0, closefd=False) as handle:
+            while consumed < len(raw):
+                check('before_verified_capture_read',
+                      source_page_cache_bytes + max_storage_bytes + scratch)
+                view = memoryview(raw)[consumed:min(len(raw), consumed+block_bytes)]
+                try:
+                    size = handle.readinto(view)
+                    if not size:
+                        raise RuntimeError('verified activation file was truncated')
+                    digest.update(view[:size])
+                finally:
+                    view.release()
+                consumed += size
+                unchanged(descriptor)
+                if release_file_pages:
+                    page = os.sysconf('SC_PAGE_SIZE')
+                    end = consumed // page * page
+                    if end > advised:
+                        _advise_activation_descriptor(descriptor, path, before,
+                                                      offset=advised, length=end-advised)
+                        advised = end
+            if handle.read(1):
+                raise RuntimeError('verified activation file grew during loading')
+        unchanged(descriptor)
+        if digest.hexdigest() != expected_sha256:
+            raise RuntimeError('verified activation file checksum mismatch')
+        reader = _VerifiedBufferReader(raw, max_copy_bytes=min(scratch//8, 128*1024))
+        archive_storage = torch_archive_storage_bytes(reader, label='verified activation load',
+                                                      metadata_cap=scratch,
+                                                      max_storage_bytes=max_storage_bytes)
+        if archive_storage > max_storage_bytes:
+            raise RuntimeError('verified activation archive backing storage exceeds its budget')
+        for device in ('meta', 'cpu'):
+            check('before_verified_capture_decode',
+                  source_page_cache_bytes + max_storage_bytes + scratch)
+            reader.seek(0)
+            value = torch.load(reader, map_location=device, weights_only=True)
+            observed = _verified_payload_storage(value, max_storage_bytes=max_storage_bytes,
+                device=device, max_nodes=scratch//512)
+            if observed > archive_storage:
+                raise RuntimeError('verified activation tensor storage exceeds its archive records')
+            if validate is not None:
+                validate(value, check_finite=device == 'cpu')
+            if device == 'cpu':
+                payload = value
+            value = None
+        unchanged(descriptor)
+        if release_file_pages:
+            _advise_activation_descriptor(descriptor, path, before)
+    except BaseException:
+        value = payload = None
+        raise
+    finally:
+        if reader is not None:
+            reader.close()
+        raw = reader = None
+        os.close(descriptor)
+    try:
+        check('after_verified_capture_buffer_release')
+    except BaseException:
+        payload = None
+        raise
+    execution = dict(schema=VERIFIED_ACTIVATION_LOAD_SCHEMA, policy=policy,
+        artifact_sha256=expected_sha256, file_bytes=before.st_size,
+        storage_cap_bytes=max_storage_bytes, archive_storage_bytes=archive_storage,
+        source_page_cache_reserve_bytes=source_page_cache_bytes,
+        file_signature=signature, source_read_bytes=consumed, live_buffer_bytes=0)
+    execution['identity_sha256'] = hashlib.sha256(json.dumps(
+        {key: execution[key] for key in ('schema', 'policy', 'artifact_sha256', 'file_bytes',
+                                         'storage_cap_bytes')},
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return payload, execution
+
+
+EXACT_ACTIVATION_SCHEMA = "prismaquant.exact_activation_entry.v1"
+
+
+@dataclass(frozen=True)
+class ExactActivationReference:
+    """An immutable exact tensor receipt, never an activation sample/cache."""
+
+    path: str
+    name: str
+    metadata_json: str
+    shape: tuple[int, ...]
+    dtype: str
+    tensor_bytes: int
+    file_bytes: int
+    sha256: str
+
+
+def _exact_activation_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _activation_file_signature(path):
+    import stat
+    value = Path(path).lstat()
+    if not stat.S_ISREG(value.st_mode):
+        raise RuntimeError("exact activation entry is not a regular file")
+    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def write_exact_activation_cache_entry(cache_dir, name, inputs, *, identity,
+                                       max_tensor_bytes, max_file_bytes,
+                                       release_file_pages=True):
+    """Extend the ordinary atomic writer with an exact tensor/identity receipt.
+
+    The caller reserves the one compact CPU copy before entering. No dtype,
+    row selection or shape change is allowed. Compact copying also prevents a
+    narrow view from serializing its entire source backing storage.
+    """
+    if not isinstance(inputs, torch.Tensor) or inputs.layout != torch.strided or inputs.is_meta:
+        raise TypeError("exact activation entry requires a materialized strided Tensor")
+    nbytes = inputs.numel() * inputs.element_size()
+    if not 0 < nbytes <= max_tensor_bytes:
+        raise RuntimeError("exact activation entry exceeds tensor residency budget")
+    metadata = {"schema": EXACT_ACTIVATION_SCHEMA, "identity": identity,
+                "shape": list(inputs.shape), "dtype": str(inputs.dtype), "tensor_bytes": nbytes}
+    encoded = _exact_activation_json(metadata)
+    path = Path(cache_dir) / activation_cache_filename(name)
+    if path.exists() or path.with_suffix(".pt.tmp").exists():
+        raise RuntimeError("exact activation entry already exists")
+    compact = None
+    try:
+        compact = inputs.detach().to(device="cpu", copy=True,
+            memory_format=torch.contiguous_format)
+        path = write_activation_cache_entry(cache_dir, name, compact,
+            source="exact_activation", durable=True, exact=metadata)
+        del compact
+        compact = None
+        published_stat = path.lstat()
+        signature = _activation_file_signature(path)
+        if signature[2] > max_file_bytes:
+            raise RuntimeError("exact activation entry exceeds file budget")
+        with path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        if _activation_file_signature(path) != signature:
+            raise RuntimeError("exact activation entry changed during publication")
+        if release_file_pages:
+            release_activation_cache_file_pages(path, expected_stat=published_stat)
+        return ExactActivationReference(str(path), name, encoded, tuple(inputs.shape),
+            str(inputs.dtype), nbytes, signature[2], digest)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        path.with_suffix(".pt.tmp").unlink(missing_ok=True)
+        raise
+    finally:
+        compact = None
+
+
+class _ExactActivationPrefetch:
+    """One borrowed, closed resident window; lookups never perform I/O."""
+
+    def __init__(self):
+        self._tensors = {}
+        self.active = False
+
+    def get(self, reference):
+        if not self.active or reference not in self._tensors:
+            raise RuntimeError("exact activation window is not ready for this entry")
+        return self._tensors[reference]
+
+
+@contextmanager
+def prefetch_exact_activation_cache_entries(references, *, max_tensor_bytes,
+                                            expected_session, residency_check=None,
+                                            release_file_pages=True):
+    """Read/verify the entire bounded window before exposing any tensor.
+
+    This is the existing activation artifact owner's exact-input read seam.
+    The consumer owns no additional cache and receives no lazy-loading path.
+    ``residency_check`` reserves/releases these tensors in its aggregate owner.
+    """
+    references = tuple(references)
+    if any(not isinstance(ref, ExactActivationReference) for ref in references):
+        raise TypeError("exact activation prefetch requires immutable references")
+    if len(set(references)) != len(references):
+        raise ValueError("exact activation window repeats an entry")
+    nbytes = sum(ref.tensor_bytes for ref in references)
+    if nbytes > max_tensor_bytes:
+        raise RuntimeError("exact activation prefetch exceeds tensor residency budget")
+    window = _ExactActivationPrefetch()
+    reserved = False
+    payload = tensor = None
+    try:
+        if residency_check is not None:
+            residency_check(nbytes)
+            reserved = True
+        for ref in references:
+            metadata = json.loads(ref.metadata_json)
+            if (metadata.get("schema") != EXACT_ACTIVATION_SCHEMA
+                    or metadata.get("identity", {}).get("session") != expected_session):
+                raise RuntimeError("exact activation reference has a different session identity")
+            path = Path(ref.path)
+            prefetched_stat = path.lstat()
+            signature = _activation_file_signature(path)
+            if signature[2] != ref.file_bytes:
+                raise RuntimeError("exact activation entry size changed")
+            with path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            if digest != ref.sha256 or _activation_file_signature(path) != signature:
+                raise RuntimeError("exact activation entry checksum changed")
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            tensor = payload.get("inputs") if isinstance(payload, dict) else None
+            if (not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided
+                    or set(payload) != {"inputs", "name", "source", "exact"}
+                    or payload["name"] != ref.name or payload["source"] != "exact_activation"
+                    or _exact_activation_json(payload["exact"]) != ref.metadata_json
+                    or tuple(tensor.shape) != ref.shape or str(tensor.dtype) != ref.dtype
+                    or tensor.numel() * tensor.element_size() != ref.tensor_bytes
+                    or tensor.untyped_storage().nbytes() != ref.tensor_bytes
+                    or not tensor.is_contiguous() or tensor.requires_grad):
+                raise RuntimeError("exact activation entry tensor/metadata differs from its receipt")
+            if _activation_file_signature(path) != signature:
+                raise RuntimeError("exact activation entry changed during prefetch")
+            window._tensors[ref] = tensor
+            payload = tensor = None
+            if release_file_pages:
+                release_activation_cache_file_pages(path, expected_stat=prefetched_stat)
+        window.active = True
+        yield window
+    finally:
+        window.active = False
+        window._tensors.clear()
+        payload = tensor = None
+        if reserved:
+            residency_check(-nbytes)
 
 
 def _tensor_hash_update(h: "hashlib._Hash", tensor: torch.Tensor) -> None:
@@ -366,7 +1083,7 @@ def _build_module_plans(
         low_act = {
             p.spec.name: p.spec
             for p in plan.params
-            if p.spec.act_bits is not None and p.spec.act_bits < 16
+            if p.spec.act_quant_changes_input
         }
         if len(low_act) == 1:
             plan.act_spec = next(iter(low_act.values()))
@@ -452,6 +1169,24 @@ class PerturbedActivationCache:
             self._activation_scales: dict[str, float] = dict(src)
         else:
             self._activation_scales = {}
+        # #227: the maximum above says what the unit's activations reach; it
+        # does NOT say which input-global-scale policy the cache's costs were
+        # priced under, and the same maximum prices G=6/amax or G=448*6/amax.
+        # The cache's own render-score provenance does say, so carry the G each
+        # unit was priced at and let the hook refuse by name when the G it
+        # would apply is a different one.
+        self._priced_input_global_scales: dict[str, float] = {}
+        if production_weight_cache is not None:
+            from prismaquant.production_weight_cache import (
+                production_cache_priced_input_global_scales,
+            )
+
+            self._priced_input_global_scales = (
+                production_cache_priced_input_global_scales(
+                    production_weight_cache,
+                    where="assignment-KL hooks",
+                )
+            )
         # Bounded uniform row reservoirs (M8): per name, at most
         # `input_rows` CPU rows + their float32 priorities, plus a batch
         # counter that keys the shared per-batch priorities.
@@ -488,6 +1223,7 @@ class PerturbedActivationCache:
         for plan in self.plans:
             if self._try_install_nvfp4_fused_forward(plan):
                 continue
+            self._install_packed_expert_activation_quant(plan)
             self._handles.append(
                 plan.module.register_forward_pre_hook(
                     self._make_pre_hook(plan),
@@ -563,6 +1299,15 @@ class PerturbedActivationCache:
                     dtype=param.dtype,
                 ).contiguous()
             else:
+                from .nvfp4_cb_footprint import is_cb_format
+
+                if is_cb_format(fmt):
+                    raise RuntimeError(
+                        f"production_weight_cache is required for CB fallback "
+                        f"({param_plan.name!r}, {fmt!r}); the registry path is "
+                        "unweighted legacy rendering and cannot represent the "
+                        "stamped production serialization contract"
+                    )
                 if (
                     self._production_weight_cache is not None
                     and fmt != "BF16"
@@ -843,6 +1588,22 @@ class PerturbedActivationCache:
                         f"RTN fallback."
                     )
             if q is None:
+                from .nvfp4_cb_footprint import is_cb_format
+
+                fmt_canon = fr.canonical_format_name(param_plan.spec.name)
+                if is_cb_format(fmt_canon):
+                    raise RuntimeError(
+                        f"production_weight_cache is required for CB fallback "
+                        f"({param_plan.name!r}, {fmt_canon!r}); refusing an "
+                        "unweighted legacy registry render"
+                    )
+                if fr.is_tessera_format_name(fmt_canon):
+                    raise RuntimeError(
+                        f"production_weight_cache is required for Tessera "
+                        f"({param_plan.name!r}, {fmt_canon!r}); the registry "
+                        "render is a weights-only reconstruction, not the "
+                        "decoded wire and not the H-aware encode that ships"
+                    )
                 q = param_plan.spec.quantize_dequantize(original)
             if q is None:
                 continue
@@ -855,11 +1616,93 @@ class PerturbedActivationCache:
         low_act = {
             p.spec.name: p.spec
             for p in plan.params
-            if p.spec.act_bits is not None and p.spec.act_bits < 16
+            if p.spec.act_quant_changes_input
         }
         if len(low_act) == 1:
             return next(iter(low_act.values()))
         return None
+
+    def _served_measurement_units(self) -> list[tuple[str, object]]:
+        """``(name, contract)`` for every member the hook prices as served.
+
+        One enumeration for both preflights below, so "which units does this
+        cache measure as served, and under whose contract" cannot be answered
+        two ways.  The contract travels with the name because the G rule is
+        the SPEC's, never a name comparison (#205).
+        """
+        if not self.include_activation_quant:
+            return []
+        units: list[tuple[str, object]] = []
+        for plan in self.plans:
+            members = self._packed_act_plan(plan)
+            if members is None:
+                act_spec = self._active_activation_spec(plan)
+                contract = getattr(act_spec, "static_activation_contract", None)
+                if contract is None or not contract.measured_as_served:
+                    continue
+                # The name the hook looks the scale up under: the dense
+                # ``weight`` member (``_module_input_member_name``), else
+                # every member -- without an input tensor the structural
+                # tie-break cannot run, and refusing one name too many is
+                # the safe side.
+                weight = next(
+                    (p.name for p in plan.params if p.attr == "weight"), None)
+                names = [weight] if weight is not None else plan.cache_names
+                units.extend((name, contract) for name in names)
+            else:
+                units.extend(
+                    (m.name, m.spec.static_activation_contract)
+                    for m in members
+                    if getattr(m.spec.static_activation_contract,
+                               "measured_as_served", False)
+                )
+        return units
+
+    def served_activation_scale_gaps(self) -> list[str]:
+        """Names this cache would have to REFUSE in the hook, listed up front.
+
+        A member whose spec is measured under the served static-scale
+        contract (``FormatSpec.static_activation_contract.measured_as_served``,
+        a Tessera W4A4 rung) needs its calibrated maximum in this cache's
+        scale identity (``activation_max_abs`` from the production cache);
+        ``_activation_qdq`` refuses it by name otherwise.  Consumers that
+        measure (``kl_measurement.measure_assignment_kl``) ask this before the
+        first forward so the refusal names every unit at once instead of the
+        first hook the model happens to reach.  Capture-only builders, which
+        run before any maximum exists, are not asked.
+        """
+        gaps: set[str] = set()
+        for name, _contract in self._served_measurement_units():
+            value = _activation_max_abs_lookup(self._activation_scales, name)
+            if value is None or float(value) <= 0.0:
+                gaps.add(name)
+        return sorted(gaps)
+
+    def served_activation_policy_conflicts(self) -> list[str]:
+        """Names whose cached cost was priced at a different static G (#227).
+
+        The sibling of :meth:`served_activation_scale_gaps`: that one asks
+        whether a unit HAS a calibrated maximum, which stays true across a
+        change of input-global-scale policy; this one asks whether the G that
+        maximum now derives is the G the unit's retained render score was
+        priced at.  Asked before the first forward for the same reason -- the
+        refusal names every affected unit rather than the first one the model
+        reaches -- and answered from the cache's own score provenance, never
+        from the environment.
+        """
+        conflicts: set[str] = set()
+        if not self._priced_input_global_scales:
+            return []
+        for name, contract in self._served_measurement_units():
+            priced = _activation_max_abs_lookup(
+                self._priced_input_global_scales, name)
+            max_abs = _activation_max_abs_lookup(self._activation_scales, name)
+            if priced is None or max_abs is None or float(max_abs) <= 0.0:
+                continue
+            applied = contract.input_global_scale_from_max_abs(float(max_abs))
+            if float(priced) != float(applied):
+                conflicts.add(name)
+        return sorted(conflicts)
 
     def _nvfp4_fused_param_plan(self, plan: _ModulePlan) -> _ParamPlan | None:
         if not _env_truthy("PRISMAQUANT_FUSED_KERNEL_NVFP4"):
@@ -947,6 +1790,7 @@ class PerturbedActivationCache:
             # formulation was a no-op (codex round-3).
             x = _activation_qdq(
                 x, act_spec, self._activation_scales, param_plan.name,
+                self._priced_input_global_scales,
             )
         weight = self._weight_for_reference_forward(plan, param_plan)
         return F.linear(x, weight, plan.module.bias)
@@ -1104,6 +1948,90 @@ class PerturbedActivationCache:
             param.data.copy_(original.to(device=param.device, dtype=param.dtype))
         plan.active_originals.clear()
 
+    def _packed_act_plan(self, plan: _ModulePlan) -> list[_ParamPlan] | None:
+        """The per-projection params of a packed-experts plan, or None.
+
+        A packed-experts module owns several 3-D projection parameters and is
+        not an ``nn.Linear``, so the module-level pre-hook can only ever see
+        ONE of their inputs -- the module input, which is gate_up's. down_proj
+        consumes the post-SwiGLU intermediate produced INSIDE the forward, and
+        no hook on the module boundary can reach it.
+
+        That is not a cosmetic gap. vLLM's ``CompressedTensorsW4A4Nvfp4MoEMethod``
+        registers BOTH ``w13_input_global_scale`` and ``w2_input_global_scale``:
+        the served runtime quantizes both activations. A gate that emulates only
+        one of them measures a cheaper model than the one that ships, on the
+        half of the MoE FLOPs it left alone -- and it is the selecting gate, so
+        the error goes straight into which assignment is chosen.
+        """
+        if not self.include_activation_quant or len(plan.params) < 2:
+            return None
+        if isinstance(plan.module, nn.Linear):
+            return None
+        members = [
+            p for p in plan.params
+            if getattr(p.spec, "act_quant_changes_input", False)
+            and getattr(getattr(plan.module, p.attr, None), "ndim", 0) == 3
+        ]
+        return members or None
+
+    def _install_packed_expert_activation_quant(self, plan: _ModulePlan) -> None:
+        """Quantize each expert-slice ``F.linear`` input with ITS OWN spec.
+
+        Same interception the probe uses to capture packed-expert Fisher
+        (``sensitivity_probe.install_packed_expert_hooks``): swap ``F.linear``
+        for the duration of the experts-module forward and dispatch on whether
+        the weight is a dim-0 slice of one of this plan's packed parameters.
+        Eval-time only -- no autograd Function, no gradient path.
+
+        Each projection uses its own calibrated activation scale, keyed by its
+        own param name. The module-level pre-hook's act-qdq is suppressed for
+        these plans (see ``_make_pre_hook``) so gate_up's input is quantized
+        exactly once, here, rather than once there and once again inside.
+        """
+        members = self._packed_act_plan(plan)
+        if members is None:
+            return
+        from prismaquant.sensitivity_probe import _packed_expert_slice_index
+
+        module = plan.module
+        original_forward = module.forward
+        owner = self
+
+        def _forward(*args, **kwargs):
+            targets: dict[int, _ParamPlan] = {}
+            params: dict[int, torch.Tensor] = {}
+            for member in members:
+                param = getattr(module, member.attr, None)
+                if not isinstance(param, torch.Tensor) or param.ndim != 3:
+                    continue
+                targets[id(param)] = member
+                params[id(param)] = param
+            if not targets:
+                return original_forward(*args, **kwargs)
+            orig_linear = F.linear
+
+            def _intercepting_linear(input, weight, bias=None):
+                base = weight._base if weight._is_view() else weight
+                member = targets.get(id(base))
+                if member is not None and isinstance(input, torch.Tensor):
+                    if _packed_expert_slice_index(
+                            weight, params[id(base)]) is not None:
+                        input = _activation_qdq(
+                            input, member.spec, owner._activation_scales,
+                            member.name,
+                            owner._priced_input_global_scales)
+                return orig_linear(input, weight, bias)
+
+            F.linear = _intercepting_linear
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                F.linear = orig_linear
+
+        module.forward = _forward
+        self._fused_forward_originals.append((module, original_forward))
+
     def _make_pre_hook(self, plan: _ModulePlan):
         def _pre_hook(_module, args, kwargs):
             where, key, x = _first_tensor_location(args, kwargs)
@@ -1112,6 +2040,12 @@ class PerturbedActivationCache:
                 member_name = _module_input_member_name(plan, x)
                 x_runtime = x
                 act_spec = self._active_activation_spec(plan)
+                if self._packed_act_plan(plan) is not None:
+                    # Handled per projection inside the forward, where
+                    # down_proj's input is reachable and each projection gets
+                    # its own calibrated scale. Quantizing here too would put
+                    # gate_up's input through the quantizer twice.
+                    act_spec = None
                 if act_spec is not None:
                     # MED-3: act-clip to the calibrated max_abs before the
                     # quantizer, so outliers don't dominate per-group
@@ -1120,7 +2054,7 @@ class PerturbedActivationCache:
                     # round-3 caught Q(x/s)*s == Q(x)).
                     x_runtime = _activation_qdq(
                         x_runtime, act_spec, self._activation_scales,
-                        member_name,
+                        member_name, self._priced_input_global_scales,
                     )
                 if x_runtime is not x:
                     args, kwargs = _replace_tensor_input(
@@ -1145,10 +2079,7 @@ class PerturbedActivationCache:
             if rows is None or rows.size(0) == 0:
                 continue
             x = rows[:self.input_rows].to(torch.bfloat16).contiguous()
-            torch.save(
-                {"inputs": x, "name": name, "source": "perturbed_x"},
-                self.cache_dir / activation_cache_filename(name),
-            )
+            write_activation_cache_entry(self.cache_dir, name, x)
             written.append(name)
         return {
             "cache_dir": str(self.cache_dir),
@@ -1239,80 +2170,17 @@ def capture_perturbed_activation_cache(
 
 
 def stage_text_only_under_work_root(model_path: str, work_root: str | Path) -> str:
-    """Text-only staging equivalent to sensitivity_probe, but never under /tmp."""
-    src = Path(model_path)
-    cfg_path = src / "config.json"
-    if not cfg_path.exists():
-        return str(src)
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-    try:
-        from .model_profiles import detect_profile
-        profile = detect_profile(str(src))
-    except Exception:
-        profile = None
-    strip_keys = (
-        list(profile.stage_text_only_strip_keys())
-        if profile is not None
-        else [
-            "vision_config",
-            "audio_config",
-            "speech_config",
-            "image_token_id",
-            "video_token_id",
-            "vision_start_token_id",
-            "vision_end_token_id",
-        ]
-    )
-    needs_num_experts_alias = (
-        "num_local_experts" in cfg and "num_experts" not in cfg
-    )
-    if (
-        not any(k in cfg for k in ("vision_config", "text_config", "audio_config", "speech_config"))
-        and not any(k in cfg for k in strip_keys)
-        and not needs_num_experts_alias
-    ):
-        return str(src)
+    """Text-only staging equivalent to sensitivity_probe, but never under /tmp.
 
-    promote_inner_mt = (
-        profile.stage_text_only_promote_inner_model_type()
-        if profile is not None else False
-    )
-    for key in strip_keys:
-        cfg.pop(key, None)
-    if "num_local_experts" in cfg and "num_experts" not in cfg:
-        cfg["num_experts"] = cfg["num_local_experts"]
-    if "text_config" in cfg:
-        text_cfg = cfg.pop("text_config")
-        for key, value in text_cfg.items():
-            if key == "model_type":
-                if promote_inner_mt:
-                    cfg[key] = value
-                continue
-            cfg[key] = value
-    archs = cfg.get("architectures", [])
-    if archs:
-        cfg["architectures"] = [
-            arch.replace("ForConditionalGeneration", "ForCausalLM")
-            for arch in archs
-        ]
-
-    root = Path(work_root)
-    root.mkdir(parents=True, exist_ok=True)
-    staged = Path(tempfile.mkdtemp(prefix="prismaquant_stage_", dir=str(root)))
-    skip = {
-        "config.json",
-        "preprocessor_config.json",
-        "video_preprocessor_config.json",
-        "processor_config.json",
-    }
-    for p in src.iterdir():
-        if p.name in skip:
-            continue
-        (staged / p.name).symlink_to(p.resolve())
-    with open(staged / "config.json", "w") as f:
-        json.dump(cfg, f, indent=2)
-    return str(staged)
+    Thin wrapper around `sensitivity_probe._stage_text_only_impl` (issue
+    #210: one home for the default strip-key list and the staging steps,
+    shared with `sensitivity_probe.stage_text_only`). This name and
+    signature stay so no caller moves; only the staging root differs
+    (an explicit, caller-owned `work_root`, never /tmp, with no `atexit`
+    registration).
+    """
+    from .sensitivity_probe import _stage_text_only_impl
+    return _stage_text_only_impl(model_path, staging_root=work_root)
 
 
 def load_text_model_under_work_root(

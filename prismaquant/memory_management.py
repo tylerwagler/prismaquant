@@ -5,6 +5,7 @@ import gc
 import os
 import sys
 import weakref
+from pathlib import Path
 from typing import Iterable
 
 import torch
@@ -15,6 +16,148 @@ _BUDGET_EVICTORS: "weakref.WeakSet[object]" = weakref.WeakSet()
 
 class GPUMemoryBudgetExceeded(RuntimeError):
     """Raised when cache eviction cannot bring CUDA memory under budget."""
+
+
+class CaptureMemoryGuard:
+    """Fail closed on the conservative cgroup-plus-CUDA capture footprint.
+
+    CUDA can be absent from GB10's cgroup charge. Adding the entire allocator
+    reservation is deliberately conservative even where charges overlap. The
+    guard never changes a cache policy or drops system-wide page caches.
+
+    Every reading is ABSOLUTE: ``memory.current`` plus the whole CUDA
+    reservation for the process, not the growth a phase caused. ``check``
+    compares that absolute reading, plus the caller's future allocation, with
+    the cgroup cap less the margin, so its own arithmetic is already in one
+    unit. What is not in that unit is a phase PLAN, which states deltas; a
+    caller that admits a plan against the raw cap is out by whatever this
+    process already held. ``baseline`` is that floor, measured at the first
+    ``check``, and ``baseline_bytes`` is what such a caller subtracts.
+    ``peak_checkpoint`` and ``peak_by_checkpoint_prefix`` say where the peak
+    was observed, so a plan that undercharges is attributable from one
+    receipt instead of a rerun.
+
+    ``MARGIN_BYTES`` is that physical safety margin as a class attribute so a
+    producer that sizes the cgroup cap a row will run under reads the number
+    this guard refuses on instead of restating it. A second copy of it would
+    drift, and the drift would show up as a row that PrismaBuild admits and
+    the guard then refuses.
+    """
+
+    #: Physical safety margin held back from the cgroup cap on every check.
+    MARGIN_BYTES = 2*1024**3
+
+    def __init__(self, device, *, cgroup_root=Path('/sys/fs/cgroup'),
+                 membership=Path('/proc/self/cgroup')):
+        self.device = torch.device(device)
+        root = Path(cgroup_root)
+        entries = [line.split(':', 2)[2] for line in Path(membership).read_text().splitlines()
+                   if line.startswith('0::')]
+        if len(entries) != 1 or not entries[0].startswith('/') or '..' in Path(entries[0]).parts:
+            raise RuntimeError('capture memory guard requires a cgroup v2 membership')
+        current = root/entries[0].lstrip('/')
+        limits = []
+        for scope in [current, *current.parents]:
+            if scope != root and root not in scope.parents:
+                break
+            limit_path = scope/'memory.max'
+            if not limit_path.is_file():
+                if scope == root:
+                    break  # The host's root cgroup has no configurable limit.
+                raise RuntimeError('capture memory guard cannot inspect its cgroup ancestors')
+            raw = limit_path.read_text().strip()
+            if raw != 'max':
+                limits.append((int(raw), scope))
+            if scope == root:
+                break
+        if not limits:
+            raise RuntimeError('bounded capture requires a finite cgroup memory budget')
+        self.cap_bytes, self.scope = min(limits, key=lambda pair: pair[0])
+        self.margin_bytes = self.MARGIN_BYTES
+        self.host_floor_bytes = 8*1024**3
+        if self.cap_bytes <= self.margin_bytes:
+            raise RuntimeError('capture budget cannot hold its physical safety margin')
+        self.failure = None
+        self.peak_bytes = 0
+        self.peak_checkpoint = None
+        self.peak_by_checkpoint_prefix = {}
+        self.baseline = None
+        self.min_available_bytes = None
+        self.last = None
+
+    def check(self, label, *, reserve_bytes=0):
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
+        try:
+            if type(reserve_bytes) is not int or reserve_bytes < 0:
+                raise ValueError('capture future allocation reservation must be nonnegative bytes')
+            raw = (self.scope/'memory.max').read_text().strip()
+            cap = self.cap_bytes if raw == 'max' else min(self.cap_bytes, int(raw))
+            current = int((self.scope/'memory.current').read_text())
+            reserved = int(torch.cuda.memory_reserved(self.device))
+            host = _host_memory_info()
+            if host is None or current < 0 or reserved < 0:
+                raise RuntimeError('capture memory observations are unavailable')
+            available, total = host
+            if not 0 <= available <= total:
+                raise RuntimeError('capture host memory observations are invalid')
+            self.last = dict(label=str(label), cgroup_current_bytes=current,
+                cuda_reserved_bytes=reserved,
+                conservative_cgroup_plus_cuda_reserved_bytes=current+reserved,
+                host_mem_available_bytes=available, cap_bytes=cap,
+                future_allocation_bytes=reserve_bytes,
+                refusal_threshold_bytes=cap-self.margin_bytes)
+            if self.baseline is None:
+                # The FIRST reading is what this process already held before
+                # any planned phase became resident: the interpreter, torch,
+                # the CUDA runtime, and every page this process had touched.
+                # A phase plan states deltas over that floor, so a caller
+                # that compares a plan with the raw cap compares two
+                # different quantities (RobTand/prismaquant#390). It is
+                # measured here, in the row's own process, because no
+                # producer-side constant can know a consumer's floor.
+                self.baseline = dict(label=str(label), bytes=current+reserved,
+                    measured_in_process=True, cgroup_current_bytes=current,
+                    cuda_reserved_bytes=reserved)
+            if current+reserved > self.peak_bytes:
+                self.peak_bytes = current+reserved
+                self.peak_checkpoint = str(label)
+            # Labels carry a per-unit suffix after ':'; the prefixes are the
+            # bounded set of phase names, so this attributes a peak to the
+            # phase that held it without growing with the roster.
+            prefix = str(label).split(':', 1)[0]
+            self.peak_by_checkpoint_prefix[prefix] = max(
+                self.peak_by_checkpoint_prefix.get(prefix, 0), current+reserved)
+            self.min_available_bytes = (available if self.min_available_bytes is None
+                                       else min(self.min_available_bytes, available))
+            if (current+reserved+reserve_bytes > cap-self.margin_bytes or
+                    available < self.host_floor_bytes+reserve_bytes):
+                raise RuntimeError(f'capture physical memory refusal: {self.last}')
+        except Exception as error:
+            self.failure = str(error)
+            raise
+        return dict(self.last)
+
+    def snapshot(self):
+        return dict(scope=str(self.scope), budget_bytes=self.cap_bytes,
+            margin_bytes=self.margin_bytes, host_floor_bytes=self.host_floor_bytes,
+            peak_conservative_bytes=self.peak_bytes,
+            peak_checkpoint=self.peak_checkpoint,
+            peak_by_checkpoint_prefix=dict(self.peak_by_checkpoint_prefix),
+            baseline=None if self.baseline is None else dict(self.baseline),
+            min_host_available_bytes=self.min_available_bytes,
+            last_checkpoint=None if self.last is None else dict(self.last))
+
+    def baseline_bytes(self):
+        """The measured process floor every delta plan is compared against.
+
+        Refuses before the first ``check`` rather than defaulting to zero: a
+        zero floor is the arithmetic this guard exists to stop, and it would
+        read as "the process holds nothing" on a box where it holds gigabytes.
+        """
+        if self.baseline is None:
+            raise RuntimeError('capture memory baseline is unmeasured; check() first')
+        return int(self.baseline['bytes'])
 
 
 def env_flag_enabled(name: str, *, default: bool = True) -> bool:
