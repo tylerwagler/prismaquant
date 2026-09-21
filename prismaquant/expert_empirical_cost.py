@@ -2567,6 +2567,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     from prismaquant.model_profiles import detect_profile
 
     staged, _cleanup = stage_multimodal(args.model)
+    # --- REPAIR: stage_multimodal strips quantization_config "so the model
+    # loads as raw tensors", but the STREAMED fp8 dequant path needs exactly
+    # that declaration: layer_streaming._declared_weight_block_size refuses a
+    # checkpoint that "pairs fp8 weights with scale tensors but config.json
+    # quantization_config.weight_block_size is absent", which is every
+    # block-scaled fp8 source (DeepSeek-V4-Flash-Vision-Exp among them), so
+    # --streaming could never run on one.  The probe's own staging
+    # (sensitivity_probe.stage_multimodal) writes the source config through
+    # VERBATIM for this same reason and is the proven path for this loader
+    # family, so give a checkpoint that declares a block grid its declaration
+    # back.  A source with NO weight_block_size is left untouched and still
+    # refused downstream, which is correct for a grid the streaming path
+    # cannot dequant.  Confined to this tool's path on purpose: the shared
+    # stage_multimodal also serves the MiniMax RTN-cache flow, which strips
+    # deliberately.  And confined to --streaming, because the NON-streaming
+    # branch below loads through AutoModelForCausalLM.from_pretrained, which is
+    # the caller the strip exists for; restoring the key there would hand a
+    # quantizer a checkpoint it is not set up to accept.
+    if args.streaming and os.path.abspath(staged) != os.path.abspath(args.model):
+        import json as _json
+        try:
+            with open(Path(args.model) / "config.json") as _f:
+                _src_cfg = _json.load(_f)
+        except Exception:
+            _src_cfg = {}
+        _qc = (_src_cfg.get("quantization_config")
+               or (_src_cfg.get("text_config") or {}).get("quantization_config")
+               or {})
+        if _qc.get("weight_block_size"):
+            _st_path = Path(staged) / "config.json"
+            with open(_st_path) as _f:
+                _st_cfg = _json.load(_f)
+            if not (_st_cfg.get("quantization_config") or {}).get("weight_block_size"):
+                _st_cfg["quantization_config"] = _qc
+                with open(_st_path, "w") as _f:
+                    _json.dump(_st_cfg, _f, indent=2)
+                _log(f"restored quantization_config.weight_block_size="
+                     f"{_qc['weight_block_size']} into the staged config "
+                     f"(stage_multimodal stripped it; the streamed fp8 dequant "
+                     f"path refuses without it)")
     # Detection is the authority for routed-expert membership and also
     # installs any architecture-owned vendored modelling override. Resolve it
     # before constructing the model; a fallback-after-load would recreate the
