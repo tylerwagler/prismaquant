@@ -124,6 +124,50 @@ def _calib_batch() -> int:
     return max(1, int(os.environ.get(_CALIB_BATCH_ENV, "1") or 1))
 
 
+_QUANTIZE_PARENTS_ENV = "PRISMAQUANT_EXPERT_QUANTIZE_PARENTS"
+
+
+def _quantize_parents() -> tuple[str, ...]:
+    """Which packed expert parents this run actually quantizes.
+
+    Default (unset) = every parent the profile couples into the unit.  That is
+    the historical behaviour and it encodes the **vLLM FusedMoE** constraint
+    ("experts must share one format"), which is what the unit model was built
+    for.  It is NOT this pipeline's only consumer: pulsar's ds4 gguf lane
+    addresses ``blk.N.ffn_{gate,up,down}_exps.weight`` as SEPARATE tensors, and
+    the shipped reapfix artifact already carries type-40 and type-44 mixed
+    within a single layer in both directions.  So on that lane the fused unit is
+    a choice, not a constraint, and a whole-layer unit KL silently assumes the
+    split between ``gate_up_proj`` and ``down_proj`` is proportional to
+    n_params -- an assumption this module exists to replace with a measurement.
+
+    Set it to a comma list (e.g. ``gate_up_proj`` or ``down_proj``) to quantize
+    one parent at a time.  The selection is stamped into the checkpoint
+    identity and the provenance, so ``--resume`` refuses to mix a gu run with a
+    down run, and a reader can see which half a KL belongs to.
+    """
+    raw = (os.environ.get(_QUANTIZE_PARENTS_ENV) or "").strip()
+    if not raw:
+        return ()
+    return tuple(sorted({part.strip() for part in raw.split(",") if part.strip()}))
+
+
+def _select_parents(all_parents: Sequence[str], sel: Sequence[str],
+                    where: str) -> list[str]:
+    """Restrict ``all_parents`` to ``sel`` (empty = keep all), refusing a name
+    the unit does not have so a typo cannot silently measure nothing."""
+    if not sel:
+        return list(all_parents)
+    unknown = [p for p in sel if p not in set(all_parents)]
+    if unknown:
+        raise SystemExit(
+            f"{where}: {_QUANTIZE_PARENTS_ENV}={sorted(sel)!r} names "
+            f"{unknown!r}, which this unit does not have; it has "
+            f"{sorted(all_parents)!r}"
+        )
+    return [p for p in all_parents if p in set(sel)]
+
+
 @torch.no_grad()
 def _baseline_logprobs(
     model, calib_ids: torch.Tensor,
@@ -669,7 +713,11 @@ def _unpacked_unit_kl(
         if member.expert_id in selected
     }
     packed = _virtual_packed_module(unit)
-    param_names = [parent for parent, _projections in unit.roles]
+    # `_quantize_parents` may restrict this to one packed parent (see its
+    # docstring): the fused unit is the vLLM constraint, not the ds4 gguf lane's.
+    param_names = _select_parents(
+        [parent for parent, _projections in unit.roles],
+        _quantize_parents(), unit.qname or "unpacked unit")
     try:
         _quantize_unit_inplace(
             packed,
@@ -1266,8 +1314,14 @@ def measure_expert_unit_costs(
         if unit_kind == "packed":
             mod = storage
             pnames = list(_packed_experts_param_names(mod, profile))
+            # Which parents get quantized.  See `_quantize_parents`: the fused
+            # unit is the vLLM FusedMoE constraint, and it is NOT the ds4 gguf
+            # lane's, where these are separate tensors that already ship mixed
+            # formats within one layer.
+            sel = _quantize_parents()
+            active_pnames = _select_parents(pnames, sel, qn or "packed unit")
             n_params_unit = sum(
-                int(getattr(mod, pn).numel()) for pn in pnames
+                int(getattr(mod, pn).numel()) for pn in active_pnames
             )
             num_experts = int(getattr(mod, pnames[0]).shape[0])
             row_members = [
@@ -1278,6 +1332,7 @@ def measure_expert_unit_costs(
                         "num_experts": num_experts,
                         "_packed_experts_module": qn,
                         "_packed_param": pn,
+                        "_quantized_here": (not sel) or (pn in set(active_pnames)),
                     },
                 )
                 for pn in pnames
@@ -1297,14 +1352,36 @@ def measure_expert_unit_costs(
         else:
             unit = storage
             num_experts = unit.num_experts
+            # Same parent restriction as the packed branch (see
+            # `_quantize_parents`).  `members_by_target` keys are
+            # f"{qname}.{parent}", so the parent name is recoverable per member.
+            sel = _quantize_parents()
+            _parent_of = {
+                q: (target[len(qn) + 1:]
+                    if qn and target.startswith(qn + ".")
+                    else target)
+                for target, _m in (unit.members_by_target or {}).items()
+                for q in _m.values()
+            }
+            _active = set(_select_parents(
+                [parent for parent, _proj in unit.roles], sel,
+                qn or "unpacked unit"))
+
+            def _q_here(qname: str) -> bool:
+                return (not sel) or (_parent_of.get(qname) in _active)
+
             n_params_unit = sum(
                 int(member.module.weight.numel()) for member in unit.members
+                if _q_here(member.qname)
             )
             row_members = [
                 (
                     member.qname,
                     member.module.weight,
-                    {"_unpacked_expert_unit": qn},
+                    {
+                        "_unpacked_expert_unit": qn,
+                        "_quantized_here": _q_here(member.qname),
+                    },
                 )
                 for member in unit.members
             ]
@@ -1334,7 +1411,7 @@ def measure_expert_unit_costs(
         def kl_of(fmt):
             if unit_kind == "packed":
                 out = _unit_kl(
-                    model, calib_ids, baseline, mod, pnames, fmt,
+                    model, calib_ids, baseline, mod, active_pnames, fmt,
                     expert_chunk=expert_chunk, col_weights=col_weights,
                     unit_qname=qn, sample_idx=sample_idx,
                     per_window=ladder is not None,
@@ -1430,14 +1507,27 @@ def measure_expert_unit_costs(
                 "n_probes": 0,
             }
             row: dict = {}
+            _q_here_row = bool(expert_metadata.get("_quantized_here", True))
             for fmt in measured_fmts:
-                # Split the UNIT cost across members by n_params so the
-                # per-member sum re-assembles exactly one unit KL.
-                row[fmt] = {
-                    "predicted_dloss": kls[fmt] * npm / n_params_unit,
-                    "cost_source": "empirical_unit_kl",
-                    "output_mse_measured": False,
-                }
+                # Split the UNIT cost across the members that were ACTUALLY
+                # quantized, by n_params, so the per-member sum re-assembles
+                # exactly one unit KL.  A member whose parent this run left at
+                # source is marked unmeasured, NOT zero: a measured zero and an
+                # unmeasured row are different facts, and only the marker lets a
+                # merge with the complementary run fill it honestly.
+                if _q_here_row:
+                    row[fmt] = {
+                        "predicted_dloss": kls[fmt] * npm / n_params_unit,
+                        "cost_source": "empirical_unit_kl",
+                        "output_mse_measured": False,
+                    }
+                else:
+                    row[fmt] = {
+                        "predicted_dloss": 0.0,
+                        "cost_source": "unmeasured_parent_this_run",
+                        "output_mse_measured": False,
+                        "_quantize_parents": list(_quantize_parents()),
+                    }
             for fmt in menu:
                 if fmt in PASSTHROUGH_FORMATS:
                     row[fmt] = {
@@ -1597,6 +1687,11 @@ def _expert_checkpoint_identity(
         "measurement_dtype": str(runner.dtype),
         "expert_chunk": int(expert_chunk),
         "calib_batch": int(_calib_batch()),
+        # Which packed parent(s) were quantized.  Without this a --resume would
+        # happily reuse a gate_up_proj run's shard for a down_proj request: the
+        # unit qname and calibration are identical, and the only difference is
+        # what got quantized.
+        "quantize_parents": list(_quantize_parents()),
         "ladder_interp": bool(ladder_interp),
         "ladder_tol": float(ladder_tol),
         "expert_sample": int(expert_sample),
@@ -2815,6 +2910,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "expert_sample": int(args.expert_sample),
         "max_units": int(args.max_units),
         "unit_filter": args.unit_filter,
+        # Which packed expert parent(s) this run quantized ([] = all).  The
+        # ds4 gguf lane addresses ffn_{gate,up,down}_exps as separate tensors,
+        # so a whole-layer unit KL silently assumes the gu/down split is
+        # proportional to n_params; this is what makes the split a measurement.
+        "quantize_parents": list(_quantize_parents()),
+        "calib_batch": int(_calib_batch()),
         # Cross-family ladder symmetry (ultraplan P5a item 2). None when no
         # ladder ran; the allocator reads it back through
         # cb_ladder_cross_family.cross_family_verdict_from_cost_payload and
