@@ -2,7 +2,8 @@
   "schema": "prismaquant.serving_profile.v1",
   "id": "ds4_engine",
   "runtime": "ds4_engine",
-  "description": "DSv4-Flash on the pulsar ds4 engine, serveable TODAY (kernel inventory as of 2026-09, pulsar dev): routed-expert tensors run on the IQ2_XXS (k-major MMQ) / Q2_K paths or the checkpoint-native MXFP4 grid; attention, shared-expert and dense tensors run ONLY on the FP8 tensor-core path (MXFP8_E4M3 group-32 re-encode); the token embedding and the output head are plain bf16 (a deliberate fidelity choice). No IQ2_XS / IQ2_S / Q3_K expert kernels exist, and non-expert projections have no IQ/k-quant path at all.",
+  "supports_per_role_expert_schemes": true,
+  "description": "DSv4-Flash on the pulsar ds4 engine, serveable TODAY: routed-expert tensors run ONLY on CUTLASS_MXFP4 (40) or IQ2_XXS_MMQ (43); attention, shared-expert and dense tensors run ONLY on the FP8 tensor-core path (MXFP8_E4M3 group-32); the token embedding and the output head are plain bf16 (a deliberate fidelity choice). IQ2_XXS and MXFP4 are the allocator-facing identities; the artifact stores their pre-formatted twins IQ2_XXS_MMQ (43) and CUTLASS_MXFP4 (40), which are pure layout permutations at identical bits and therefore allocation-equivalent. gate and up must match; gate/up and down are independently one of the two, and the combo may differ per layer.",
   "export_lane": {
     "id": "pulsar_ds4",
     "exporter": "pulsar gguf-tools/deepseek4-quantize (out of tree; per-tensor --format-map JSON)",
@@ -15,9 +16,9 @@
     {
       "id": "routed_expert_kernels",
       "when": {"regex": "\\.mlp\\.experts\\."},
-      "allow_formats": ["IQ2_XXS", "Q2_K", "MXFP4"],
+      "allow_formats": ["IQ2_XXS", "MXFP4", "CUTLASS_MXFP4"],
       "reason": "profile_mismatch",
-      "detail": "routed-expert tensors: engine kernels exist only for IQ2_XXS, Q2_K, and the checkpoint-native MXFP4 grid (no IQ2_XS/IQ2_S/Q3_K expert kernels)"
+      "detail": "routed-expert tensors: the only surviving expert kernels are CUTLASS_MXFP4 (type 40, CUTLASS grouped tensor-core) and IQ2_XXS_MMQ (types 43/44, MMQ arms) -- verified against weights.cpp:tensor_is_routed_expert_type. Q2_K and the other IQ2/IQ3 expert types have no kernel; pricing Q2_K here yields an artifact the engine refuses at load."
     },
     {
       "id": "embed_and_head_bf16",
@@ -37,7 +38,7 @@
   "shape_rules": [
     {
       "id": "kquant_superblock_shape",
-      "formats": ["Q2_K", "IQ2_XXS"],
+      "formats": ["IQ2_XXS"],
       "in_features_multiple_of": 256,
       "reason": "kernel_shape",
       "detail": "GGUF k-quants and 256-superblock IQ types pack 256-element superblocks along the input dim"
