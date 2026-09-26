@@ -263,7 +263,11 @@ class Qwen4ExpProfile(ModelProfile):
         return nn.Identity()
 
     def head_resident_extra_prefixes(self, root) -> list[str]:
-        return ["hyper_connection_mixer."]
+        """The top-level stream mixer (``model.hyper_connection_mixer``) runs in
+        `collapse_hidden_after_layers`, so it loads with the head batch."""
+        if root is not None and not hasattr(root, "model") and hasattr(root, "hyper_connection_mixer"):
+            return ["hyper_connection_mixer."]
+        return ["model.hyper_connection_mixer."]
 
     def extra_layer_kwargs(self, *, input_ids=None) -> dict:
         """The PLE layer hashes the token ids (``ple_input_ids``)."""
