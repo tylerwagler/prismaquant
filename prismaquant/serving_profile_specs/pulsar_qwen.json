@@ -1,0 +1,61 @@
+{
+  "schema": "prismaquant.serving_profile.v1",
+  "id": "pulsar_qwen",
+  "runtime": "pulsar_engine",
+  "supports_per_role_expert_schemes": true,
+  "description": "Qwen3.8-Flash-Next (qwen4_exp) on the pulsar engine, single GB10 (L251). Routed experts AND dense Linears run on the EXL3 trellis GEMV (K=2..5, exllamav3 bit-compatible, L245) wherever both dims are multiples of 128; MXFP8_E4M3 (mxfp8_lt, E4M3 + E8M0/32) is the 8-bit tier; the token embedding and output head are plain bf16 (fidelity choice). The MoE router, the gated-residual low-rank read (hc_lowrank 320 is not a multiple of 128) and the DeltaNet a/b projections (48 rows) have no EXL3 form and take MXFP8 or BF16. 1-D params, conv kernels, the shared-expert sigmoid gate and the 4-row block_inject stay BF16. The PLE n-gram table is not allocated here: it ships on the disk path (Qwen's own FP8 bytes).",
+  "export_lane": {
+    "id": "pulsar_qwen_builder",
+    "exporter": "pulsar tools/container direct builder (out of tree; per-tensor format map)",
+    "codec_formats_from": ["prismaquant.pulsar_qwen_formats:PULSAR_QWEN_FORMATS"],
+    "passthrough_formats": [],
+    "reason": "exporter_cannot_emit",
+    "detail": "pulsar's builder writes exactly the formats its engine has kernels for; the declaration module mirrors its format-map vocabulary"
+  },
+  "format_rules": [
+    {
+      "id": "embed_and_head_bf16",
+      "when": {"regex": "embed_tokens|lm_head"},
+      "allow_formats": ["BF16"],
+      "reason": "profile_mismatch",
+      "detail": "token embedding and output head ship as plain bf16 (source-exact)"
+    },
+    {
+      "id": "no_exl3_form",
+      "when": {"regex": "\\.mlp\\.gate$|hyper_connection\\.input_mix_weight_(down|up)$|hyper_connection_mixer\\.input_mix_weight_(down|up)$|linear_attn\\.in_proj_[ab]$"},
+      "allow_formats": ["MXFP8_E4M3", "BF16"],
+      "reason": "profile_mismatch",
+      "detail": "router (a route flip is not a smooth cost; held at 8 bits or source), gated-residual low-rank (320 wide) and DeltaNet a/b (48 rows): no EXL3 tiling"
+    },
+    {
+      "id": "bf16_small",
+      "when": {"regex": "shared_expert_gate$|block_inject_weight$"},
+      "allow_formats": ["BF16"],
+      "reason": "profile_mismatch",
+      "detail": "1- and 4-row gate projections stay bf16"
+    },
+    {
+      "id": "exl3_or_8bit",
+      "when": {"not_regex": "embed_tokens|lm_head|\\.mlp\\.gate$|hyper_connection|linear_attn\\.in_proj_[ab]$|shared_expert_gate$"},
+      "allow_formats": ["EXL3_K2", "EXL3_K3", "EXL3_K4", "EXL3_K5", "MXFP8_E4M3", "BF16"],
+      "reason": "profile_mismatch",
+      "detail": "routed experts, shared expert, DeltaNet qkv/z/out, QSA q/k/v/o + indexer, PLE key/value: the EXL3 trellis GEMV or the 8-bit tier"
+    }
+  ],
+  "shape_rules": [
+    {
+      "id": "exl3_hadamard_128",
+      "formats": ["EXL3_K2", "EXL3_K3", "EXL3_K4", "EXL3_K5"],
+      "in_features_multiple_of": 128,
+      "reason": "kernel_shape",
+      "detail": "EXL3 applies a 128-blockwise Hadamard along the input dim (and the output dim: pulsar_qwen_formats refuses out % 128 != 0)"
+    },
+    {
+      "id": "mx_group32_shape",
+      "formats": ["MXFP8_E4M3"],
+      "in_features_multiple_of": 32,
+      "reason": "kernel_shape",
+      "detail": "OCP MX formats scale 32-element groups along the input dim"
+    }
+  ]
+}
