@@ -163,6 +163,24 @@ def _install_disk_ngram_table() -> None:
     cls.__init__ = __init__
     cls._prismaquant_disk_table = True
 
+    # The QSA indexer gathers per-sequence rope rows (`full_cos[batch_idx]`),
+    # so it needs position embeddings with the real batch dimension, which
+    # `Qwen4ExpTextModel.forward` gets by expanding position_ids to
+    # (4, B, T). The streamed driver computes one broadcastable row (batch 1);
+    # expanding it here is the identical tensor the model forward builds.
+    indexer = modeling.Qwen4ExpTextQSAIndexer
+    original_forward = indexer.forward
+
+    def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values):
+        cos, sin = position_embeddings
+        batch = hidden_states.shape[0]
+        if cos.shape[0] == 1 and batch > 1:
+            position_embeddings = (cos.expand(batch, *cos.shape[1:]),
+                                   sin.expand(batch, *sin.shape[1:]))
+        return original_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
+
+    indexer.forward = forward
+
 
 class Qwen4ExpProfile(ModelProfile):
     """Model profile for the ``qwen4_exp`` (Qwen3.8-Flash-Next) family."""
