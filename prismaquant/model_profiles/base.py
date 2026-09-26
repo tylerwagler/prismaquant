@@ -1388,6 +1388,18 @@ class ModelProfile(ABC):
         Default: passthrough."""
         return hidden
 
+    def final_norm(self, base_model):
+        """The pre-lm_head norm module (after `collapse_hidden_after_layers`).
+
+        Default: the first of ``norm``, ``embedding_norm``,
+        ``final_layernorm``, ``final_norm``, ``ln_f`` present on the base
+        model, else None."""
+        for attr in ("norm", "embedding_norm", "final_layernorm", "final_norm", "ln_f"):
+            n = getattr(base_model, attr, None)
+            if n is not None:
+                return n
+        return None
+
     def extra_layer_kwargs(self, *, input_ids=None) -> dict:
         """Extra kwargs to pass to `layer(...)` during phase-1/3.
         DSv4 hash-routed layers consume `input_ids` for the `tid2eid`

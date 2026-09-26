@@ -37,7 +37,131 @@ declarations but *not* the Python-side walk rules or the RMSNorm offset below.
 """
 from __future__ import annotations
 
+import json
+import struct
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+
 from .base import ModelProfile
+
+#: Checkpoint-key marker of the PLE n-gram table (128 row-contiguous shards,
+#: 51.2B bf16 params, ~102 GB). transformers' own ``_no_placement_params``
+#: keeps it off the device; the streaming loader must never read it either.
+NGRAM_SHARD_MARKER = ".ple_embedding.ngram_embedding.shard_"
+
+#: Checkpoint directories declared to a qwen4_exp profile whose index carries
+#: the n-gram shards; the disk table reads from the first one.
+_NGRAM_SOURCES: list[Path] = []
+
+
+class _DeviceTag:
+    """Stands in for ``ngram_embedding.weight`` where HF only reads ``.device``."""
+
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class Qwen4ExpDiskNGramTable(nn.Module):
+    """The PLE n-gram table as a parameter-free, disk-backed row gather.
+
+    ``Qwen4ExpTextNGramEmbedding`` concatenates ``shard_0 .. shard_{S-1}``
+    (each ``[rows, 160]`` bf16) into one ``nn.Embedding`` (transformers'
+    conversion mapping, ``Concatenate(dim=0)``) and then only ever looks rows
+    up. This module performs the same lookup straight from the safetensors
+    files through a read-only numpy memmap, so only the touched rows are paged
+    in and nothing of the 102 GB table is materialised on the host or device.
+    It carries no parameter or buffer: the table is a lookup, not a weight the
+    probe prices or the allocator places (it ships on the disk path).
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, layer_idx: int):
+        super().__init__()
+        self.num_embeddings = int(num_embeddings)
+        self.embedding_dim = int(embedding_dim)
+        self.layer_idx = int(layer_idx)
+        self._shards = None
+        self._rows_per_shard = None
+
+    @property
+    def weight(self):
+        return _DeviceTag()
+
+    def _open(self):
+        if self._shards is not None:
+            return
+        if not _NGRAM_SOURCES:
+            raise RuntimeError(
+                "qwen4_exp n-gram disk table: no checkpoint with n-gram shards "
+                "was declared to the profile (detect_profile(model_path))")
+        src = _NGRAM_SOURCES[0]
+        weight_map = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
+        prefix = f"model.language_model.layers.{self.layer_idx}.ple.ple_embedding.ngram_embedding.shard_"
+        keys = sorted((k for k in weight_map if k.startswith(prefix)),
+                      key=lambda k: int(k[len(prefix):].split(".")[0]))
+        if not keys:
+            raise RuntimeError(f"qwen4_exp n-gram disk table: no {prefix}* keys in {src}")
+        shards = []
+        for i, key in enumerate(keys):
+            if int(key[len(prefix):].split(".")[0]) != i:
+                raise RuntimeError(f"n-gram shard numbering has a gap at {key}")
+            path = src / weight_map[key]
+            with open(path, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(n))
+            meta = header[key]
+            if meta["dtype"] != "BF16" or meta["shape"][1] != self.embedding_dim:
+                raise RuntimeError(f"n-gram shard {key}: {meta['dtype']} {meta['shape']}")
+            start, end = meta["data_offsets"]
+            rows = meta["shape"][0]
+            if end - start != rows * self.embedding_dim * 2:
+                raise RuntimeError(f"n-gram shard {key}: byte span {end - start} != shape")
+            shards.append(np.memmap(path, dtype=np.uint16, mode="r", offset=8 + n + start,
+                                    shape=(rows, self.embedding_dim)))
+        rows = {s.shape[0] for s in shards}
+        if len(rows) != 1:
+            raise RuntimeError(f"n-gram shards are not equal-sized: {sorted(rows)}")
+        self._rows_per_shard = rows.pop()
+        if self._rows_per_shard * len(shards) < self.num_embeddings - self._rows_per_shard:
+            raise RuntimeError("n-gram shards cover fewer rows than the embedding declares")
+        self._shards = shards
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        self._open()
+        flat = ids.reshape(-1).to("cpu")
+        uniq, inv = torch.unique(flat, return_inverse=True)
+        u = uniq.numpy()
+        shard_of = u // self._rows_per_shard
+        if u.size and (u.min() < 0 or shard_of.max() >= len(self._shards)):
+            raise IndexError("n-gram id outside the table")
+        out = np.empty((u.size, self.embedding_dim), dtype=np.uint16)
+        for s in np.unique(shard_of):
+            sel = np.nonzero(shard_of == s)[0]
+            out[sel] = self._shards[int(s)][u[sel] - int(s) * self._rows_per_shard]
+        rows = torch.from_numpy(out).view(torch.bfloat16).to(ids.device)
+        return rows[inv.to(ids.device)].view(*ids.shape, self.embedding_dim)
+
+
+def _install_disk_ngram_table() -> None:
+    """Patch ``Qwen4ExpTextNGramEmbedding`` so every skeleton built from here
+    on carries the disk table instead of a 51B-parameter ``nn.Embedding``."""
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as modeling
+
+    cls = modeling.Qwen4ExpTextNGramEmbedding
+    if getattr(cls, "_prismaquant_disk_table", False):
+        return
+    original_init = cls.__init__
+
+    def __init__(self, config, embedding_dim, layer_idx, ple_layer_index=0):
+        original_init(self, config, embedding_dim, layer_idx, ple_layer_index)
+        emb = self.ngram_embedding
+        self.ngram_embedding = Qwen4ExpDiskNGramTable(
+            emb.num_embeddings, emb.embedding_dim, layer_idx)
+
+    cls.__init__ = __init__
+    cls._prismaquant_disk_table = True
 
 
 class Qwen4ExpProfile(ModelProfile):
@@ -74,6 +198,59 @@ class Qwen4ExpProfile(ModelProfile):
     # ------------------------------------------------------------
     # vLLM: absent by measurement, not by omission
     # ------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Streaming probe glue (Qwen4ExpTextModel.forward, read 2026-09-26 from
+    # transformers 5.18.0.dev0 modeling_qwen4_exp.py)
+    # ------------------------------------------------------------
+    def _declare_model_path(self, model_path) -> None:
+        super()._declare_model_path(model_path)
+        index = Path(model_path) / "model.safetensors.index.json"
+        if index.is_file() and Path(model_path) not in _NGRAM_SOURCES:
+            if any(NGRAM_SHARD_MARKER in k for k in json.loads(index.read_text())["weight_map"]):
+                _NGRAM_SOURCES.append(Path(model_path))
+
+    def register_vendored_modeling(self) -> None:
+        """Replace the 51B-parameter n-gram ``nn.Embedding`` with the disk table."""
+        _install_disk_ngram_table()
+
+    def checkpoint_to_live_name(self, ckpt_key: str, *, multimodal: bool = False):
+        """Drop the n-gram table shards: the disk table reads them itself."""
+        if NGRAM_SHARD_MARKER in ckpt_key:
+            return None
+        return super().checkpoint_to_live_name(ckpt_key, multimodal=multimodal)
+
+    def rotary_position_ids(self, position_ids):
+        """Three identical mRoPE rows for text, as ``Qwen4ExpTextModel.forward``
+        passes ``position_ids[1:]`` of its 4-row text layout to the rotary."""
+        if position_ids.ndim == 2:
+            return position_ids.unsqueeze(0).expand(3, -1, -1)
+        if position_ids.ndim == 3 and position_ids.shape[0] == 3:
+            return position_ids
+        raise ValueError("qwen4_exp rotary positions require [batch, tokens] or [3, batch, tokens]")
+
+    def expand_hidden_for_layers(self, hidden, base_model):
+        """``hidden_states.repeat(1, 1, hc_count)``: 4 identical residual streams."""
+        return hidden.repeat(1, 1, base_model.config.hc_count)
+
+    def collapse_hidden_after_layers(self, hidden, base_model):
+        """``self.hyper_connection_mixer(hidden_states)``: the top-level gated
+        read collapses the streams; its grouped hc_norm is the final norm."""
+        return base_model.hyper_connection_mixer(hidden)
+
+    def final_norm(self, base_model):
+        """Identity: the mixer's hc_norm (inside `collapse_hidden_after_layers`)
+        is this family's only pre-head norm; `Qwen4ExpTextModel` has no `norm`."""
+        if hasattr(base_model, "norm"):
+            raise RuntimeError("qwen4_exp text model grew a `norm`; revisit final_norm")
+        return nn.Identity()
+
+    def head_resident_extra_prefixes(self, root) -> list[str]:
+        return ["hyper_connection_mixer."]
+
+    def extra_layer_kwargs(self, *, input_ids=None) -> dict:
+        """The PLE layer hashes the token ids (``ple_input_ids``)."""
+        return {"ple_input_ids": input_ids} if input_ids is not None else {}
+
     def vllm_architecture_class(self) -> str | None:
         """None — no vLLM class exists for ``Qwen4Exp*``.
 

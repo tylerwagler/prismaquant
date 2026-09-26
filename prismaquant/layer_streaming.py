@@ -2599,12 +2599,12 @@ def _get_final_norm(base_model: nn.Module) -> nn.Module | None:
     """Find the final pre-lm_head norm by trying the attribute names used
     across HF architectures, in priority order: ``norm`` (Llama/Qwen/most),
     then ``embedding_norm``, ``final_layernorm``, ``final_norm``, and
-    ``ln_f`` (GPT-2 lineage). Returns the first present module, else None."""
-    for attr in ("norm", "embedding_norm", "final_layernorm", "final_norm", "ln_f"):
-        n = getattr(base_model, attr, None)
-        if n is not None:
-            return n
-    return None
+    ``ln_f`` (GPT-2 lineage). Returns the first present module, else None.
+
+    The answer is the profile's (`ModelProfile.final_norm`), so a family
+    whose final norm lives inside its stream collapse (qwen4_exp) can say so."""
+    from .model_profiles import profile_from_model
+    return profile_from_model(base_model).final_norm(base_model)
 
 
 def _embed_prefix(base_model: nn.Module, full_path: str) -> str:
