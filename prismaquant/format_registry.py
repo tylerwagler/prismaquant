@@ -1426,3 +1426,9 @@ def nvfp4_activation_qdq_served(
     )
 
     return _owned_nvfp4_activation_qdq_served(x, input_global_scale)
+
+
+# The pulsar Qwen lane's EXL3 rungs (declared next to their exporter's format
+# table, like ds4_engine_formats) register themselves on import; importing here
+# makes them resolvable wherever the registry is.
+from . import pulsar_qwen_formats as _pulsar_qwen_formats  # noqa: E402,F401
