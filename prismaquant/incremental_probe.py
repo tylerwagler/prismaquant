@@ -4830,6 +4830,10 @@ def main():
                          "(2*out + 3*in) * 4 bytes. Default ON; overrides "
                          "PRISMAQUANT_PROBE_MARGINALS. --no-emit-marginals "
                          "restores byte-identical legacy output.")
+    ap.add_argument("--calib-window-start", choices=("random", "row"), default="random",
+                    help="Where each calibration window starts inside its text row: "
+                         "'random' (historical) or 'row' (token 0 of the row, as in "
+                         "serving -- a rendered chat starts at its template).")
     ap.add_argument("--unified-sweep", action="store_true", default=False,
                     help="Phase-3 in ONE reverse sweep through all 62 "
                          "layers, tracking ALL in-scope Linears at once "
@@ -5371,7 +5375,8 @@ def main():
             args.nsamples = ns  # write back so meta records the actual count
             calib = load_calibration(
                 tokenizer, args.dataset, ns, args.seqlen,
-                calib_seed=int(args.calib_seed))
+                calib_seed=int(args.calib_seed),
+                window_start=args.calib_window_start)
             print(f"[incremental] calibration ready: {tuple(calib.shape)}",
                   flush=True)
 

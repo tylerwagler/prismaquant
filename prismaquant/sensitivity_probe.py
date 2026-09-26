@@ -3064,7 +3064,8 @@ class FisherAccumulator:
 # Calibration data
 # ---------------------------------------------------------------------------
 def load_calibration(tokenizer, source: str, n_samples: int,
-                     seqlen: int, *, calib_seed: int = 42) -> torch.Tensor:
+                     seqlen: int, *, calib_seed: int = 42,
+                     window_start: str = "random") -> torch.Tensor:
     """Load calibration from a HuggingFace dataset id, a local .jsonl, or
     a local .txt file. Extensionless regular files are content-sniffed so a
     bind-mounted JSONL at a canonical container path such as ``/dataset``
@@ -3270,7 +3271,19 @@ def load_calibration(tokenizer, source: str, n_samples: int,
         ids = tokenizer(t, return_tensors="pt", truncation=False).input_ids
         if ids.size(1) < seqlen:
             continue
-        start = random.randint(0, ids.size(1) - seqlen)
+        # window_start="row": every window is the first `seqlen` tokens of its
+        # row, so position 0 is the row's own first token (a rendered chat's
+        # `<|im_start|>`), as in serving. The default random start cuts windows
+        # mid-conversation; on qwen4_exp one such window starting at a stray
+        # `<|im_end|>` carried 93-97% of the layer-36..47 gradient energy in a
+        # 32x1024 draw (research note L251 alloc), i.e. the Fisher measured
+        # the window cut, not the model.
+        if window_start == "row":
+            start = 0
+        elif window_start == "random":
+            start = random.randint(0, ids.size(1) - seqlen)
+        else:
+            raise ValueError(f"window_start must be 'random' or 'row', got {window_start!r}")
         samples.append(ids[0, start:start + seqlen])
         if len(samples) >= n_samples:
             break
