@@ -3020,6 +3020,15 @@ def _compute_attention_mask(
 
     masks = {"full_attention": create_causal_mask(**mask_kwargs)}
 
+    if "indexed_attention" in layer_types:
+        # qwen4_exp QSA layers: the indexer overlays its block selection on
+        # the causal mask (`attention_mask & selected_token_mask`), so the
+        # mask must exist -- `Qwen4ExpTextModel.forward` builds it with
+        # `allow_is_causal_skip=False` for exactly that reason (transformers
+        # 5.18 modeling_qwen4_exp.py, `causal_mask_mapping`).
+        masks["indexed_attention"] = create_causal_mask(
+            **mask_kwargs, allow_is_causal_skip=False)
+
     if has_sliding:
         masks["sliding_attention"] = create_sliding_window_causal_mask(
             **sliding_mask_kwargs
